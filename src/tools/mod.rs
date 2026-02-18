@@ -20,6 +20,9 @@ pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod sessions_history;
+pub mod sessions_list;
+pub mod sessions_send;
 pub mod shell;
 pub mod traits;
 
@@ -46,6 +49,9 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use sessions_history::SessionsHistoryTool;
+pub use sessions_list::SessionsListTool;
+pub use sessions_send::SessionsSendTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -144,6 +150,9 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Box::new(SessionsListTool::new(workspace_dir.to_path_buf())),
+        Box::new(SessionsHistoryTool::new(workspace_dir.to_path_buf())),
+        Box::new(SessionsSendTool::new(workspace_dir.to_path_buf())),
     ];
 
     if browser_config.enabled {
@@ -269,6 +278,9 @@ mod tests {
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"sessions_list"));
+        assert!(names.contains(&"sessions_history"));
+        assert!(names.contains(&"sessions_send"));
     }
 
     #[test]
@@ -307,6 +319,9 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"sessions_list"));
+        assert!(names.contains(&"sessions_history"));
+        assert!(names.contains(&"sessions_send"));
     }
 
     #[test]

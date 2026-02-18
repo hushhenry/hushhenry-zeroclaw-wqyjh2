@@ -16,6 +16,10 @@ impl SessionId {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -60,6 +64,17 @@ pub struct SessionMessage {
     pub content: String,
     pub created_at: String,
     pub meta_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub session_key: String,
+    pub status: String,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: i64,
 }
 
 pub struct SessionStore {
@@ -306,6 +321,55 @@ impl SessionStore {
         Ok(messages)
     }
 
+    pub fn list_sessions(
+        &self,
+        session_key: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SessionSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_id, s.session_key, s.status, s.title, s.created_at, s.updated_at,
+                        COUNT(m.id) AS message_count
+                 FROM sessions s
+                 LEFT JOIN session_messages m ON m.session_id = s.session_id
+                 WHERE (?1 IS NULL OR s.session_key = ?1)
+                 GROUP BY s.session_id, s.session_key, s.status, s.title, s.created_at, s.updated_at
+                 ORDER BY s.updated_at DESC
+                 LIMIT ?2",
+            )
+            .context("Failed to prepare list_sessions query")?;
+
+        let rows = stmt
+            .query_map(params![session_key, i64::from(limit)], |row| {
+                Ok(SessionSummary {
+                    session_id: row.get(0)?,
+                    session_key: row.get(1)?,
+                    status: row.get(2)?,
+                    title: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    message_count: row.get(6)?,
+                })
+            })
+            .context("Failed to query sessions list")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode sessions list")
+    }
+
+    pub fn session_exists(&self, session_id: &SessionId) -> Result<bool> {
+        let conn = self.conn.lock();
+        let exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+                params![session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("Failed to query session existence")?;
+        Ok(exists == 1)
+    }
+
     pub fn load_messages_after_id(
         &self,
         session_id: &SessionId,
@@ -378,7 +442,7 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionStore;
+    use super::{SessionId, SessionStore};
     use crate::session::SessionKey;
     use rusqlite::{params, Connection};
     use tempfile::TempDir;
@@ -475,5 +539,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state, "\"summary-v1\"");
+    }
+
+    #[test]
+    fn session_store_lists_sessions_and_checks_existence() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let session_key = SessionKey::new("group:telegram:list-check");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+        store
+            .append_message(&session_id, "user", "list-message", None)
+            .unwrap();
+
+        let sessions = store.list_sessions(Some(session_key.as_str()), 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id.as_str());
+        assert_eq!(sessions[0].message_count, 1);
+
+        assert!(store.session_exists(&session_id).unwrap());
+        assert!(!store
+            .session_exists(&SessionId::from_string("missing-session-id"))
+            .unwrap());
     }
 }
