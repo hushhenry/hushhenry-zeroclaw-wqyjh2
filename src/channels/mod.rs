@@ -257,30 +257,34 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     }
 
-    let memory_context = build_memory_context(
-        ctx.memory.as_ref(),
-        &msg.content,
-        active_session.as_ref().map(SessionId::as_str),
-    )
-    .await;
-
-    if ctx.auto_save_memory {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                active_session.as_ref().map(SessionId::as_str),
-            )
-            .await;
-    }
-
-    let enriched_message = if memory_context.is_empty() {
+    let enriched_message = if ctx.session_enabled {
         msg.content.clone()
     } else {
-        format!("{memory_context}{}", msg.content)
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            active_session.as_ref().map(SessionId::as_str),
+        )
+        .await;
+
+        if ctx.auto_save_memory {
+            let autosave_key = conversation_memory_key(&msg);
+            let _ = ctx
+                .memory
+                .store(
+                    &autosave_key,
+                    &msg.content,
+                    crate::memory::MemoryCategory::Conversation,
+                    active_session.as_ref().map(SessionId::as_str),
+                )
+                .await;
+        }
+
+        if memory_context.is_empty() {
+            msg.content.clone()
+        } else {
+            format!("{memory_context}{}", msg.content)
+        }
     };
 
     if let Some(channel) = target_channel.as_ref() {
@@ -1738,6 +1742,180 @@ mod tests {
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    #[derive(Default)]
+    struct TrackingMemory {
+        recall_calls: AtomicUsize,
+        conversation_store_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for TrackingMemory {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            if matches!(category, crate::memory::MemoryCategory::Conversation) {
+                self.conversation_store_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.recall_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![crate::memory::MemoryEntry {
+                id: "id-1".to_string(),
+                key: "k".to_string(),
+                content: "memory-fact".to_string(),
+                category: crate::memory::MemoryCategory::Conversation,
+                timestamp: "1970-01-01T00:00:00Z".to_string(),
+                score: Some(0.99),
+                session_id: None,
+            }])
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct HistoryCaptureProvider {
+        captured_history: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for HistoryCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let captured = messages
+                .iter()
+                .map(|msg| (msg.role.clone(), msg.content.clone()))
+                .collect::<Vec<_>>();
+            let mut lock = self.captured_history.lock().await;
+            *lock = captured;
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_session_mode_skips_memory_context_and_conversation_autosave() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let memory = Arc::new(TrackingMemory::default());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = traits::ChannelMessage {
+            id: "msg-3".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-168".to_string(),
+            content: "current question".to_string(),
+            channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-168".to_string(),
+            thread_id: None,
+            timestamp: 3,
+        };
+
+        let session_resolver = SessionResolver::new();
+        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        session_store
+            .append_message(&session_id, "user", "past-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "past-assistant", None)
+            .unwrap();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            memory: memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: true,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store.clone()),
+            session_resolver,
+        });
+
+        process_channel_message(runtime_ctx, msg).await;
+
+        assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(memory.conversation_store_calls.load(Ordering::Relaxed), 0);
+
+        let captured_history = provider.captured_history.lock().await;
+        let final_user = captured_history
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.clone())
+            .unwrap();
+        assert_eq!(final_user, "current question");
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "user" && content == "past-user"));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == "past-assistant"));
     }
 
     #[tokio::test]
