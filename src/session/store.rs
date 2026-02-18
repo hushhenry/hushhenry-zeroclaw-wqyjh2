@@ -110,6 +110,7 @@ pub enum SubagentRunStatus {
     Running,
     Succeeded,
     Failed,
+    Canceled,
 }
 
 impl SubagentRunStatus {
@@ -119,6 +120,7 @@ impl SubagentRunStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Canceled => "canceled",
         }
     }
 
@@ -128,6 +130,7 @@ impl SubagentRunStatus {
             "running" => Some(Self::Running),
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
             _ => None,
         }
     }
@@ -823,20 +826,26 @@ impl SessionStore {
         let tx = conn
             .transaction()
             .context("Failed to start claim_next_queued_subagent_run transaction")?;
-        let next_run_id = tx
+        let next = tx
             .query_row(
-                "SELECT run_id
+                "SELECT run_id, subagent_session_id
                  FROM subagent_runs
                  WHERE status = 'queued'
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM subagent_runs AS running
+                        WHERE running.subagent_session_id = subagent_runs.subagent_session_id
+                          AND running.status = 'running'
+                   )
                  ORDER BY queued_at ASC
                  LIMIT 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .context("Failed to query next queued subagent run")?;
 
-        let Some(run_id) = next_run_id else {
+        let Some((run_id, subagent_session_id)) = next else {
             tx.commit()
                 .context("Failed to commit empty queued-run transaction")?;
             return Ok(None);
@@ -846,8 +855,15 @@ impl SessionStore {
         tx.execute(
             "UPDATE subagent_runs
              SET status = 'running', started_at = ?1, updated_at = ?1
-             WHERE run_id = ?2 AND status = 'queued'",
-            params![now, run_id],
+             WHERE run_id = ?2
+               AND status = 'queued'
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM subagent_runs AS running
+                    WHERE running.subagent_session_id = ?3
+                      AND running.status = 'running'
+               )",
+            params![now, run_id, subagent_session_id],
         )
         .context("Failed to mark subagent run as running")?;
 
@@ -870,6 +886,35 @@ impl SessionStore {
         self.mark_subagent_run_final(run_id, SubagentRunStatus::Failed, None, Some(error_message))
     }
 
+    pub fn mark_subagent_run_canceled(&self, run_id: &str) -> Result<()> {
+        self.mark_subagent_run_final_with_allowed(
+            run_id,
+            SubagentRunStatus::Canceled,
+            None,
+            Some("subagent run canceled"),
+            &["queued", "running"],
+            false,
+        )
+    }
+
+    pub fn recover_running_subagent_runs_to_queued(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "UPDATE subagent_runs
+             SET status = 'queued',
+                 started_at = NULL,
+                 updated_at = ?1
+             WHERE status = 'running'",
+            params![now],
+        )
+        .context("Failed to recover running subagent runs")?;
+        let changes = conn
+            .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
+            .context("Failed to query recovered subagent run changes")?;
+        Ok(changes.max(0) as usize)
+    }
+
     fn mark_subagent_run_final(
         &self,
         run_id: &str,
@@ -877,25 +922,98 @@ impl SessionStore {
         output_json: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<()> {
+        self.mark_subagent_run_final_with_allowed(
+            run_id,
+            status,
+            output_json,
+            error_message,
+            &["running"],
+            true,
+        )
+    }
+
+    fn mark_subagent_run_final_with_allowed(
+        &self,
+        run_id: &str,
+        status: SubagentRunStatus,
+        output_json: Option<&str>,
+        error_message: Option<&str>,
+        allowed_current_statuses: &[&str],
+        bail_when_unchanged: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         let now = Self::now();
-        let changed = conn
-            .execute(
-                "UPDATE subagent_runs
+        let allowed_statuses = allowed_current_statuses
+            .iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "UPDATE subagent_runs
                  SET status = ?1,
                      output_json = ?2,
                      error_message = ?3,
                      finished_at = ?4,
                      updated_at = ?4
                  WHERE run_id = ?5
-                   AND status = 'running'",
+                   AND status IN ({allowed_statuses})"
+        );
+        let changed = conn
+            .execute(
+                query.as_str(),
                 params![status.as_str(), output_json, error_message, now, run_id],
             )
             .context("Failed to mark subagent run final state")?;
-        if changed == 0 {
+        if changed == 0 && bail_when_unchanged {
             bail!("Subagent run '{run_id}' must be in running state before finalizing");
         }
         Ok(())
+    }
+
+    pub fn get_subagent_session(
+        &self,
+        subagent_session_id: &str,
+    ) -> Result<Option<SubagentSession>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT subagent_session_id, spec_id, status, created_at, updated_at, meta_json
+             FROM subagent_sessions
+             WHERE subagent_session_id = ?1",
+            params![subagent_session_id],
+            |row| {
+                Ok(SubagentSession {
+                    subagent_session_id: row.get(0)?,
+                    spec_id: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    meta_json: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query subagent session")
+    }
+
+    pub fn get_subagent_spec_by_id(&self, spec_id: &str) -> Result<Option<SubagentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT spec_id, name, config_json, created_at, updated_at
+             FROM subagent_specs
+             WHERE spec_id = ?1",
+            params![spec_id],
+            |row| {
+                Ok(SubagentSpec {
+                    spec_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query subagent spec by id")
     }
 
     pub fn get_subagent_run(&self, run_id: &str) -> Result<Option<SubagentRun>> {
@@ -1173,6 +1291,50 @@ mod tests {
         assert_eq!(completed.status, SubagentRunStatus::Succeeded.as_str());
         assert_eq!(completed.output_json.as_deref(), Some(r#"{"text":"done"}"#));
         assert!(completed.finished_at.is_some());
+    }
+
+    #[test]
+    fn subagent_store_cancel_and_recover_running_runs() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let subagent_session = store.create_subagent_session(None, None).unwrap();
+
+        let queued_run = store
+            .enqueue_subagent_run(
+                subagent_session.subagent_session_id.as_str(),
+                "cancel me",
+                None,
+            )
+            .unwrap();
+        store
+            .mark_subagent_run_canceled(queued_run.run_id.as_str())
+            .unwrap();
+        let canceled = store
+            .get_subagent_run(queued_run.run_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, SubagentRunStatus::Canceled.as_str());
+        assert!(canceled.finished_at.is_some());
+
+        let running_candidate = store
+            .enqueue_subagent_run(
+                subagent_session.subagent_session_id.as_str(),
+                "recover me",
+                None,
+            )
+            .unwrap();
+        let running = store.claim_next_queued_subagent_run().unwrap().unwrap();
+        assert_eq!(running.run_id, running_candidate.run_id);
+        assert_eq!(running.status, SubagentRunStatus::Running.as_str());
+
+        let recovered = store.recover_running_subagent_runs_to_queued().unwrap();
+        assert_eq!(recovered, 1);
+        let after_recovery = store
+            .get_subagent_run(running.run_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_recovery.status, SubagentRunStatus::Queued.as_str());
+        assert!(after_recovery.started_at.is_none());
     }
 
     #[test]

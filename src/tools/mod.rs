@@ -25,6 +25,8 @@ pub mod sessions_list;
 pub mod sessions_send;
 pub mod shell;
 pub mod subagent_poll;
+pub mod subagent_send;
+pub mod subagent_stop;
 pub mod traits;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
@@ -55,6 +57,8 @@ pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use shell::ShellTool;
 pub use subagent_poll::SubagentPollTool;
+pub use subagent_send::SubagentSendTool;
+pub use subagent_stop::SubagentStopTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -155,6 +159,8 @@ pub fn all_tools_with_runtime(
         Box::new(SessionsListTool::new(workspace_dir.to_path_buf())),
         Box::new(SessionsHistoryTool::new(workspace_dir.to_path_buf())),
         Box::new(SessionsSendTool::new(workspace_dir.to_path_buf())),
+        Box::new(SubagentSendTool::new(config.clone())),
+        Box::new(SubagentStopTool::new(config)),
         Box::new(SubagentPollTool::new(workspace_dir.to_path_buf())),
     ];
 
@@ -284,6 +290,8 @@ mod tests {
         assert!(names.contains(&"sessions_list"));
         assert!(names.contains(&"sessions_history"));
         assert!(names.contains(&"sessions_send"));
+        assert!(names.contains(&"subagent_send"));
+        assert!(names.contains(&"subagent_stop"));
         assert!(names.contains(&"subagent_poll"));
     }
 
@@ -326,6 +334,8 @@ mod tests {
         assert!(names.contains(&"sessions_list"));
         assert!(names.contains(&"sessions_history"));
         assert!(names.contains(&"sessions_send"));
+        assert!(names.contains(&"subagent_send"));
+        assert!(names.contains(&"subagent_stop"));
         assert!(names.contains(&"subagent_poll"));
     }
 

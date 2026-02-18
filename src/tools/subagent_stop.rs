@@ -1,27 +1,28 @@
 use super::traits::{Tool, ToolResult};
-use crate::session::SessionStore;
+use crate::config::Config;
+use crate::subagent::SubagentRuntime;
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
+use std::sync::Arc;
 
-pub struct SubagentPollTool {
-    workspace_dir: PathBuf,
+pub struct SubagentStopTool {
+    config: Arc<Config>,
 }
 
-impl SubagentPollTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+impl SubagentStopTool {
+    pub fn new(config: Arc<Config>) -> Self {
+        Self { config }
     }
 }
 
 #[async_trait]
-impl Tool for SubagentPollTool {
+impl Tool for SubagentStopTool {
     fn name(&self) -> &str {
-        "subagent_poll"
+        "subagent_stop"
     }
 
     fn description(&self) -> &str {
-        "Poll persisted subagent run state from memory/sessions.db"
+        "Cancel a queued or running subagent run"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -54,8 +55,8 @@ impl Tool for SubagentPollTool {
             }
         };
 
-        let store = SessionStore::new(&self.workspace_dir)?;
-        let Some(run) = store.get_subagent_run(run_id)? else {
+        let runtime = SubagentRuntime::shared(Arc::clone(&self.config))?;
+        let Some(run) = runtime.stop_run(run_id).await? else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -69,9 +70,6 @@ impl Tool for SubagentPollTool {
                 "run_id": run.run_id,
                 "subagent_session_id": run.subagent_session_id,
                 "status": run.status,
-                "prompt": run.prompt,
-                "input_json": run.input_json,
-                "output_json": run.output_json,
                 "error_message": run.error_message,
                 "queued_at": run.queued_at,
                 "started_at": run.started_at,
@@ -86,44 +84,45 @@ impl Tool for SubagentPollTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionStore;
-    use crate::subagent::{EnqueueSubagentRunRequest, SubagentRuntime};
+    use crate::subagent::EnqueueSubagentRunRequest;
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn subagent_poll_returns_existing_run() {
+    async fn subagent_stop_returns_not_found_for_missing_run() {
         let workspace = TempDir::new().unwrap();
-        let store = std::sync::Arc::new(SessionStore::new(workspace.path()).unwrap());
-        let runtime = SubagentRuntime::new(store);
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let tool = SubagentStopTool::new(Arc::new(config));
+
+        let result = tool.execute(json!({"run_id":"missing-run"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_cancels_queued_run() {
+        let workspace = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let config = Arc::new(config);
+        let runtime = SubagentRuntime::shared(Arc::clone(&config)).unwrap();
 
         let run = runtime
             .enqueue_run(EnqueueSubagentRunRequest {
                 subagent_session_id: None,
                 spec_id: None,
-                prompt: "poll me".to_string(),
+                prompt: "cancel me".to_string(),
                 input_json: None,
                 session_meta_json: None,
             })
             .await
             .unwrap();
 
-        let tool = SubagentPollTool::new(workspace.path().to_path_buf());
-        let result = tool.execute(json!({ "run_id": run.run_id })).await.unwrap();
+        let tool = SubagentStopTool::new(config);
+        let result = tool.execute(json!({"run_id":run.run_id})).await.unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("queued"));
-    }
-
-    #[tokio::test]
-    async fn subagent_poll_returns_not_found_for_missing_run() {
-        let workspace = TempDir::new().unwrap();
-        let tool = SubagentPollTool::new(workspace.path().to_path_buf());
-        let result = tool
-            .execute(json!({ "run_id": "missing-run-id" }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("not found"));
+        assert!(result.output.contains("canceled"));
     }
 }
