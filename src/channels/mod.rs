@@ -1564,7 +1564,7 @@ mod tests {
     use crate::channels::traits::ChatType;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatMessage, Provider};
+    use crate::providers::{ChatRequest, ChatResponse, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1625,15 +1625,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for SlowProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             tokio::time::sleep(self.delay).await;
-            Ok(format!("echo: {message}"))
+            let message = request
+                .messages
+                .iter()
+                .rfind(|m| m.role == "user")
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
+            Ok(ChatResponse {
+                text: Some(format!("echo: {message}")),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -1655,30 +1663,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for ToolCallingProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok(tool_call_payload())
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            let has_tool_results = messages
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_results = request
+                .messages
                 .iter()
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
-            if has_tool_results {
-                Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
+            let text = if has_tool_results {
+                "BTC is currently around $65,000 based on latest tool output.".to_string()
             } else {
-                Ok(tool_call_payload())
-            }
+                tool_call_payload()
+            };
+            Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -1686,30 +1689,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for ToolCallingAliasProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok(tool_call_payload_with_alias_tag())
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            let has_tool_results = messages
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_results = request
+                .messages
                 .iter()
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
-            if has_tool_results {
-                Ok("BTC alias-tag flow resolved to final text output.".to_string())
+            let text = if has_tool_results {
+                "BTC alias-tag flow resolved to final text output.".to_string()
             } else {
-                Ok(tool_call_payload_with_alias_tag())
-            }
+                tool_call_payload_with_alias_tag()
+            };
+            Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -1979,29 +1977,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for HistoryCaptureProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            let captured = messages
+        ) -> anyhow::Result<ChatResponse> {
+            let captured = request
+                .messages
                 .iter()
                 .map(|msg| (msg.role.clone(), msg.content.clone()))
                 .collect::<Vec<_>>();
             let mut lock = self.captured_history.lock().await;
             *lock = captured;
-            Ok("ok".to_string())
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 

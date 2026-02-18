@@ -257,29 +257,28 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        self.chat_with_system(None, message, model, temperature)
-            .await
+        let messages = vec![ChatMessage::user(message)];
+        let response = self
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                model,
+                temperature,
+            )
+            .await?;
+        Ok(response.text_or_empty().to_string())
     }
 
-    /// One-shot chat with optional system prompt.
-    ///
-    /// Kept for compatibility and advanced one-shot prompting.
-    async fn chat_with_system(
+    /// Structured chat API for all provider callers.
+    async fn chat(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String>;
-
-    /// Multi-turn conversation. Default implementation extracts the last user
-    /// message and delegates to `chat_with_system`.
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
+        let messages = with_prompt_guided_tools(self, request)?;
         let system = messages
             .iter()
             .find(|m| m.role == "system")
@@ -289,61 +288,66 @@ pub trait Provider: Send + Sync {
             .rfind(|m| m.role == "user")
             .map(|m| m.content.as_str())
             .unwrap_or("");
-        self.chat_with_system(system, last_user, model, temperature)
-            .await
-    }
 
-    /// Structured chat API for agent loop callers.
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
-        // If tools are provided but provider doesn't support native tools,
-        // inject tool instructions into system prompt as fallback.
-        if let Some(tools) = request.tools {
-            if !tools.is_empty() && !self.supports_native_tools() {
-                let tool_instructions = match self.convert_tools(tools) {
-                    ToolsPayload::PromptGuided { instructions } => instructions,
-                    payload => {
-                        anyhow::bail!(
-                            "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
-                        )
-                    }
-                };
-                let mut modified_messages = request.messages.to_vec();
-
-                // Inject tool instructions into an existing system message.
-                // If none exists, prepend one to the conversation.
-                if let Some(system_message) =
-                    modified_messages.iter_mut().find(|m| m.role == "system")
-                {
-                    if !system_message.content.is_empty() {
-                        system_message.content.push_str("\n\n");
-                    }
-                    system_message.content.push_str(&tool_instructions);
-                } else {
-                    modified_messages.insert(0, ChatMessage::system(tool_instructions));
-                }
-
-                let text = self
-                    .chat_with_history(&modified_messages, model, temperature)
-                    .await?;
-                return Ok(ChatResponse {
-                    text: Some(text),
-                    tool_calls: Vec::new(),
-                });
-            }
-        }
-
+        #[allow(deprecated)]
         let text = self
-            .chat_with_history(request.messages, model, temperature)
+            .chat_with_system(system, last_user, model, temperature)
             .await?;
+
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
         })
+    }
+
+    /// One-shot chat with optional system prompt.
+    ///
+    /// Kept for compatibility and advanced one-shot prompting.
+    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = system_prompt {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+        messages.push(ChatMessage::user(message));
+        let response = self
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                model,
+                temperature,
+            )
+            .await?;
+        Ok(response.text_or_empty().to_string())
+    }
+
+    /// Multi-turn conversation compatibility wrapper.
+    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let response = self
+            .chat(
+                ChatRequest {
+                    messages,
+                    tools: None,
+                },
+                model,
+                temperature,
+            )
+            .await?;
+        Ok(response.text_or_empty().to_string())
     }
 
     /// Whether provider supports native tool calls over API.
@@ -358,8 +362,8 @@ pub trait Provider: Send + Sync {
     }
 
     /// Chat with tool definitions for native function calling support.
-    /// The default implementation falls back to chat_with_history and returns
-    /// an empty tool_calls vector (prompt-based tool use only).
+    /// Compatibility wrapper retained for older call sites.
+    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -367,11 +371,15 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let text = self.chat_with_history(messages, model, temperature).await?;
-        Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: Vec::new(),
-        })
+        self.chat(
+            ChatRequest {
+                messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        )
+        .await
     }
 
     /// Whether provider supports streaming responses.
@@ -445,6 +453,41 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     }
 
     instructions
+}
+
+/// Inject prompt-guided tool instructions for providers that do not support
+/// native tool-calling payloads.
+pub fn with_prompt_guided_tools<P: Provider + ?Sized>(
+    provider: &P,
+    request: ChatRequest<'_>,
+) -> anyhow::Result<Vec<ChatMessage>> {
+    if let Some(tools) = request.tools {
+        if !tools.is_empty() && !provider.supports_native_tools() {
+            let tool_instructions = match provider.convert_tools(tools) {
+                ToolsPayload::PromptGuided { instructions } => instructions,
+                payload => {
+                    anyhow::bail!(
+                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                    )
+                }
+            };
+
+            let mut modified_messages = request.messages.to_vec();
+            if let Some(system_message) = modified_messages.iter_mut().find(|m| m.role == "system")
+            {
+                if !system_message.content.is_empty() {
+                    system_message.content.push_str("\n\n");
+                }
+                system_message.content.push_str(&tool_instructions);
+            } else {
+                modified_messages.insert(0, ChatMessage::system(tool_instructions));
+            }
+
+            return Ok(modified_messages);
+        }
+    }
+
+    Ok(request.messages.to_vec())
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -151,13 +151,12 @@ impl Provider for ReliableProvider {
         Ok(())
     }
 
-    async fn chat_with_system(
+    async fn chat(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -167,112 +166,14 @@ impl Provider for ReliableProvider {
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_system(system_prompt, message, current_model, temperature)
-                        .await
-                    {
-                        Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
-                                tracing::info!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt,
-                                    original_model = model,
-                                    "Provider recovered (failover/retry)"
-                                );
-                            }
-                            return Ok(resp);
-                        }
-                        Err(e) => {
-                            let non_retryable = is_non_retryable(&e);
-                            let rate_limited = is_rate_limited(&e);
-
-                            let failure_reason = if rate_limited {
-                                "rate_limited"
-                            } else if non_retryable {
-                                "non_retryable"
-                            } else {
-                                "retryable"
-                            };
-                            failures.push(format!(
-                                "{provider_name}/{current_model} attempt {}/{}: {failure_reason}",
-                                attempt + 1,
-                                self.max_retries + 1
-                            ));
-
-                            // On rate-limit, try rotating API key
-                            if rate_limited {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::info!(
-                                        provider = provider_name,
-                                        "Rate limited, rotated API key (key ending ...{})",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
-                            if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    "Non-retryable error, moving on"
-                                );
-                                break;
-                            }
-
-                            if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    "Provider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            }
-                        }
-                    }
-                }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
-            }
-        }
-
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
-    }
-
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let models = self.model_chain(model);
-        let mut failures = Vec::new();
-
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
-                let mut backoff_ms = self.base_backoff_ms;
-
-                for attempt in 0..=self.max_retries {
-                    match provider
-                        .chat_with_history(messages, current_model, temperature)
+                        .chat(
+                            ChatRequest {
+                                messages: request.messages,
+                                tools: request.tools,
+                            },
+                            current_model,
+                            temperature,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -428,8 +329,10 @@ impl Provider for ReliableProvider {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::providers::ChatMessage;
     use std::sync::Arc;
 
     struct MockProvider {
@@ -441,31 +344,20 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            _request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
                 anyhow::bail!(self.error);
             }
-            Ok(self.response.to_string())
-        }
-
-        async fn chat_with_history(
-            &self,
-            _messages: &[ChatMessage],
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if attempt <= self.fail_until_attempt {
-                anyhow::bail!(self.error);
-            }
-            Ok(self.response.to_string())
+            Ok(ChatResponse {
+                text: Some(self.response.to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -479,19 +371,21 @@ mod tests {
 
     #[async_trait]
     impl Provider for ModelAwareMock {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            _request: ChatRequest<'_>,
             model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models_seen.lock().push(model.to_string());
             if self.fail_models.contains(&model) {
                 anyhow::bail!("500 model {} unavailable", model);
             }
-            Ok(self.response.to_string())
+            Ok(ChatResponse {
+                text: Some(self.response.to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -912,16 +806,13 @@ mod tests {
 
     #[async_trait]
     impl Provider for Arc<ModelAwareMock> {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            system_prompt: Option<&str>,
-            message: &str,
+            request: ChatRequest<'_>,
             model: &str,
             temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.as_ref()
-                .chat_with_system(system_prompt, message, model, temperature)
-                .await
+        ) -> anyhow::Result<ChatResponse> {
+            self.as_ref().chat(request, model, temperature).await
         }
     }
 }

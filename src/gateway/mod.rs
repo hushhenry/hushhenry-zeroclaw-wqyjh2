@@ -903,15 +903,17 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            _request: crate::providers::ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".into())
+            Ok(crate::providers::ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+            })
         }
     }
 

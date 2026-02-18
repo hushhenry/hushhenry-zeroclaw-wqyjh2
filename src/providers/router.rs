@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, ChatRequest, ChatResponse};
+use super::traits::{ChatRequest, ChatResponse};
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -92,40 +92,6 @@ impl RouterProvider {
 
 #[async_trait]
 impl Provider for RouterProvider {
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let (provider_idx, resolved_model) = self.resolve(model);
-
-        let (provider_name, provider) = &self.providers[provider_idx];
-        tracing::info!(
-            provider = provider_name.as_str(),
-            model = resolved_model.as_str(),
-            "Router dispatching request"
-        );
-
-        provider
-            .chat_with_system(system_prompt, message, &resolved_model, temperature)
-            .await
-    }
-
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider
-            .chat_with_history(messages, &resolved_model, temperature)
-            .await
-    }
-
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -133,7 +99,12 @@ impl Provider for RouterProvider {
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
+        let (provider_name, provider) = &self.providers[provider_idx];
+        tracing::info!(
+            provider = provider_name.as_str(),
+            model = resolved_model.as_str(),
+            "Router dispatching request"
+        );
         provider.chat(request, &resolved_model, temperature).await
     }
 
@@ -156,6 +127,7 @@ impl Provider for RouterProvider {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,16 +159,18 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            _request: ChatRequest<'_>,
             model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
-            Ok(self.response.to_string())
+            Ok(ChatResponse {
+                text: Some(self.response.to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -241,16 +215,13 @@ mod tests {
     // Arc<MockProvider> should also be a Provider
     #[async_trait]
     impl Provider for Arc<MockProvider> {
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            system_prompt: Option<&str>,
-            message: &str,
+            request: ChatRequest<'_>,
             model: &str,
             temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.as_ref()
-                .chat_with_system(system_prompt, message, model, temperature)
-                .await
+        ) -> anyhow::Result<ChatResponse> {
+            self.as_ref().chat(request, model, temperature).await
         }
     }
 

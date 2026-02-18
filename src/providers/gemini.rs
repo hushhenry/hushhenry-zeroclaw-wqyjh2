@@ -3,7 +3,10 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::Provider;
+use crate::providers::traits::{
+    with_prompt_guided_tools, ChatRequest as ProviderChatRequest,
+    ChatResponse as ProviderChatResponse, Provider,
+};
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -254,13 +257,12 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
-    async fn chat_with_system(
+    async fn chat(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
+        request: ProviderChatRequest<'_>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProviderChatResponse> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -270,6 +272,17 @@ impl Provider for GeminiProvider {
                  4. Run `zeroclaw onboard` to configure"
             )
         })?;
+
+        let messages = with_prompt_guided_tools(self, request)?;
+        let system_prompt = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+        let message = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
 
         // Build request
         let system_instruction = system_prompt.map(|sys| Content {
@@ -314,12 +327,17 @@ impl Provider for GeminiProvider {
         }
 
         // Extract text from response
-        result
+        let text = result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content.parts.into_iter().next())
             .and_then(|p| p.text)
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+
+        Ok(ProviderChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+        })
     }
 }
 

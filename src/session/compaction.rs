@@ -1,3 +1,4 @@
+use crate::providers::ChatRequest;
 use crate::providers::{ChatMessage, Provider};
 use crate::session::{SessionId, SessionStore};
 use crate::util::truncate_with_ellipsis;
@@ -180,14 +181,21 @@ pub async fn maybe_compact(
     let transcript = build_transcript(to_compact);
     let prompt = build_compaction_prompt(state.summary.as_deref(), &transcript, system_prompt);
 
+    let summary_messages = vec![
+        ChatMessage::system("You are a session compaction engine. Return compact durable context."),
+        ChatMessage::user(prompt),
+    ];
     let summary_raw = provider
-        .chat_with_system(
-            Some("You are a session compaction engine. Return compact durable context."),
-            &prompt,
+        .chat(
+            ChatRequest {
+                messages: &summary_messages,
+                tools: None,
+            },
             model,
             0.1,
         )
         .await
+        .map(|response| response.text_or_empty().to_string())
         .unwrap_or_else(|_| {
             truncate_with_ellipsis(&transcript, SESSION_COMPACTION_MAX_SUMMARY_CHARS)
         });

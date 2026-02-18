@@ -632,6 +632,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
+        #[allow(deprecated)]
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
@@ -778,6 +779,7 @@ impl Provider for OpenAiCompatibleProvider {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

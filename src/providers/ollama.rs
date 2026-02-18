@@ -1,4 +1,7 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{
+    with_prompt_guided_tools, ChatRequest as ProviderChatRequest,
+    ChatResponse as ProviderChatResponse, Provider,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -259,6 +262,61 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let messages = with_prompt_guided_tools(self, request)?;
+        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let response = self
+            .send_request(api_messages, &normalized_model, temperature, should_auth)
+            .await?;
+
+        if !response.message.tool_calls.is_empty() {
+            tracing::debug!(
+                "Ollama returned {} tool call(s), formatting for loop parser",
+                response.message.tool_calls.len()
+            );
+            return Ok(ProviderChatResponse {
+                text: Some(self.format_tool_calls_for_loop(&response.message.tool_calls)),
+                tool_calls: vec![],
+            });
+        }
+
+        let content = response.message.content;
+        if content.is_empty() {
+            if let Some(thinking) = &response.message.thinking {
+                tracing::warn!(
+                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
+                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                );
+                return Ok(ProviderChatResponse {
+                    text: Some(format!(
+                        "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
+                        if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                    )),
+                    tool_calls: vec![],
+                });
+            }
+            tracing::warn!("Ollama returned empty content with no tool calls");
+        }
+
+        Ok(ProviderChatResponse {
+            text: Some(content),
+            tool_calls: vec![],
+        })
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

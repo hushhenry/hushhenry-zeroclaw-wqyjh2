@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -197,15 +197,24 @@ impl Tool for DelegateTool {
         let temperature = agent_config.temperature.unwrap_or(0.7);
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
-        let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
-            provider.chat_with_system(
-                agent_config.system_prompt.as_deref(),
-                &full_prompt,
-                &agent_config.model,
-                temperature,
-            ),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(DELEGATE_TIMEOUT_SECS), async {
+            let mut messages = Vec::new();
+            if let Some(system_prompt) = agent_config.system_prompt.as_deref() {
+                messages.push(ChatMessage::system(system_prompt));
+            }
+            messages.push(ChatMessage::user(&full_prompt));
+            let response = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                    },
+                    &agent_config.model,
+                    temperature,
+                )
+                .await?;
+            Ok::<String, anyhow::Error>(response.text_or_empty().to_string())
+        })
         .await;
 
         let result = match result {
