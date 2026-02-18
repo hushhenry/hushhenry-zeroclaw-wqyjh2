@@ -120,9 +120,12 @@ impl WhatsAppChannel {
                     messages.push(ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         reply_target: normalized_from.clone(),
-                        sender: normalized_from,
+                        sender: normalized_from.clone(),
                         content,
                         channel: "whatsapp".to_string(),
+                        chat_type: "direct".to_string(),
+                        conversation_id: normalized_from,
+                        thread_id: None,
                         timestamp,
                     });
                 }

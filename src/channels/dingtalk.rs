@@ -51,16 +51,19 @@ impl DingTalkChannel {
         }
     }
 
-    fn resolve_chat_id(data: &serde_json::Value, sender_id: &str) -> String {
-        let is_private_chat = data
-            .get("conversationType")
+    fn is_private_chat(data: &serde_json::Value) -> bool {
+        data.get("conversationType")
             .and_then(|value| {
                 value
                     .as_str()
                     .map(|v| v == "1")
                     .or_else(|| value.as_i64().map(|v| v == 1))
             })
-            .unwrap_or(true);
+            .unwrap_or(true)
+    }
+
+    fn resolve_chat_id(data: &serde_json::Value, sender_id: &str) -> String {
+        let is_private_chat = Self::is_private_chat(data);
 
         if is_private_chat {
             sender_id.to_string()
@@ -229,6 +232,11 @@ impl Channel for DingTalkChannel {
 
                     // Private chat uses sender ID, group chat uses conversation ID.
                     let chat_id = Self::resolve_chat_id(&data, sender_id);
+                    let chat_type = if Self::is_private_chat(&data) {
+                        "direct"
+                    } else {
+                        "group"
+                    };
 
                     // Store session webhook for later replies
                     if let Some(webhook) = data.get("sessionWebhook").and_then(|w| w.as_str()) {
@@ -260,9 +268,12 @@ impl Channel for DingTalkChannel {
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
-                        reply_target: chat_id,
+                        reply_target: chat_id.clone(),
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
+                        chat_type: chat_type.to_string(),
+                        conversation_id: chat_id,
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

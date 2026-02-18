@@ -429,9 +429,12 @@ impl Channel for EmailChannel {
                         let msg = ChannelMessage {
                             id,
                             reply_target: sender.clone(),
-                            sender,
+                            sender: sender.clone(),
                             content,
                             channel: "email".to_string(),
+                            chat_type: "direct".to_string(),
+                            conversation_id: sender,
+                            thread_id: None,
                             timestamp: ts,
                         };
                         if tx.send(msg).await.is_err() {

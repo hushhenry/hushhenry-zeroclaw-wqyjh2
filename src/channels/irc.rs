@@ -561,14 +561,18 @@ impl Channel for IrcChannel {
                     } else {
                         format!("{IRC_STYLE_PREFIX}{text}")
                     };
+                    let chat_type = if is_channel { "group" } else { "direct" };
 
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: sender_nick.to_string(),
-                        reply_target: reply_to,
+                        reply_target: reply_to.clone(),
                         content,
                         channel: "irc".to_string(),
+                        chat_type: chat_type.to_string(),
+                        conversation_id: reply_to,
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

@@ -43,6 +43,9 @@ impl Channel for CliChannel {
                 reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
+                chat_type: "direct".to_string(),
+                conversation_id: "user".to_string(),
+                thread_id: None,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -106,6 +109,9 @@ mod tests {
             reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
+            chat_type: "direct".into(),
+            conversation_id: "user".into(),
+            thread_id: None,
             timestamp: 1_234_567_890,
         };
         assert_eq!(msg.id, "test-id");
@@ -124,6 +130,9 @@ mod tests {
             reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
+            chat_type: "direct".into(),
+            conversation_id: "s".into(),
+            thread_id: None,
             timestamp: 0,
         };
         let cloned = msg.clone();

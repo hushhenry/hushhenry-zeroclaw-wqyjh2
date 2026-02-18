@@ -219,6 +219,13 @@ impl MattermostChannel {
             reply_target,
             content: text.to_string(),
             channel: "mattermost".to_string(),
+            chat_type: "group".to_string(),
+            conversation_id: channel_id.to_string(),
+            thread_id: Some(if root_id.is_empty() {
+                id.to_string()
+            } else {
+                root_id.to_string()
+            }),
             #[allow(clippy::cast_sign_loss)]
             timestamp: (create_at / 1000) as u64,
         })

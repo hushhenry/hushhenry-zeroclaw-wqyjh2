@@ -8,6 +8,9 @@ pub struct ChannelMessage {
     pub reply_target: String,
     pub content: String,
     pub channel: String,
+    pub chat_type: String,
+    pub conversation_id: String,
+    pub thread_id: Option<String>,
     pub timestamp: u64,
 }
 
@@ -98,6 +101,9 @@ mod tests {
                 reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
+                chat_type: "direct".into(),
+                conversation_id: "tester".into(),
+                thread_id: None,
                 timestamp: 123,
             })
             .await
@@ -113,6 +119,9 @@ mod tests {
             reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
+            chat_type: "direct".into(),
+            conversation_id: "alice".into(),
+            thread_id: None,
             timestamp: 999,
         };
 
@@ -122,6 +131,9 @@ mod tests {
         assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
+        assert_eq!(cloned.chat_type, "direct");
+        assert_eq!(cloned.conversation_id, "alice");
+        assert!(cloned.thread_id.is_none());
         assert_eq!(cloned.timestamp, 999);
     }
 

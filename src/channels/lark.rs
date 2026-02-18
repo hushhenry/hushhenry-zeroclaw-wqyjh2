@@ -453,6 +453,9 @@ impl LarkChannel {
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
+                        chat_type: lark_msg.chat_type.clone(),
+                        conversation_id: lark_msg.chat_id.clone(),
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -610,6 +613,10 @@ impl LarkChannel {
             .pointer("/message/chat_id")
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
+        let chat_type = event
+            .pointer("/message/chat_type")
+            .and_then(|c| c.as_str())
+            .unwrap_or("p2p");
 
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
@@ -617,6 +624,9 @@ impl LarkChannel {
             reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
+            chat_type: chat_type.to_string(),
+            conversation_id: chat_id.to_string(),
+            thread_id: None,
             timestamp,
         });
 

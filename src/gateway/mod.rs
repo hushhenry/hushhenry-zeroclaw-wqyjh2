@@ -832,6 +832,9 @@ mod tests {
             reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
+            chat_type: "direct".into(),
+            conversation_id: "+1234567890".into(),
+            thread_id: None,
             timestamp: 1,
         };
 

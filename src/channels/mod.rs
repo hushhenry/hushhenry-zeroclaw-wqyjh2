@@ -91,32 +91,12 @@ fn is_new_session_command(content: &str) -> bool {
 }
 
 fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
-    let thread_parts = if msg.channel == "mattermost" {
-        msg.reply_target.split_once(':')
-    } else {
-        None
-    };
-
-    let (conversation_id, thread_id) = if let Some((conversation_id, thread_id)) = thread_parts {
-        (conversation_id.to_string(), Some(thread_id.to_string()))
-    } else if msg.reply_target == msg.sender {
-        (msg.sender.clone(), None)
-    } else {
-        (msg.reply_target.clone(), None)
-    };
-
-    let chat_type = if thread_id.is_some() || msg.reply_target != msg.sender {
-        "group".to_string()
-    } else {
-        "direct".to_string()
-    };
-
     SessionContext {
         channel: msg.channel.clone(),
-        chat_type,
+        chat_type: msg.chat_type.clone(),
         sender_id: msg.sender.clone(),
-        conversation_id,
-        thread_id,
+        conversation_id: msg.conversation_id.clone(),
+        thread_id: msg.thread_id.clone(),
     }
 }
 
@@ -1627,6 +1607,9 @@ mod tests {
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                chat_type: "group".to_string(),
+                conversation_id: "chat-42".to_string(),
+                thread_id: None,
                 timestamp: 1,
             },
         )
@@ -1672,6 +1655,9 @@ mod tests {
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                chat_type: "group".to_string(),
+                conversation_id: "chat-84".to_string(),
+                thread_id: None,
                 timestamp: 2,
             },
         )
@@ -1770,6 +1756,9 @@ mod tests {
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
+            chat_type: "direct".to_string(),
+            conversation_id: "alice".to_string(),
+            thread_id: None,
             timestamp: 1,
         })
         .await
@@ -1780,6 +1769,9 @@ mod tests {
             reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
+            chat_type: "direct".to_string(),
+            conversation_id: "bob".to_string(),
+            thread_id: None,
             timestamp: 2,
         })
         .await
@@ -2043,6 +2035,9 @@ mod tests {
             reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
+            chat_type: "group".into(),
+            conversation_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
 
@@ -2057,6 +2052,9 @@ mod tests {
             reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
+            chat_type: "group".into(),
+            conversation_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
         let msg2 = traits::ChannelMessage {
@@ -2065,6 +2063,9 @@ mod tests {
             reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
+            chat_type: "group".into(),
+            conversation_id: "C456".into(),
+            thread_id: None,
             timestamp: 2,
         };
 
@@ -2085,6 +2086,9 @@ mod tests {
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
+            chat_type: "group".into(),
+            conversation_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
         let msg2 = traits::ChannelMessage {
@@ -2093,6 +2097,9 @@ mod tests {
             reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
+            chat_type: "group".into(),
+            conversation_id: "C456".into(),
+            thread_id: None,
             timestamp: 2,
         };
 
