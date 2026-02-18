@@ -469,6 +469,19 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&str>) -> usize {
+    let Some(session_key) = backlog_key else {
+        return 0;
+    };
+
+    let backlog_messages = crate::session::backlog::drain(session_key);
+    for message in &backlog_messages {
+        history.push(ChatMessage::user(format!("[Backlog]\n{message}")));
+    }
+
+    backlog_messages.len()
+}
+
 #[derive(Debug)]
 struct ParsedToolCall {
     name: String,
@@ -500,6 +513,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None,
     )
     .await
 }
@@ -518,6 +532,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    backlog_key: Option<&str>,
 ) -> Result<String> {
     let tool_specs = tools_to_specs(tools_registry);
     let tool_slice = if tool_specs.is_empty() {
@@ -676,6 +691,7 @@ pub(crate) async fn run_tool_call_loop(
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        let _ = inject_backlog_messages(history, backlog_key);
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -851,6 +867,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -925,6 +942,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
             )
             .await
             {
@@ -1097,6 +1115,42 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn inject_backlog_messages_drains_and_prefixes_user_messages() {
+        crate::session::backlog::clear();
+        crate::session::backlog::enqueue("session-checkpoint", "steer one");
+        crate::session::backlog::enqueue("session-checkpoint", "steer two");
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("task start"),
+        ];
+        let injected = inject_backlog_messages(&mut history, Some("session-checkpoint"));
+
+        assert_eq!(injected, 2);
+        assert!(history
+            .iter()
+            .any(|msg| msg.role == "user" && msg.content == "[Backlog]\nsteer one"));
+        assert!(history
+            .iter()
+            .any(|msg| msg.role == "user" && msg.content == "[Backlog]\nsteer two"));
+        assert!(crate::session::backlog::drain("session-checkpoint").is_empty());
+    }
+
+    #[test]
+    fn inject_backlog_messages_noop_without_key() {
+        crate::session::backlog::clear();
+        crate::session::backlog::enqueue("session-noop", "ignored");
+
+        let mut history = vec![ChatMessage::system("system")];
+        let injected = inject_backlog_messages(&mut history, None);
+
+        assert_eq!(injected, 0);
+        assert_eq!(history.len(), 1);
+        let pending = crate::session::backlog::drain("session-noop");
+        assert_eq!(pending, vec!["ignored"]);
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;

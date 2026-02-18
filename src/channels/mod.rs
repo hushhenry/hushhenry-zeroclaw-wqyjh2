@@ -86,6 +86,26 @@ struct ChannelRuntimeContext {
     session_resolver: SessionResolver,
 }
 
+struct SessionTurnGuard {
+    session_key: String,
+}
+
+impl SessionTurnGuard {
+    fn acquire(session_key: String) -> Option<Self> {
+        if crate::session::backlog::try_begin_turn(&session_key) {
+            Some(Self { session_key })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SessionTurnGuard {
+    fn drop(&mut self) {
+        crate::session::backlog::finish_turn(&self.session_key);
+    }
+}
+
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
@@ -290,6 +310,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         channel_delivery_instructions(&msg.channel),
     );
     let mut active_session: Option<SessionId> = None;
+    let mut session_turn_guard: Option<SessionTurnGuard> = None;
 
     if ctx.session_enabled {
         let session_context = normalize_session_context(&msg);
@@ -376,6 +397,28 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 .await;
             }
             return;
+        }
+
+        if let Some(session_id) = active_session.as_ref() {
+            let session_key = session_id.as_str().to_string();
+            if let Some(guard) = SessionTurnGuard::acquire(session_key.clone()) {
+                session_turn_guard = Some(guard);
+            } else {
+                crate::session::backlog::enqueue(&session_key, msg.content.clone());
+                tracing::info!(
+                    session_id = %session_id.as_str(),
+                    "Session busy; queued message in backlog"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(&SendMessage::new(
+                            "⏳ Session is busy. Your message was queued and will be applied as steering context shortly.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+                return;
+            }
         }
     }
 
@@ -544,9 +587,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             true, // silent — channels don't write to stdout
             None,
             msg.channel.as_str(),
+            active_session.as_ref().map(SessionId::as_str),
         ),
     )
     .await;
+
+    drop(session_turn_guard);
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.stop_typing(&msg.reply_target).await {
