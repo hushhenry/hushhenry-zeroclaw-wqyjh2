@@ -38,6 +38,7 @@ use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::session::{SessionContext, SessionId, SessionResolver, SessionStore};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -71,10 +72,56 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    session_enabled: bool,
+    session_history_limit: u32,
+    session_store: Option<Arc<SessionStore>>,
+    session_resolver: SessionResolver,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+fn is_new_session_command(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("/new") {
+        return false;
+    }
+    trimmed.chars().nth(4).is_none_or(|ch| ch.is_whitespace())
+}
+
+fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
+    let thread_parts = if msg.channel == "mattermost" {
+        msg.reply_target.split_once(':')
+    } else {
+        None
+    };
+
+    let (conversation_id, thread_id) = if let Some((conversation_id, thread_id)) = thread_parts {
+        (conversation_id.to_string(), Some(thread_id.to_string()))
+    } else if msg.reply_target == msg.sender {
+        (msg.sender.clone(), None)
+    } else {
+        (msg.reply_target.clone(), None)
+    };
+
+    let chat_type = if thread_id.is_some() || msg.reply_target != msg.sender {
+        "group".to_string()
+    } else {
+        "direct".to_string()
+    };
+
+    SessionContext {
+        channel: msg.channel.clone(),
+        chat_type,
+        sender_id: msg.sender.clone(),
+        conversation_id,
+        thread_id,
+    }
+}
+
+fn short_session_id(session_id: &SessionId) -> String {
+    session_id.as_str().chars().take(8).collect::<String>()
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -86,10 +133,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+async fn build_memory_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -165,7 +216,71 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let mut active_session: Option<SessionId> = None;
+
+    if ctx.session_enabled {
+        let session_context = normalize_session_context(&msg);
+        let session_key = ctx.session_resolver.resolve(&session_context);
+
+        if is_new_session_command(&msg.content) {
+            if let Some(session_store) = ctx.session_store.as_ref() {
+                match session_store.create_new(&session_key) {
+                    Ok(session_id) => {
+                        let confirmation = format!(
+                            "Started a new session `{}` for this conversation.",
+                            short_session_id(&session_id)
+                        );
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Err(error) = channel
+                                .send(&SendMessage::new(confirmation, &msg.reply_target))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to send /new confirmation on {}: {error}",
+                                    channel.name()
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "Failed to create new session for key {}: {error}",
+                            session_key
+                        );
+                        if let Some(channel) = target_channel.as_ref() {
+                            let _ = channel
+                                .send(&SendMessage::new(
+                                    "⚠️ Failed to create a new session. Please try again.",
+                                    &msg.reply_target,
+                                ))
+                                .await;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(session_store) = ctx.session_store.as_ref() {
+            match session_store.get_or_create_active(&session_key) {
+                Ok(session_id) => active_session = Some(session_id),
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to get active session for key {}: {error}",
+                        session_key
+                    );
+                }
+            }
+        }
+    }
+
+    let memory_context = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        active_session.as_ref().map(SessionId::as_str),
+    )
+    .await;
 
     if ctx.auto_save_memory {
         let autosave_key = conversation_memory_key(&msg);
@@ -175,7 +290,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                active_session.as_ref().map(SessionId::as_str),
             )
             .await;
     }
@@ -186,8 +301,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         format!("{memory_context}{}", msg.content)
     };
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
-
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.reply_target).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
@@ -197,14 +310,37 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![
-        ChatMessage::system(ctx.system_prompt.as_str()),
-        ChatMessage::user(&enriched_message),
-    ];
+    let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
+
+    if ctx.session_enabled {
+        if let (Some(session_store), Some(session_id)) =
+            (ctx.session_store.as_ref(), active_session.as_ref())
+        {
+            match session_store.load_recent_messages(session_id, ctx.session_history_limit) {
+                Ok(messages) => {
+                    for message in messages {
+                        match message.role.as_str() {
+                            "system" => history.push(ChatMessage::system(message.content)),
+                            "user" => history.push(ChatMessage::user(message.content)),
+                            "assistant" => history.push(ChatMessage::assistant(message.content)),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load recent session history {}: {error}",
+                        session_id.as_str()
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
         history.push(ChatMessage::system(instructions));
     }
+    history.push(ChatMessage::user(&enriched_message));
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -238,10 +374,33 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(&response, &msg.reply_target))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+            }
+
+            if ctx.session_enabled {
+                if let (Some(session_store), Some(session_id)) =
+                    (ctx.session_store.as_ref(), active_session.as_ref())
+                {
+                    if let Err(error) =
+                        session_store.append_message(session_id, "user", &msg.content, None)
+                    {
+                        tracing::warn!(
+                            "Failed to persist user session message {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
+                    if let Err(error) =
+                        session_store.append_message(session_id, "assistant", &response, None)
+                    {
+                        tracing::warn!(
+                            "Failed to persist assistant session message {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
                 }
             }
         }
@@ -984,6 +1143,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let session_store = if config.session.enabled {
+        Some(Arc::new(SessionStore::new(&config.workspace_dir)?))
+    } else {
+        None
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -1221,6 +1385,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        session_enabled: config.session.enabled,
+        session_history_limit: config.session.history_limit,
+        session_store,
+        session_resolver: SessionResolver::new(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1445,6 +1613,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         process_channel_message(
@@ -1486,6 +1658,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         process_channel_message(
@@ -1581,6 +1757,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -1947,7 +2127,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age").await;
+        let context = build_memory_context(&mem, "age", None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }
