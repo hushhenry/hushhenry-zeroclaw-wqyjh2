@@ -44,7 +44,8 @@ use crate::session::{
         load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
         SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
-    SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionStore,
+    SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionRouteMetadata,
+    SessionStore,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -117,6 +118,19 @@ fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
 
 fn short_session_id(session_id: &SessionId) -> String {
     session_id.as_str().chars().take(8).collect::<String>()
+}
+
+fn build_route_metadata(msg: &traits::ChannelMessage) -> SessionRouteMetadata {
+    SessionRouteMetadata {
+        agent_id: msg.agent_id.clone(),
+        channel: msg.channel.clone(),
+        account_id: msg.account_id.clone(),
+        chat_type: format!("{:?}", msg.chat_type).to_ascii_lowercase(),
+        chat_id: msg.chat_id.clone(),
+        route_id: msg.thread_id.clone(),
+        sender_id: msg.sender.clone(),
+        title: msg.title.clone(),
+    }
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -285,6 +299,14 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             if let Some(session_store) = ctx.session_store.as_ref() {
                 match session_store.create_new(&session_key) {
                     Ok(session_id) => {
+                        if let Err(error) = session_store
+                            .upsert_route_metadata(&session_id, &build_route_metadata(&msg))
+                        {
+                            tracing::warn!(
+                                "Failed to persist route metadata for session {}: {error}",
+                                session_id.as_str()
+                            );
+                        }
                         let confirmation = format!(
                             "Started a new session `{}` for this conversation.",
                             short_session_id(&session_id)
@@ -322,7 +344,17 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
         if let Some(session_store) = ctx.session_store.as_ref() {
             match session_store.get_or_create_active(&session_key) {
-                Ok(session_id) => active_session = Some(session_id),
+                Ok(session_id) => {
+                    if let Err(error) = session_store
+                        .upsert_route_metadata(&session_id, &build_route_metadata(&msg))
+                    {
+                        tracing::warn!(
+                            "Failed to persist route metadata for session {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
+                    active_session = Some(session_id);
+                }
                 Err(error) => {
                     tracing::error!(
                         "Failed to get active session for key {}: {error}",
@@ -1779,10 +1811,13 @@ mod tests {
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
+                agent_id: None,
+                account_id: None,
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                title: None,
                 chat_type: ChatType::Group,
                 raw_chat_type: None,
                 chat_id: "chat-42".to_string(),
@@ -1828,10 +1863,13 @@ mod tests {
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-2".to_string(),
+                agent_id: None,
+                account_id: None,
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                title: None,
                 chat_type: ChatType::Group,
                 raw_chat_type: None,
                 chat_id: "chat-84".to_string(),
@@ -2008,10 +2046,13 @@ mod tests {
 
         let msg = traits::ChannelMessage {
             id: "msg-3".to_string(),
+            agent_id: None,
+            account_id: None,
             sender: "zeroclaw_user".to_string(),
             reply_target: "chat-168".to_string(),
             content: "current question".to_string(),
             channel: "test-channel".to_string(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "chat-168".to_string(),
@@ -2080,10 +2121,13 @@ mod tests {
 
         let msg = traits::ChannelMessage {
             id: "msg-4".to_string(),
+            agent_id: None,
+            account_id: None,
             sender: "zeroclaw_user".to_string(),
             reply_target: "chat-200".to_string(),
             content: "latest question".to_string(),
             channel: "test-channel".to_string(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "chat-200".to_string(),
@@ -2168,6 +2212,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_channel_message_session_mode_upserts_route_metadata() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            memory: Arc::new(TrackingMemory::default()),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store.clone()),
+            session_resolver: SessionResolver::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-meta".to_string(),
+                agent_id: Some("zeroclaw-bot".to_string()),
+                account_id: Some("account-main".to_string()),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-meta".to_string(),
+                content: "metadata ping".to_string(),
+                channel: "test-channel".to_string(),
+                title: Some("Project Alpha Group".to_string()),
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-meta".to_string(),
+                thread_id: Some("thread-77".to_string()),
+                timestamp: 5,
+            },
+        )
+        .await;
+
+        let candidates = session_store
+            .find_chat_candidates_by_title("alpha", 10)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].chat_id, "chat-meta");
+        assert_eq!(candidates[0].channel, "test-channel");
+        assert_eq!(candidates[0].account_id.as_deref(), Some("account-main"));
+        assert_eq!(candidates[0].chat_type, "group");
+    }
+
+    #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -2196,10 +2297,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
+            agent_id: None,
+            account_id: None,
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "alice".to_string(),
@@ -2210,10 +2314,13 @@ mod tests {
         .unwrap();
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
+            agent_id: None,
+            account_id: None,
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "bob".to_string(),
@@ -2477,10 +2584,13 @@ mod tests {
     fn conversation_memory_key_uses_message_id() {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
+            agent_id: None,
+            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
+            title: None,
             chat_type: ChatType::Group,
             raw_chat_type: None,
             chat_id: "C456".into(),
@@ -2495,10 +2605,13 @@ mod tests {
     fn conversation_memory_key_is_unique_per_message() {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
+            agent_id: None,
+            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
+            title: None,
             chat_type: ChatType::Group,
             raw_chat_type: None,
             chat_id: "C456".into(),
@@ -2507,10 +2620,13 @@ mod tests {
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
+            agent_id: None,
+            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
+            title: None,
             chat_type: ChatType::Group,
             raw_chat_type: None,
             chat_id: "C456".into(),
@@ -2531,10 +2647,13 @@ mod tests {
 
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
+            agent_id: None,
+            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
+            title: None,
             chat_type: ChatType::Group,
             raw_chat_type: None,
             chat_id: "C456".into(),
@@ -2543,10 +2662,13 @@ mod tests {
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
+            agent_id: None,
+            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
+            title: None,
             chat_type: ChatType::Group,
             raw_chat_type: None,
             chat_id: "C456".into(),

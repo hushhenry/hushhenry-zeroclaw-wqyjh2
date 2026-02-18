@@ -229,10 +229,13 @@ impl Channel for MatrixChannel {
 
                     let msg = ChannelMessage {
                         id: format!("mx_{}", chrono::Utc::now().timestamp_millis()),
+                        agent_id: None,
+                        account_id: None,
                         sender: event.sender.clone(),
                         reply_target: event.sender.clone(),
                         content: body.clone(),
                         channel: "matrix".to_string(),
+                        title: None,
                         chat_type: ChatType::Group,
                         raw_chat_type: None,
                         chat_id: self.room_id.clone(),

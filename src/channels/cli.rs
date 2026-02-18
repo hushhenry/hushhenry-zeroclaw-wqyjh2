@@ -39,10 +39,13 @@ impl Channel for CliChannel {
 
             let msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
+                agent_id: None,
+                account_id: None,
                 sender: "user".to_string(),
                 reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
+                title: None,
                 chat_type: ChatType::Direct,
                 raw_chat_type: None,
                 chat_id: "user".to_string(),
@@ -106,10 +109,13 @@ mod tests {
     fn channel_message_struct() {
         let msg = ChannelMessage {
             id: "test-id".into(),
+            agent_id: None,
+            account_id: None,
             sender: "user".into(),
             reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "user".into(),
@@ -128,10 +134,13 @@ mod tests {
     fn channel_message_clone() {
         let msg = ChannelMessage {
             id: "id".into(),
+            agent_id: None,
+            account_id: None,
             sender: "s".into(),
             reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "s".into(),

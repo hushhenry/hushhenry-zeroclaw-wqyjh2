@@ -828,10 +828,13 @@ mod tests {
     fn whatsapp_memory_key_includes_sender_and_message_id() {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
+            agent_id: None,
+            account_id: None,
             sender: "+1234567890".into(),
             reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
+            title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "+1234567890".into(),
