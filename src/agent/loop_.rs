@@ -498,8 +498,11 @@ fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&
     };
 
     let backlog_messages = crate::session::backlog::drain(session_key);
-    for message in &backlog_messages {
-        history.push(ChatMessage::user(format!("[Backlog]\n{message}")));
+    if !backlog_messages.is_empty() {
+        history.push(ChatMessage::user(format!(
+            "[Backlog]\n{}",
+            backlog_messages.join("\n")
+        )));
     }
 
     backlog_messages.len()
@@ -1143,38 +1146,37 @@ mod tests {
     }
 
     #[test]
-    fn inject_backlog_messages_drains_and_prefixes_user_messages() {
-        crate::session::backlog::clear();
-        crate::session::backlog::enqueue("session-checkpoint", "steer one");
-        crate::session::backlog::enqueue("session-checkpoint", "steer two");
+    fn inject_backlog_messages_drains_and_merges_into_single_user_message() {
+        let session_key = "session-checkpoint-merge";
+        let _ = crate::session::backlog::drain(session_key);
+        crate::session::backlog::enqueue(session_key, "steer one");
+        crate::session::backlog::enqueue(session_key, "steer two");
 
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("task start"),
         ];
-        let injected = inject_backlog_messages(&mut history, Some("session-checkpoint"));
+        let injected = inject_backlog_messages(&mut history, Some(session_key));
 
         assert_eq!(injected, 2);
-        assert!(history
-            .iter()
-            .any(|msg| msg.role == "user" && msg.content == "[Backlog]\nsteer one"));
-        assert!(history
-            .iter()
-            .any(|msg| msg.role == "user" && msg.content == "[Backlog]\nsteer two"));
-        assert!(crate::session::backlog::drain("session-checkpoint").is_empty());
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, "[Backlog]\nsteer one\nsteer two");
+        assert!(crate::session::backlog::drain(session_key).is_empty());
     }
 
     #[test]
     fn inject_backlog_messages_noop_without_key() {
-        crate::session::backlog::clear();
-        crate::session::backlog::enqueue("session-noop", "ignored");
+        let session_key = "session-noop-without-key";
+        let _ = crate::session::backlog::drain(session_key);
+        crate::session::backlog::enqueue(session_key, "ignored");
 
         let mut history = vec![ChatMessage::system("system")];
         let injected = inject_backlog_messages(&mut history, None);
 
         assert_eq!(injected, 0);
         assert_eq!(history.len(), 1);
-        let pending = crate::session::backlog::drain("session-noop");
+        let pending = crate::session::backlog::drain(session_key);
         assert_eq!(pending, vec!["ignored"]);
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
