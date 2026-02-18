@@ -3,4 +3,8 @@ mod resolver;
 mod store;
 
 pub use resolver::{SessionContext, SessionKey, SessionResolver};
-pub use store::{SessionId, SessionMessageRole, SessionStore, SessionSummary};
+#[allow(unused_imports)]
+pub use store::{
+    SessionChatCandidate, SessionId, SessionMessageRole, SessionRouteMetadata, SessionStore,
+    SessionSummary, SubagentRun, SubagentRunStatus, SubagentSession, SubagentSpec,
+};

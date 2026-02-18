@@ -59,6 +59,7 @@ mod security;
 mod service;
 mod session;
 mod skills;
+mod subagent;
 mod tools;
 mod util;
 
