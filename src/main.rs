@@ -40,15 +40,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod agent;
 mod approval;
 mod channels;
-mod rag {
-    pub use zeroclaw::rag::*;
-}
 mod config;
 mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
-mod hardware;
 mod health;
 mod heartbeat;
 mod identity;
@@ -57,21 +53,15 @@ mod memory;
 mod migration;
 mod observability;
 mod onboard;
-mod peripherals;
 mod providers;
 mod runtime;
 mod security;
 mod service;
-mod skillforge;
 mod skills;
 mod tools;
-mod tunnel;
 mod util;
 
 use config::Config;
-
-// Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
 
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -140,10 +130,6 @@ enum Commands {
         /// Temperature (0.0 - 2.0)
         #[arg(short, long, default_value = "0.7")]
         temperature: f64,
-
-        /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
-        #[arg(long)]
-        peripheral: Vec<String>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -217,18 +203,6 @@ enum Commands {
     Migrate {
         #[command(subcommand)]
         migrate_command: MigrateCommands,
-    },
-
-    /// Discover and introspect USB hardware
-    Hardware {
-        #[command(subcommand)]
-        hardware_command: zeroclaw::HardwareCommands,
-    },
-
-    /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
-    Peripheral {
-        #[command(subcommand)]
-        peripheral_command: zeroclaw::PeripheralCommands,
     },
 }
 
@@ -439,8 +413,7 @@ async fn main() -> Result<()> {
             provider,
             model,
             temperature,
-            peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral)
+        } => agent::run(config, message, provider, model, temperature)
             .await
             .map(|_| ()),
 
@@ -531,18 +504,6 @@ async fn main() -> Result<()> {
                     }
                 );
             }
-            println!();
-            println!("Peripherals:");
-            println!(
-                "  Enabled:   {}",
-                if config.peripherals.enabled {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            println!("  Boards:    {}", config.peripherals.boards.len());
-
             Ok(())
         }
 
@@ -607,14 +568,6 @@ async fn main() -> Result<()> {
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
-        }
-
-        Commands::Hardware { hardware_command } => {
-            hardware::handle_command(hardware_command.clone(), &config)
-        }
-
-        Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config)
         }
     }
 }

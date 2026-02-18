@@ -1,8 +1,7 @@
-//! RAG pipeline for hardware datasheet retrieval.
+//! RAG pipeline for datasheet retrieval.
 //!
 //! Supports:
 //! - Markdown and text datasheets (always)
-//! - PDF ingestion (with `rag-pdf` feature)
 //! - Pin/alias tables (e.g. `red_led: 13`) for explicit lookup
 //! - Keyword retrieval (default) or semantic search via embeddings (optional)
 
@@ -115,30 +114,7 @@ fn collect_md_txt_paths(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-#[cfg(feature = "rag-pdf")]
-fn collect_pdf_paths(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_pdf_paths(&path, out);
-        } else if path.is_file() {
-            if path.extension().and_then(|e| e.to_str()) == Some("pdf") {
-                out.push(path);
-            }
-        }
-    }
-}
-
-#[cfg(feature = "rag-pdf")]
-fn extract_pdf_text(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    pdf_extract::extract_text_from_mem(&bytes).ok()
-}
-
-/// Hardware RAG index — loads and retrieves datasheet chunks.
+/// RAG index — loads and retrieves datasheet chunks.
 pub struct HardwareRag {
     chunks: Vec<DatasheetChunk>,
     /// Per-board pin aliases (board -> alias -> pin).
@@ -160,26 +136,13 @@ impl HardwareRag {
 
         let mut paths: Vec<std::path::PathBuf> = Vec::new();
         collect_md_txt_paths(&base, &mut paths);
-        #[cfg(feature = "rag-pdf")]
-        collect_pdf_paths(&base, &mut paths);
 
         let mut chunks = Vec::new();
         let mut pin_aliases: HashMap<String, PinAliases> = HashMap::new();
         let max_tokens = 512;
 
         for path in paths {
-            let content = if path.extension().and_then(|e| e.to_str()) == Some("pdf") {
-                #[cfg(feature = "rag-pdf")]
-                {
-                    extract_pdf_text(&path).unwrap_or_default()
-                }
-                #[cfg(not(feature = "rag-pdf"))]
-                {
-                    String::new()
-                }
-            } else {
-                std::fs::read_to_string(&path).unwrap_or_default()
-            };
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
 
             if content.trim().is_empty() {
                 continue;

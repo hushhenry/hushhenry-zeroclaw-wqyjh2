@@ -83,7 +83,6 @@ cron = "0.12"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.15"
 
-# Hardware discovery (device path globbing)
 glob = "0.3"
 
 # Discord WebSocket gateway
@@ -110,27 +109,12 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls-webpki-roots"] }
 
-# USB device enumeration (hardware discovery)
-nusb = { version = "0.2", default-features = false, optional = true }
-
-# Serial port for peripheral communication (STM32, etc.)
-tokio-serial = { version = "5", default-features = false, optional = true }
-
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.30", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
-pdf-extract = { version = "0.10", optional = true }
-
-# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
+# Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.14", optional = true }
 landlock = { version = "0.4", optional = true }
 
 [features]
-default = ["hardware"]
-hardware = ["nusb", "tokio-serial"]
-peripheral-rpi = ["rppal"]
+default = []
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
@@ -140,10 +124,6 @@ sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
 # Backward-compatible alias for older invocations
 landlock = ["sandbox-landlock"]
-# probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
-probe = ["dep:probe-rs"]
-# rag-pdf = PDF ingestion for datasheet RAG
-rag-pdf = ["dep:pdf-extract"]
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds

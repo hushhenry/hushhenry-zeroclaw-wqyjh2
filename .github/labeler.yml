@@ -106,11 +106,6 @@
       - any-glob-to-any-file:
           - "src/service/**"
 
-"skillforge":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/skillforge/**"
-
 "skills":
   - changed-files:
       - any-glob-to-any-file:
@@ -120,11 +115,6 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/tools/**"
-
-"tunnel":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/tunnel/**"
 
 "observability":
   - changed-files:

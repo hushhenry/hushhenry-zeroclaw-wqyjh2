@@ -47,7 +47,6 @@ pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod gateway;
-pub mod hardware;
 pub mod health;
 pub mod heartbeat;
 pub mod identity;
@@ -56,7 +55,6 @@ pub mod memory;
 pub mod migration;
 pub mod observability;
 pub mod onboard;
-pub mod peripherals;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
@@ -64,7 +62,6 @@ pub mod security;
 pub mod service;
 pub mod skills;
 pub mod tools;
-pub mod tunnel;
 pub mod util;
 
 pub use config::Config;
@@ -205,50 +202,4 @@ pub enum IntegrationCommands {
         /// Integration name
         name: String,
     },
-}
-
-/// Hardware discovery subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum HardwareCommands {
-    /// Enumerate USB devices (VID/PID) and show known boards
-    Discover,
-    /// Introspect a device by path (e.g. /dev/ttyACM0)
-    Introspect {
-        /// Serial or device path
-        path: String,
-    },
-    /// Get chip info via USB (probe-rs over ST-Link). No firmware needed on target.
-    Info {
-        /// Chip name (e.g. STM32F401RETx). Default: STM32F401RETx for Nucleo-F401RE
-        #[arg(long, default_value = "STM32F401RETx")]
-        chip: String,
-    },
-}
-
-/// Peripheral (hardware) management subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PeripheralCommands {
-    /// List configured peripherals
-    List,
-    /// Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)
-    Add {
-        /// Board type (nucleo-f401re, rpi-gpio, esp32)
-        board: String,
-        /// Path for serial transport (/dev/ttyACM0) or "native" for local GPIO
-        path: String,
-    },
-    /// Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
-    Flash {
-        /// Serial port (e.g. /dev/cu.usbmodem12345). If omitted, uses first arduino-uno from config.
-        #[arg(short, long)]
-        port: Option<String>,
-    },
-    /// Setup Arduino Uno Q Bridge app (deploy GPIO bridge for agent control)
-    SetupUnoQ {
-        /// Uno Q IP (e.g. 192.168.0.48). If omitted, assumes running ON the Uno Q.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
-    FlashNucleo,
 }
