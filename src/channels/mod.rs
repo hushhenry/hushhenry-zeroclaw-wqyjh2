@@ -39,6 +39,11 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
+    compaction::{
+        build_compaction_summary_message, build_merged_system_prompt, estimate_tokens,
+        load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+    },
     SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionStore,
 };
 use crate::tools::{self, Tool};
@@ -92,6 +97,14 @@ fn is_new_session_command(content: &str) -> bool {
     trimmed.chars().nth(4).is_none_or(|ch| ch.is_whitespace())
 }
 
+fn is_compact_session_command(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("/compact") {
+        return false;
+    }
+    trimmed.chars().nth(8).is_none_or(|ch| ch.is_whitespace())
+}
+
 fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
     SessionContext {
         channel: msg.channel.clone(),
@@ -112,6 +125,65 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
         ),
         _ => None,
+    }
+}
+
+async fn run_manual_session_compaction(
+    ctx: &ChannelRuntimeContext,
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    session_id: &SessionId,
+    merged_system_prompt: &str,
+) {
+    let Some(session_store) = ctx.session_store.as_ref() else {
+        return;
+    };
+
+    match maybe_compact(
+        session_store.as_ref(),
+        session_id,
+        ctx.provider.as_ref(),
+        ctx.model.as_str(),
+        merged_system_prompt,
+        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(channel) = target_channel {
+                let confirmation = if result.compacted {
+                    format!(
+                        "Session compacted successfully for `{}`.",
+                        short_session_id(session_id)
+                    )
+                } else {
+                    "No compaction needed yet. Session tail is already small.".to_string()
+                };
+                if let Err(error) = channel
+                    .send(&SendMessage::new(confirmation, reply_target))
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to send /compact confirmation on {}: {error}",
+                        channel.name()
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "Manual session compaction failed for {}: {error}",
+                session_id.as_str()
+            );
+            if let Some(channel) = target_channel {
+                let _ = channel
+                    .send(&SendMessage::new(
+                        "⚠️ Failed to compact this session. Please try again.",
+                        reply_target,
+                    ))
+                    .await;
+            }
+        }
     }
 }
 
@@ -199,6 +271,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     );
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let merged_system_prompt = build_merged_system_prompt(
+        ctx.system_prompt.as_str(),
+        channel_delivery_instructions(&msg.channel),
+    );
     let mut active_session: Option<SessionId> = None;
 
     if ctx.session_enabled {
@@ -255,6 +331,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 }
             }
         }
+
+        if is_compact_session_command(&msg.content) {
+            if let Some(session_id) = active_session.as_ref() {
+                run_manual_session_compaction(
+                    &ctx,
+                    target_channel.as_ref(),
+                    &msg.reply_target,
+                    session_id,
+                    &merged_system_prompt,
+                )
+                .await;
+            }
+            return;
+        }
     }
 
     let enriched_message = if ctx.session_enabled {
@@ -296,49 +386,118 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
+    let mut history = vec![ChatMessage::system(merged_system_prompt.clone())];
 
     if ctx.session_enabled {
         if let (Some(session_store), Some(session_id)) =
             (ctx.session_store.as_ref(), active_session.as_ref())
         {
-            match session_store.load_recent_messages(session_id, ctx.session_history_limit) {
-                Ok(messages) => {
-                    for message in messages {
-                        match SessionMessageRole::from_str(message.role.as_str()) {
-                            Some(SessionMessageRole::User) => {
-                                history.push(ChatMessage::user(message.content))
-                            }
-                            Some(SessionMessageRole::Assistant) => {
-                                history.push(ChatMessage::assistant(message.content))
-                            }
-                            Some(SessionMessageRole::Tool) => {
-                                history.push(ChatMessage::tool(message.content))
-                            }
-                            None => {
-                                tracing::warn!(
-                                    role = message.role.as_str(),
-                                    session_id = %session_id.as_str(),
-                                    "Skipping unsupported role from stored session history"
-                                );
-                            }
-                        }
-                    }
-                }
+            let mut compaction_state = match load_compaction_state(session_store, session_id) {
+                Ok(state) => state,
                 Err(error) => {
                     tracing::warn!(
-                        "Failed to load recent session history {}: {error}",
+                        "Failed to load compaction state for session {}: {error}",
                         session_id.as_str()
                     );
+                    Default::default()
+                }
+            };
+
+            let mut tail_messages = match session_store
+                .load_messages_after_id(session_id, compaction_state.after_message_id)
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load session tail history {}: {error}",
+                        session_id.as_str()
+                    );
+                    Vec::new()
+                }
+            };
+
+            if let Some(summary) = compaction_state.summary.as_deref() {
+                history.push(build_compaction_summary_message(summary));
+            }
+            for message in tail_messages.iter().cloned() {
+                match SessionMessageRole::from_str(message.role.as_str()) {
+                    Some(SessionMessageRole::User) => {
+                        history.push(ChatMessage::user(message.content))
+                    }
+                    Some(SessionMessageRole::Assistant) => {
+                        history.push(ChatMessage::assistant(message.content))
+                    }
+                    Some(SessionMessageRole::Tool) => {
+                        history.push(ChatMessage::tool(message.content))
+                    }
+                    None => {
+                        tracing::warn!(
+                            role = message.role.as_str(),
+                            session_id = %session_id.as_str(),
+                            "Skipping unsupported role from stored session history"
+                        );
+                    }
                 }
             }
-        }
-    }
 
-    if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
-        history.push(ChatMessage::system(instructions));
+            history.push(ChatMessage::user(&enriched_message));
+            if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
+                let keep_recent = usize::try_from(ctx.session_history_limit)
+                    .ok()
+                    .map(|limit| limit.clamp(1, SESSION_COMPACTION_KEEP_RECENT_MESSAGES))
+                    .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES);
+
+                match maybe_compact(
+                    session_store.as_ref(),
+                    session_id,
+                    ctx.provider.as_ref(),
+                    ctx.model.as_str(),
+                    &merged_system_prompt,
+                    keep_recent,
+                )
+                .await
+                {
+                    Ok(outcome) if outcome.compacted => {
+                        compaction_state.summary = outcome.summary;
+                        compaction_state.after_message_id = outcome.after_message_id;
+                        tail_messages = session_store
+                            .load_messages_after_id(session_id, compaction_state.after_message_id)
+                            .unwrap_or_default();
+                        history = vec![ChatMessage::system(merged_system_prompt)];
+                        if let Some(summary) = compaction_state.summary.as_deref() {
+                            history.push(build_compaction_summary_message(summary));
+                        }
+                        for message in tail_messages {
+                            match SessionMessageRole::from_str(message.role.as_str()) {
+                                Some(SessionMessageRole::User) => {
+                                    history.push(ChatMessage::user(message.content))
+                                }
+                                Some(SessionMessageRole::Assistant) => {
+                                    history.push(ChatMessage::assistant(message.content))
+                                }
+                                Some(SessionMessageRole::Tool) => {
+                                    history.push(ChatMessage::tool(message.content))
+                                }
+                                None => {}
+                            }
+                        }
+                        history.push(ChatMessage::user(&enriched_message));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "Auto-compaction failed for session {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
+                }
+            }
+        } else {
+            history.push(ChatMessage::user(&enriched_message));
+        }
+    } else {
+        history.push(ChatMessage::user(&enriched_message));
     }
-    history.push(ChatMessage::user(&enriched_message));
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -1916,6 +2075,104 @@ mod tests {
         assert!(captured_history
             .iter()
             .any(|(role, content)| role == "assistant" && content == "past-assistant"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_session_mode_uses_compaction_summary_and_boundary_tail() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let memory = Arc::new(TrackingMemory::default());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = traits::ChannelMessage {
+            id: "msg-4".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-200".to_string(),
+            content: "latest question".to_string(),
+            channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-200".to_string(),
+            thread_id: None,
+            timestamp: 4,
+        };
+
+        let session_resolver = SessionResolver::new();
+        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        session_store
+            .append_message(&session_id, "user", "old-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "old-assistant", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "user", "recent-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "recent-assistant", None)
+            .unwrap();
+
+        let all_messages = session_store
+            .load_messages_after_id(&session_id, None)
+            .unwrap();
+        let boundary_message_id = all_messages[1].id;
+        session_store
+            .set_state_key(
+                &session_id,
+                crate::session::compaction::SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY,
+                &serde_json::to_string(&boundary_message_id).unwrap(),
+            )
+            .unwrap();
+        session_store
+            .set_state_key(
+                &session_id,
+                crate::session::compaction::SESSION_COMPACTION_SUMMARY_KEY,
+                "\"summary-v2\"",
+            )
+            .unwrap();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            memory: memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: true,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store.clone()),
+            session_resolver,
+        });
+
+        process_channel_message(runtime_ctx, msg).await;
+
+        assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
+
+        let captured_history = provider.captured_history.lock().await;
+        assert!(captured_history.iter().any(|(role, content)| {
+            role == "assistant" && content.contains("[Session Compaction Summary]")
+        }));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == "recent-assistant"));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "user" && content == "recent-user"));
+        assert!(!captured_history
+            .iter()
+            .any(|(_, content)| content == "old-user"));
+        assert!(!captured_history
+            .iter()
+            .any(|(_, content)| content == "old-assistant"));
     }
 
     #[tokio::test]

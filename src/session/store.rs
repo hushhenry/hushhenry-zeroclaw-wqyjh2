@@ -55,6 +55,7 @@ impl SessionMessageRole {
 
 #[derive(Debug, Clone)]
 pub struct SessionMessage {
+    pub id: i64,
     pub role: String,
     pub content: String,
     pub created_at: String,
@@ -276,7 +277,7 @@ impl SessionStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT role, content, created_at, meta_json
+                "SELECT id, role, content, created_at, meta_json
                  FROM session_messages
                  WHERE session_id = ?1
                    AND role IN ('user', 'assistant', 'tool')
@@ -288,10 +289,11 @@ impl SessionStore {
         let rows = stmt
             .query_map(params![session_id.as_str(), i64::from(limit)], |row| {
                 Ok(SessionMessage {
-                    role: row.get(0)?,
-                    content: row.get(1)?,
-                    created_at: row.get(2)?,
-                    meta_json: row.get(3)?,
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                    meta_json: row.get(4)?,
                 })
             })
             .context("Failed to query recent session messages")?;
@@ -304,7 +306,40 @@ impl SessionStore {
         Ok(messages)
     }
 
-    pub fn get_state(&self, session_id: &SessionId, key: &str) -> Result<Option<String>> {
+    pub fn load_messages_after_id(
+        &self,
+        session_id: &SessionId,
+        after_message_id: Option<i64>,
+    ) -> Result<Vec<SessionMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, content, created_at, meta_json
+                 FROM session_messages
+                 WHERE session_id = ?1
+                   AND role IN ('user', 'assistant', 'tool')
+                   AND (?2 IS NULL OR id > ?2)
+                 ORDER BY id ASC",
+            )
+            .context("Failed to prepare load_messages_after_id query")?;
+
+        let rows = stmt
+            .query_map(params![session_id.as_str(), after_message_id], |row| {
+                Ok(SessionMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                    meta_json: row.get(4)?,
+                })
+            })
+            .context("Failed to query session messages after boundary")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode boundary-filtered session messages")
+    }
+
+    pub fn get_state_key(&self, session_id: &SessionId, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let value = conn
             .query_row(
@@ -317,7 +352,7 @@ impl SessionStore {
         Ok(value)
     }
 
-    pub fn set_state(&self, session_id: &SessionId, key: &str, value_json: &str) -> Result<()> {
+    pub fn set_state_key(&self, session_id: &SessionId, key: &str, value_json: &str) -> Result<()> {
         let conn = self.conn.lock();
         let now = Self::now();
         conn.execute(
@@ -330,6 +365,14 @@ impl SessionStore {
         )
         .context("Failed to set session state")?;
         Ok(())
+    }
+
+    pub fn get_state(&self, session_id: &SessionId, key: &str) -> Result<Option<String>> {
+        self.get_state_key(session_id, key)
+    }
+
+    pub fn set_state(&self, session_id: &SessionId, key: &str, value_json: &str) -> Result<()> {
+        self.set_state_key(session_id, key, value_json)
     }
 }
 
@@ -357,6 +400,7 @@ mod tests {
 
         let messages = store.load_recent_messages(&session_id, 10).unwrap();
         assert_eq!(messages.len(), 2);
+        assert!(messages[0].id > 0);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
@@ -394,5 +438,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn session_store_state_and_after_boundary_loading() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let session_key = SessionKey::new("group:telegram:chat-compact");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+
+        store
+            .append_message(&session_id, "user", "old-user", None)
+            .unwrap();
+        store
+            .append_message(&session_id, "assistant", "old-assistant", None)
+            .unwrap();
+        store
+            .append_message(&session_id, "user", "new-user", None)
+            .unwrap();
+
+        let all_messages = store.load_messages_after_id(&session_id, None).unwrap();
+        assert_eq!(all_messages.len(), 3);
+        let boundary = all_messages[1].id;
+
+        let after_boundary = store
+            .load_messages_after_id(&session_id, Some(boundary))
+            .unwrap();
+        assert_eq!(after_boundary.len(), 1);
+        assert_eq!(after_boundary[0].content, "new-user");
+
+        store
+            .set_state_key(&session_id, "compaction_summary", "\"summary-v1\"")
+            .unwrap();
+        let state = store
+            .get_state_key(&session_id, "compaction_summary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "\"summary-v1\"");
     }
 }

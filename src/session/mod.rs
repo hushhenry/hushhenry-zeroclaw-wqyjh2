@@ -1,3 +1,4 @@
+pub mod compaction;
 mod resolver;
 mod store;
 
