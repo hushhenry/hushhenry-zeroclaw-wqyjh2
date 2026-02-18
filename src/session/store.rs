@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::SessionKey;
 
@@ -60,9 +61,8 @@ pub struct SessionMessage {
     pub meta_json: Option<String>,
 }
 
-#[derive(Debug, Clone)]
 pub struct SessionStore {
-    db_path: PathBuf,
+    conn: Mutex<Connection>,
 }
 
 impl SessionStore {
@@ -75,10 +75,24 @@ impl SessionStore {
             )
         })?;
 
+        let db_path = db_dir.join("sessions.db");
+        let conn = Connection::open(&db_path)
+            .with_context(|| format!("Failed to open sessions DB: {}", db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA mmap_size = 8388608;
+             PRAGMA cache_size = -2000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
+        )
+        .context("Failed to configure sessions DB pragmas")?;
+
+        Self::init_schema(&conn)?;
+
         let store = Self {
-            db_path: db_dir.join("sessions.db"),
+            conn: Mutex::new(conn),
         };
-        store.init_schema()?;
         Ok(store)
     }
 
@@ -86,20 +100,7 @@ impl SessionStore {
         Utc::now().to_rfc3339()
     }
 
-    fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("Failed to open sessions DB: {}", self.db_path.display()))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;",
-        )
-        .context("Failed to configure sessions DB pragmas")?;
-        Ok(conn)
-    }
-
-    fn init_schema(&self) -> Result<()> {
-        let conn = self.connect()?;
+    fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_index (
                 session_key TEXT PRIMARY KEY,
@@ -143,7 +144,7 @@ impl SessionStore {
     }
 
     pub fn get_or_create_active(&self, session_key: &SessionKey) -> Result<SessionId> {
-        let mut conn = self.connect()?;
+        let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("Failed to start session transaction")?;
@@ -185,7 +186,7 @@ impl SessionStore {
     }
 
     pub fn create_new(&self, session_key: &SessionKey) -> Result<SessionId> {
-        let mut conn = self.connect()?;
+        let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("Failed to start session transaction")?;
@@ -248,7 +249,7 @@ impl SessionStore {
             return Ok(());
         };
 
-        let conn = self.connect()?;
+        let conn = self.conn.lock();
         let now = Self::now();
 
         conn.execute(
@@ -272,7 +273,7 @@ impl SessionStore {
         session_id: &SessionId,
         limit: u32,
     ) -> Result<Vec<SessionMessage>> {
-        let conn = self.connect()?;
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT role, content, created_at, meta_json
@@ -304,7 +305,7 @@ impl SessionStore {
     }
 
     pub fn get_state(&self, session_id: &SessionId, key: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
+        let conn = self.conn.lock();
         let value = conn
             .query_row(
                 "SELECT value_json FROM session_state WHERE session_id = ?1 AND key = ?2",
@@ -317,7 +318,7 @@ impl SessionStore {
     }
 
     pub fn set_state(&self, session_id: &SessionId, key: &str, value_json: &str) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn.lock();
         let now = Self::now();
         conn.execute(
             "INSERT INTO session_state (session_id, key, value_json, updated_at)
