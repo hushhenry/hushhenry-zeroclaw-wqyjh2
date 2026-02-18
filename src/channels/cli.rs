@@ -44,7 +44,7 @@ impl Channel for CliChannel {
                 content: line,
                 channel: "cli".to_string(),
                 chat_type: "direct".to_string(),
-                conversation_id: "user".to_string(),
+                chat_id: "user".to_string(),
                 thread_id: None,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -110,7 +110,7 @@ mod tests {
             content: "hello".into(),
             channel: "cli".into(),
             chat_type: "direct".into(),
-            conversation_id: "user".into(),
+            chat_id: "user".into(),
             thread_id: None,
             timestamp: 1_234_567_890,
         };
@@ -131,7 +131,7 @@ mod tests {
             content: "c".into(),
             channel: "ch".into(),
             chat_type: "direct".into(),
-            conversation_id: "s".into(),
+            chat_id: "s".into(),
             thread_id: None,
             timestamp: 0,
         };

@@ -220,7 +220,7 @@ impl MattermostChannel {
             content: text.to_string(),
             channel: "mattermost".to_string(),
             chat_type: "group".to_string(),
-            conversation_id: channel_id.to_string(),
+            chat_id: channel_id.to_string(),
             thread_id: Some(if root_id.is_empty() {
                 id.to_string()
             } else {

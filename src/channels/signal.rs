@@ -247,7 +247,7 @@ impl SignalChannel {
         } else {
             "direct"
         };
-        let conversation_id = group_id.unwrap_or(sender.as_str()).to_string();
+        let chat_id = group_id.unwrap_or(sender.as_str()).to_string();
 
         let timestamp = data_msg
             .timestamp
@@ -269,7 +269,7 @@ impl SignalChannel {
             content: text.to_string(),
             channel: "signal".to_string(),
             chat_type: chat_type.to_string(),
-            conversation_id,
+            chat_id,
             thread_id: None,
             timestamp: timestamp / 1000, // millis → secs
         })

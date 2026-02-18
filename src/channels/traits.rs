@@ -9,9 +9,16 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub chat_type: String,
-    pub conversation_id: String,
+    pub chat_id: String,
     pub thread_id: Option<String>,
     pub timestamp: u64,
+}
+
+impl ChannelMessage {
+    #[deprecated(note = "renamed to chat_id; use `chat_id` instead")]
+    pub fn conversation_id(&self) -> &str {
+        &self.chat_id
+    }
 }
 
 /// Message to send through a channel
@@ -102,7 +109,7 @@ mod tests {
                 content: "hello".into(),
                 channel: "dummy".into(),
                 chat_type: "direct".into(),
-                conversation_id: "tester".into(),
+                chat_id: "tester".into(),
                 thread_id: None,
                 timestamp: 123,
             })
@@ -120,7 +127,7 @@ mod tests {
             content: "ping".into(),
             channel: "dummy".into(),
             chat_type: "direct".into(),
-            conversation_id: "alice".into(),
+            chat_id: "alice".into(),
             thread_id: None,
             timestamp: 999,
         };
@@ -132,7 +139,7 @@ mod tests {
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
         assert_eq!(cloned.chat_type, "direct");
-        assert_eq!(cloned.conversation_id, "alice");
+        assert_eq!(cloned.chat_id, "alice");
         assert!(cloned.thread_id.is_none());
         assert_eq!(cloned.timestamp, 999);
     }

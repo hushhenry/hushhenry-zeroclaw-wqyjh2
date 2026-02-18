@@ -24,8 +24,15 @@ pub struct SessionContext {
     pub channel: String,
     pub chat_type: String,
     pub sender_id: String,
-    pub conversation_id: String,
+    pub chat_id: String,
     pub thread_id: Option<String>,
+}
+
+impl SessionContext {
+    #[deprecated(note = "renamed to chat_id; use `chat_id` instead")]
+    pub fn conversation_id(&self) -> &str {
+        &self.chat_id
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -40,7 +47,7 @@ impl SessionResolver {
         if let Some(thread_id) = context.thread_id.as_deref() {
             return SessionKey::new(format!(
                 "thread:{}:{}:{}",
-                context.channel, context.conversation_id, thread_id
+                context.channel, context.chat_id, thread_id
             ));
         }
 
@@ -48,7 +55,7 @@ impl SessionResolver {
         if matches!(chat_type.as_str(), "group" | "channel" | "supergroup") {
             return SessionKey::new(format!(
                 "group:{}:{}",
-                context.channel, context.conversation_id
+                context.channel, context.chat_id
             ));
         }
 
@@ -67,7 +74,7 @@ mod tests {
             channel: "telegram".into(),
             chat_type: "group".into(),
             sender_id: "user-1".into(),
-            conversation_id: "chat-42".into(),
+            chat_id: "chat-42".into(),
             thread_id: Some("17".into()),
         };
 
@@ -82,7 +89,7 @@ mod tests {
             channel: "discord".into(),
             chat_type: "channel".into(),
             sender_id: "user-2".into(),
-            conversation_id: "chan-88".into(),
+            chat_id: "chan-88".into(),
             thread_id: None,
         };
 
@@ -97,7 +104,7 @@ mod tests {
             channel: "imessage".into(),
             chat_type: "direct".into(),
             sender_id: "alice".into(),
-            conversation_id: "alice".into(),
+            chat_id: "alice".into(),
             thread_id: None,
         };
 

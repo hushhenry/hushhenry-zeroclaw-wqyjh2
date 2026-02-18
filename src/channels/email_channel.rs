@@ -433,7 +433,7 @@ impl Channel for EmailChannel {
                             content,
                             channel: "email".to_string(),
                             chat_type: "direct".to_string(),
-                            conversation_id: sender,
+                            chat_id: sender,
                             thread_id: None,
                             timestamp: ts,
                         };

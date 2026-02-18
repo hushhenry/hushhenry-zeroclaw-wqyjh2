@@ -124,7 +124,7 @@ impl WhatsAppChannel {
                         content,
                         channel: "whatsapp".to_string(),
                         chat_type: "direct".to_string(),
-                        conversation_id: normalized_from,
+                        chat_id: normalized_from,
                         thread_id: None,
                         timestamp,
                     });

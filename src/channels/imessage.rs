@@ -176,7 +176,7 @@ end tell"#
                             content: text,
                             channel: "imessage".to_string(),
                             chat_type: "direct".to_string(),
-                            conversation_id: sender,
+                            chat_id: sender,
                             thread_id: None,
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)

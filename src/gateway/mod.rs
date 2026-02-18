@@ -833,7 +833,7 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             chat_type: "direct".into(),
-            conversation_id: "+1234567890".into(),
+            chat_id: "+1234567890".into(),
             thread_id: None,
             timestamp: 1,
         };

@@ -95,7 +95,7 @@ fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
         channel: msg.channel.clone(),
         chat_type: msg.chat_type.clone(),
         sender_id: msg.sender.clone(),
-        conversation_id: msg.conversation_id.clone(),
+        chat_id: msg.chat_id.clone(),
         thread_id: msg.thread_id.clone(),
     }
 }
@@ -1608,7 +1608,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 chat_type: "group".to_string(),
-                conversation_id: "chat-42".to_string(),
+                chat_id: "chat-42".to_string(),
                 thread_id: None,
                 timestamp: 1,
             },
@@ -1656,7 +1656,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 chat_type: "group".to_string(),
-                conversation_id: "chat-84".to_string(),
+                chat_id: "chat-84".to_string(),
                 thread_id: None,
                 timestamp: 2,
             },
@@ -1757,7 +1757,7 @@ mod tests {
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             chat_type: "direct".to_string(),
-            conversation_id: "alice".to_string(),
+            chat_id: "alice".to_string(),
             thread_id: None,
             timestamp: 1,
         })
@@ -1770,7 +1770,7 @@ mod tests {
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             chat_type: "direct".to_string(),
-            conversation_id: "bob".to_string(),
+            chat_id: "bob".to_string(),
             thread_id: None,
             timestamp: 2,
         })
@@ -2036,7 +2036,7 @@ mod tests {
             content: "hello".into(),
             channel: "slack".into(),
             chat_type: "group".into(),
-            conversation_id: "C456".into(),
+            chat_id: "C456".into(),
             thread_id: None,
             timestamp: 1,
         };
@@ -2053,7 +2053,7 @@ mod tests {
             content: "first".into(),
             channel: "slack".into(),
             chat_type: "group".into(),
-            conversation_id: "C456".into(),
+            chat_id: "C456".into(),
             thread_id: None,
             timestamp: 1,
         };
@@ -2064,7 +2064,7 @@ mod tests {
             content: "second".into(),
             channel: "slack".into(),
             chat_type: "group".into(),
-            conversation_id: "C456".into(),
+            chat_id: "C456".into(),
             thread_id: None,
             timestamp: 2,
         };
@@ -2087,7 +2087,7 @@ mod tests {
             content: "I'm Paul".into(),
             channel: "slack".into(),
             chat_type: "group".into(),
-            conversation_id: "C456".into(),
+            chat_id: "C456".into(),
             thread_id: None,
             timestamp: 1,
         };
@@ -2098,7 +2098,7 @@ mod tests {
             content: "I'm 45".into(),
             channel: "slack".into(),
             chat_type: "group".into(),
-            conversation_id: "C456".into(),
+            chat_id: "C456".into(),
             thread_id: None,
             timestamp: 2,
         };

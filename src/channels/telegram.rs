@@ -579,7 +579,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content: text.to_string(),
             channel: "telegram".to_string(),
             chat_type,
-            conversation_id: chat_id,
+            chat_id: chat_id,
             thread_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

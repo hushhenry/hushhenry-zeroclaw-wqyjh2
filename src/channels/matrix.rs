@@ -234,7 +234,7 @@ impl Channel for MatrixChannel {
                         content: body.clone(),
                         channel: "matrix".to_string(),
                         chat_type: "group".to_string(),
-                        conversation_id: self.room_id.clone(),
+                        chat_id: self.room_id.clone(),
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

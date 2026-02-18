@@ -356,7 +356,7 @@ impl Channel for QQChannel {
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 chat_type: "direct".to_string(),
-                                conversation_id: user_openid.to_string(),
+                                chat_id: user_openid.to_string(),
                                 thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -397,7 +397,7 @@ impl Channel for QQChannel {
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 chat_type: "group".to_string(),
-                                conversation_id: group_openid.to_string(),
+                                chat_id: group_openid.to_string(),
                                 thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

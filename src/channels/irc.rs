@@ -571,7 +571,7 @@ impl Channel for IrcChannel {
                         content,
                         channel: "irc".to_string(),
                         chat_type: chat_type.to_string(),
-                        conversation_id: reply_to,
+                        chat_id: reply_to,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

@@ -392,7 +392,7 @@ impl Channel for DiscordChannel {
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                    let conversation_id = if channel_id.is_empty() {
+                    let chat_id = if channel_id.is_empty() {
                         author_id.to_string()
                     } else {
                         channel_id.clone()
@@ -414,7 +414,7 @@ impl Channel for DiscordChannel {
                         content: clean_content,
                         channel: channel_id,
                         chat_type: chat_type.to_string(),
-                        conversation_id,
+                        chat_id,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

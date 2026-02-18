@@ -175,7 +175,7 @@ impl Channel for SlackChannel {
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         chat_type: chat_type.to_string(),
-                        conversation_id: channel_id.clone(),
+                        chat_id: channel_id.clone(),
                         thread_id,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

@@ -454,7 +454,7 @@ impl LarkChannel {
                         content: text,
                         channel: "lark".to_string(),
                         chat_type: lark_msg.chat_type.clone(),
-                        conversation_id: lark_msg.chat_id.clone(),
+                        chat_id: lark_msg.chat_id.clone(),
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -625,7 +625,7 @@ impl LarkChannel {
             content: text,
             channel: "lark".to_string(),
             chat_type: chat_type.to_string(),
-            conversation_id: chat_id.to_string(),
+            chat_id: chat_id.to_string(),
             thread_id: None,
             timestamp,
         });

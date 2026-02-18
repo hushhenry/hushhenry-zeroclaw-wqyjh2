@@ -272,7 +272,7 @@ impl Channel for DingTalkChannel {
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
                         chat_type: chat_type.to_string(),
-                        conversation_id: chat_id,
+                        chat_id: chat_id,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
