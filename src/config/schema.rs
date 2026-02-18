@@ -83,15 +83,16 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
-    /// Delegate agent configurations for multi-agent workflows.
+    /// Legacy delegate agent configurations.
+    /// Deprecated: entries are mapped into subagent specs for compatibility.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
 
-/// Configuration for a delegate sub-agent used by the deprecated `delegate` tool.
-/// This legacy one-shot path is kept for compatibility while subagent-run migration lands.
+/// Configuration for a legacy delegate agent entry in config.
+/// Deprecated: parsed for compatibility and mapped to subagent specs at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
@@ -1716,6 +1717,14 @@ fn encrypt_optional_secret(
 }
 
 impl Config {
+    fn warn_legacy_agents_usage(&self) {
+        if !self.agents.is_empty() {
+            tracing::warn!(
+                "config.agents is deprecated and delegate tool is removed; legacy agents will be mapped to subagent specs for compatibility"
+            );
+        }
+    }
+
     pub fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -1780,6 +1789,7 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
             config.apply_env_overrides();
+            config.warn_legacy_agents_usage();
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -1795,6 +1805,7 @@ impl Config {
             }
 
             config.apply_env_overrides();
+            config.warn_legacy_agents_usage();
             Ok(config)
         }
     }

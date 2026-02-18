@@ -301,6 +301,43 @@ impl SubagentRuntime {
         self.store.get_subagent_run(run_id)
     }
 
+    pub async fn wait_for_run_completion(
+        &self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<SubagentRun> {
+        let deadline = time::Instant::now() + timeout;
+
+        loop {
+            let run = self
+                .store
+                .get_subagent_run(run_id)?
+                .ok_or_else(|| anyhow!("subagent run not found: {run_id}"))?;
+
+            if matches!(
+                SubagentRunStatus::from_str(run.status.as_str()),
+                Some(
+                    SubagentRunStatus::Succeeded
+                        | SubagentRunStatus::Failed
+                        | SubagentRunStatus::Canceled
+                )
+            ) {
+                return Ok(run);
+            }
+
+            let now = time::Instant::now();
+            if now >= deadline {
+                return Err(anyhow!(
+                    "subagent run '{run_id}' did not complete within {}s",
+                    timeout.as_secs()
+                ));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            time::sleep(self.poll_interval.min(remaining)).await;
+        }
+    }
+
     pub async fn run_loop(&self, poll_interval: Duration) -> Result<()> {
         let mut interval = time::interval(poll_interval);
         loop {
@@ -803,5 +840,59 @@ mod tests {
             tracking.max_global.load(Ordering::Acquire) >= 2,
             "expected parallel execution across sessions"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_runtime_wait_for_run_completion_returns_terminal_run() {
+        let workspace = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(workspace.path()).unwrap());
+        let runtime = Arc::new(SubagentRuntime::with_executor(
+            Arc::clone(&store),
+            Arc::new(Config::default()),
+            Arc::new(ImmediateExecutor),
+            Duration::from_millis(10),
+        ));
+        runtime.start_background_worker();
+
+        let run = runtime
+            .enqueue_run(EnqueueSubagentRunRequest {
+                subagent_session_id: None,
+                spec_id: None,
+                prompt: "wait".to_string(),
+                input_json: None,
+                session_meta_json: None,
+            })
+            .await
+            .unwrap();
+
+        let completed = runtime
+            .wait_for_run_completion(run.run_id.as_str(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, SubagentRunStatus::Succeeded.as_str());
+    }
+
+    #[tokio::test]
+    async fn subagent_runtime_wait_for_run_completion_times_out_for_non_terminal_run() {
+        let workspace = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(workspace.path()).unwrap());
+        let runtime = SubagentRuntime::new(store);
+
+        let run = runtime
+            .enqueue_run(EnqueueSubagentRunRequest {
+                subagent_session_id: None,
+                spec_id: None,
+                prompt: "pending".to_string(),
+                input_json: None,
+                session_meta_json: None,
+            })
+            .await
+            .unwrap();
+
+        let err = runtime
+            .wait_for_run_completion(run.run_id.as_str(), Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not complete"));
     }
 }
