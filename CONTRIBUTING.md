@@ -211,6 +211,17 @@ Before requesting review, ensure all of the following are true:
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
 - Linked issue (or rationale for no issue) is included.
 
+### Milestone PR Testing Checklist
+
+For all milestone PRs, confirm coverage for:
+
+- Happy path behavior for core logic.
+- Boundary cases: empty/missing inputs, configured limits, and not-found errors.
+- Concurrency and reentrancy behavior.
+- Recovery semantics for persisted runs (restart/resume/failure recovery).
+- Invariants: no system persisted, and session vs memory mutual exclusion.
+- Tool parameter validation (invalid/missing/extra/wrong-type params).
+
 ## PR Definition of Done (DoD)
 
 A PR is merge-ready when:
