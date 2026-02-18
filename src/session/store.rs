@@ -102,7 +102,7 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 3;
+const SESSION_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubagentRunStatus {
@@ -111,6 +111,41 @@ pub enum SubagentRunStatus {
     Succeeded,
     Failed,
     Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecRunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+    TimedOut,
+}
+
+impl ExecRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    pub fn from_str(status: &str) -> Option<Self> {
+        match status {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
 }
 
 impl SubagentRunStatus {
@@ -168,6 +203,36 @@ pub struct SubagentRun {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecRun {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub command: String,
+    pub pty: bool,
+    pub timeout_secs: i64,
+    pub max_output_bytes: i64,
+    pub watch_json: Option<String>,
+    pub exit_code: Option<i64>,
+    pub output_bytes: i64,
+    pub truncated: bool,
+    pub error_message: Option<String>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecRunItem {
+    pub seq: i64,
+    pub run_id: String,
+    pub item_type: String,
+    pub payload: String,
+    pub meta_json: Option<String>,
+    pub created_at: String,
 }
 
 impl SessionStore {
@@ -333,6 +398,48 @@ impl SessionStore {
             conn.pragma_update(None, "user_version", 3_i64)
                 .context("Failed to set sessions schema version to 3")?;
             version = 3;
+        }
+
+        if version < 4 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS exec_runs (
+                    run_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    pty INTEGER NOT NULL DEFAULT 0,
+                    timeout_secs INTEGER NOT NULL,
+                    max_output_bytes INTEGER NOT NULL,
+                    watch_json TEXT,
+                    exit_code INTEGER,
+                    output_bytes INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    queued_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS exec_run_items (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    item_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    meta_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES exec_runs(run_id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_exec_runs_status_queued
+                    ON exec_runs(status, queued_at ASC);
+                 CREATE INDEX IF NOT EXISTS idx_exec_runs_session
+                    ON exec_runs(session_id, queued_at ASC);
+                 CREATE INDEX IF NOT EXISTS idx_exec_run_items_run_seq
+                    ON exec_run_items(run_id, seq ASC);",
+            )
+            .context("Failed to apply sessions schema migration v4")?;
+            conn.pragma_update(None, "user_version", 4_i64)
+                .context("Failed to set sessions schema version to 4")?;
+            version = 4;
         }
 
         if version != SESSION_SCHEMA_VERSION {
@@ -1153,11 +1260,346 @@ impl SessionStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("Failed to decode subagent runs list")
     }
+
+    pub fn enqueue_exec_run(
+        &self,
+        session_id: &str,
+        command: &str,
+        pty: bool,
+        timeout_secs: i64,
+        max_output_bytes: i64,
+        watch_json: Option<&str>,
+    ) -> Result<ExecRun> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO exec_runs (
+                run_id, session_id, status, command, pty, timeout_secs, max_output_bytes,
+                watch_json, exit_code, output_bytes, truncated, error_message,
+                queued_at, started_at, finished_at, updated_at
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, NULL, 0, 0, NULL, ?8, NULL, NULL, ?8)",
+            params![
+                run_id,
+                session_id,
+                command,
+                if pty { 1_i64 } else { 0_i64 },
+                timeout_secs,
+                max_output_bytes,
+                watch_json,
+                now
+            ],
+        )
+        .context("Failed to enqueue exec run")?;
+
+        Ok(ExecRun {
+            run_id,
+            session_id: session_id.to_string(),
+            status: ExecRunStatus::Queued.as_str().to_string(),
+            command: command.to_string(),
+            pty,
+            timeout_secs,
+            max_output_bytes,
+            watch_json: watch_json.map(ToOwned::to_owned),
+            exit_code: None,
+            output_bytes: 0,
+            truncated: false,
+            error_message: None,
+            queued_at: now.clone(),
+            started_at: None,
+            finished_at: None,
+            updated_at: now,
+        })
+    }
+
+    pub fn claim_next_queued_exec_run(&self) -> Result<Option<ExecRun>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("Failed to start claim_next_queued_exec_run transaction")?;
+        let next = tx
+            .query_row(
+                "SELECT run_id, session_id
+                 FROM exec_runs
+                 WHERE status = 'queued'
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM exec_runs AS running
+                        WHERE running.session_id = exec_runs.session_id
+                          AND running.status = 'running'
+                   )
+                 ORDER BY queued_at ASC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .context("Failed to query next queued exec run")?;
+
+        let Some((run_id, session_id)) = next else {
+            tx.commit()
+                .context("Failed to commit empty queued exec-run transaction")?;
+            return Ok(None);
+        };
+
+        let now = Self::now();
+        tx.execute(
+            "UPDATE exec_runs
+             SET status = 'running', started_at = ?1, updated_at = ?1
+             WHERE run_id = ?2
+               AND status = 'queued'
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM exec_runs AS running
+                    WHERE running.session_id = ?3
+                      AND running.status = 'running'
+               )",
+            params![now, run_id, session_id],
+        )
+        .context("Failed to mark exec run as running")?;
+
+        tx.commit()
+            .context("Failed to commit exec-run claim transaction")?;
+        drop(conn);
+        self.get_exec_run(run_id.as_str())
+    }
+
+    pub fn recover_running_exec_runs_to_queued(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "UPDATE exec_runs
+             SET status = 'queued',
+                 started_at = NULL,
+                 updated_at = ?1
+             WHERE status = 'running'",
+            params![now],
+        )
+        .context("Failed to recover running exec runs")?;
+        let changes = conn
+            .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
+            .context("Failed to query recovered exec run changes")?;
+        Ok(changes.max(0) as usize)
+    }
+
+    pub fn mark_exec_run_succeeded(
+        &self,
+        run_id: &str,
+        exit_code: Option<i64>,
+        output_bytes: i64,
+        truncated: bool,
+    ) -> Result<()> {
+        self.mark_exec_run_final(
+            run_id,
+            ExecRunStatus::Succeeded,
+            exit_code,
+            output_bytes,
+            truncated,
+            None,
+            &["running"],
+            true,
+        )
+    }
+
+    pub fn mark_exec_run_failed(
+        &self,
+        run_id: &str,
+        exit_code: Option<i64>,
+        output_bytes: i64,
+        truncated: bool,
+        error_message: &str,
+    ) -> Result<()> {
+        self.mark_exec_run_final(
+            run_id,
+            ExecRunStatus::Failed,
+            exit_code,
+            output_bytes,
+            truncated,
+            Some(error_message),
+            &["running"],
+            true,
+        )
+    }
+
+    pub fn mark_exec_run_timed_out(
+        &self,
+        run_id: &str,
+        output_bytes: i64,
+        truncated: bool,
+    ) -> Result<()> {
+        self.mark_exec_run_final(
+            run_id,
+            ExecRunStatus::TimedOut,
+            None,
+            output_bytes,
+            truncated,
+            Some("exec run timed out"),
+            &["running"],
+            true,
+        )
+    }
+
+    pub fn mark_exec_run_canceled(&self, run_id: &str) -> Result<()> {
+        self.mark_exec_run_final(
+            run_id,
+            ExecRunStatus::Canceled,
+            None,
+            0,
+            false,
+            Some("exec run canceled"),
+            &["queued", "running"],
+            false,
+        )
+    }
+
+    pub fn append_exec_run_item(
+        &self,
+        run_id: &str,
+        item_type: &str,
+        payload: &str,
+        meta_json: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "INSERT INTO exec_run_items (run_id, item_type, payload, meta_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id, item_type, payload, meta_json, now],
+        )
+        .context("Failed to append exec run item")?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn load_exec_run_items_since(
+        &self,
+        run_id: &str,
+        since_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ExecRunItem>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, run_id, item_type, payload, meta_json, created_at
+                 FROM exec_run_items
+                 WHERE run_id = ?1
+                   AND (?2 IS NULL OR seq > ?2)
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .context("Failed to prepare load_exec_run_items_since query")?;
+
+        let rows = stmt
+            .query_map(params![run_id, since_seq, i64::from(limit)], |row| {
+                Ok(ExecRunItem {
+                    seq: row.get(0)?,
+                    run_id: row.get(1)?,
+                    item_type: row.get(2)?,
+                    payload: row.get(3)?,
+                    meta_json: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .context("Failed to query exec run items")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode exec run items")
+    }
+
+    pub fn get_exec_run(&self, run_id: &str) -> Result<Option<ExecRun>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT run_id, session_id, status, command, pty, timeout_secs, max_output_bytes, watch_json,
+                    exit_code, output_bytes, truncated, error_message,
+                    queued_at, started_at, finished_at, updated_at
+             FROM exec_runs
+             WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(ExecRun {
+                    run_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    status: row.get(2)?,
+                    command: row.get(3)?,
+                    pty: row.get::<_, i64>(4)? == 1,
+                    timeout_secs: row.get(5)?,
+                    max_output_bytes: row.get(6)?,
+                    watch_json: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    output_bytes: row.get(9)?,
+                    truncated: row.get::<_, i64>(10)? == 1,
+                    error_message: row.get(11)?,
+                    queued_at: row.get(12)?,
+                    started_at: row.get(13)?,
+                    finished_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query exec run")
+    }
+
+    fn mark_exec_run_final(
+        &self,
+        run_id: &str,
+        status: ExecRunStatus,
+        exit_code: Option<i64>,
+        output_bytes: i64,
+        truncated: bool,
+        error_message: Option<&str>,
+        allowed_current_statuses: &[&str],
+        bail_when_unchanged: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        let allowed_statuses = allowed_current_statuses
+            .iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "UPDATE exec_runs
+                 SET status = ?1,
+                     exit_code = COALESCE(?2, exit_code),
+                     output_bytes = CASE
+                        WHEN ?3 > output_bytes THEN ?3
+                        ELSE output_bytes
+                     END,
+                     truncated = CASE
+                        WHEN ?4 = 1 THEN 1
+                        ELSE truncated
+                     END,
+                     error_message = ?5,
+                     finished_at = ?6,
+                     updated_at = ?6
+                 WHERE run_id = ?7
+                   AND status IN ({allowed_statuses})"
+        );
+        let changed = conn
+            .execute(
+                query.as_str(),
+                params![
+                    status.as_str(),
+                    exit_code,
+                    output_bytes,
+                    if truncated { 1_i64 } else { 0_i64 },
+                    error_message,
+                    now,
+                    run_id
+                ],
+            )
+            .context("Failed to mark exec run final state")?;
+        if changed == 0 && bail_when_unchanged {
+            bail!("Exec run '{run_id}' must be in running state before finalizing");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionId, SessionRouteMetadata, SessionStore, SubagentRunStatus};
+    use super::{ExecRunStatus, SessionId, SessionRouteMetadata, SessionStore, SubagentRunStatus};
     use crate::session::SessionKey;
     use rusqlite::{params, Connection};
     use std::fs;
@@ -1347,6 +1789,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(subagent_runs_exists, 1);
+
+        let exec_runs_exists: i64 = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='exec_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exec_runs_exists, 1);
     }
 
     #[test]
@@ -1526,5 +1977,58 @@ mod tests {
         assert_eq!(loaded.channel, "slack");
         assert_eq!(loaded.route_id.as_deref(), Some("thread-1"));
         assert_eq!(loaded.chat_id, "chat-1");
+    }
+
+    #[test]
+    fn exec_store_enqueues_claims_streams_and_recovers() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let queued = store
+            .enqueue_exec_run(
+                "session-ops",
+                "echo hello",
+                false,
+                30,
+                2048,
+                Some(r#"[{"regex":"hello","event":"ready"}]"#),
+            )
+            .unwrap();
+        assert_eq!(queued.status, ExecRunStatus::Queued.as_str());
+
+        let claimed = store.claim_next_queued_exec_run().unwrap().unwrap();
+        assert_eq!(claimed.run_id, queued.run_id);
+        assert_eq!(claimed.status, ExecRunStatus::Running.as_str());
+
+        let seq = store
+            .append_exec_run_item(claimed.run_id.as_str(), "stdout", "hello\n", None)
+            .unwrap();
+        assert!(seq > 0);
+        let streamed = store
+            .load_exec_run_items_since(claimed.run_id.as_str(), Some(seq - 1), 10)
+            .unwrap();
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].payload, "hello\n");
+
+        store
+            .mark_exec_run_succeeded(claimed.run_id.as_str(), Some(0), 6, false)
+            .unwrap();
+        let completed = store
+            .get_exec_run(claimed.run_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, ExecRunStatus::Succeeded.as_str());
+        assert_eq!(completed.exit_code, Some(0));
+
+        let second = store
+            .enqueue_exec_run("session-ops", "sleep 1", false, 30, 1024, None)
+            .unwrap();
+        let second_claimed = store.claim_next_queued_exec_run().unwrap().unwrap();
+        assert_eq!(second_claimed.run_id, second.run_id);
+        let recovered = store.recover_running_exec_runs_to_queued().unwrap();
+        assert_eq!(recovered, 1);
+        let recovered_run = store.get_exec_run(second.run_id.as_str()).unwrap().unwrap();
+        assert_eq!(recovered_run.status, ExecRunStatus::Queued.as_str());
+        assert!(recovered_run.started_at.is_none());
     }
 }

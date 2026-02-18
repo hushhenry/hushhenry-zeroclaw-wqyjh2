@@ -229,13 +229,18 @@ fn maybe_bind_source_session_id(
         return arguments;
     };
 
-    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule") {
+    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule" | "shell") {
         return arguments;
     }
 
     match arguments {
         serde_json::Value::Object(mut obj) => {
-            obj.entry("source_session_id".to_string())
+            let field_name = if tool_name == "shell" {
+                "session_id"
+            } else {
+                "source_session_id"
+            };
+            obj.entry(field_name.to_string())
                 .or_insert_with(|| serde_json::Value::String(source_session_id.to_string()));
             serde_json::Value::Object(obj)
         }

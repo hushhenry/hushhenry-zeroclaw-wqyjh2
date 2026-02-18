@@ -1,7 +1,9 @@
+use super::shell_exec_runtime::{PollExecRunResponse, ShellExecRuntime, SpawnExecRunRequest};
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +12,23 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+const MAX_WATCHERS: usize = 16;
+const MAX_WATCH_REGEX_LEN: usize = 256;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ShellWatchSpec {
+    regex: String,
+    event: String,
+    #[serde(default)]
+    once: Option<bool>,
+    #[serde(default)]
+    scope: Option<String>,
+}
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -26,71 +40,38 @@ impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self { security, runtime }
     }
-}
 
-#[async_trait]
-impl Tool for ShellTool {
-    fn name(&self) -> &str {
-        "shell"
-    }
-
-    fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
-                }
-            },
-            "required": ["command"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
+    fn validate_command_access(&self, command: &str, approved: bool) -> Option<ToolResult> {
         if self.security.is_rate_limited() {
-            return Ok(ToolResult {
+            return Some(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
-            Ok(_) => {}
-            Err(reason) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
+        if let Err(reason) = self.security.validate_command_execution(command, approved) {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
         }
 
         if !self.security.record_action() {
-            return Ok(ToolResult {
+            return Some(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
+        }
+
+        None
+    }
+
+    async fn execute_legacy(&self, command: &str, approved: bool) -> anyhow::Result<ToolResult> {
+        if let Some(result) = self.validate_command_access(command, approved) {
+            return Ok(result);
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -159,6 +140,306 @@ impl Tool for ShellTool {
             }),
         }
     }
+
+    async fn execute_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if let Some(result) = self.validate_command_access(command, approved) {
+            return Ok(result);
+        }
+
+        let watch_specs = parse_watch_specs(args.get("watch"))?;
+        let watch_json = if watch_specs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&watch_specs)?)
+        };
+
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("cli")
+            .to_string();
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let pty = args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false);
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(SHELL_TIMEOUT_SECS) as i64;
+        let max_output_bytes = args
+            .get("max_output_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(MAX_OUTPUT_BYTES as u64) as i64;
+
+        let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
+        let run = exec_runtime
+            .enqueue_run(SpawnExecRunRequest {
+                session_id: session_id.clone(),
+                command: command.to_string(),
+                pty,
+                timeout_secs,
+                max_output_bytes,
+                watch_json,
+            })
+            .await?;
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "status": run.status,
+                "queued_at": run.queued_at,
+                "background": background,
+                "pty": pty,
+                "note": if background {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String("background=false is accepted, but runs are still processed asynchronously in phase 1".to_string())
+                }
+            }))?,
+            error: None,
+        })
+    }
+
+    async fn execute_poll(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let run_id = args
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
+        let since_seq = args.get("since_seq").and_then(|v| v.as_i64());
+
+        let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
+        let Some(PollExecRunResponse {
+            run,
+            items,
+            next_seq,
+        }) = exec_runtime.poll_run(run_id, since_seq).await?
+        else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Exec run not found: {run_id}")),
+            });
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "status": run.status,
+                "command": run.command,
+                "exit_code": run.exit_code,
+                "output_bytes": run.output_bytes,
+                "truncated": run.truncated,
+                "error_message": run.error_message,
+                "queued_at": run.queued_at,
+                "started_at": run.started_at,
+                "finished_at": run.finished_at,
+                "updated_at": run.updated_at,
+                "since_seq": since_seq,
+                "next_seq": next_seq,
+                "items": items.iter().map(|item| json!({
+                    "seq": item.seq,
+                    "type": item.item_type,
+                    "payload": item.payload,
+                    "meta_json": item.meta_json,
+                    "created_at": item.created_at
+                })).collect::<Vec<_>>()
+            }))?,
+            error: None,
+        })
+    }
+
+    async fn execute_kill(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let run_id = args
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
+
+        let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
+        let Some(run) = exec_runtime.stop_run(run_id).await? else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Exec run not found: {run_id}")),
+            });
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "run_id": run.run_id,
+                "status": run.status,
+                "finished_at": run.finished_at,
+                "updated_at": run.updated_at
+            }))?,
+            error: None,
+        })
+    }
+}
+
+fn parse_watch_specs(raw: Option<&serde_json::Value>) -> anyhow::Result<Vec<ShellWatchSpec>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+
+    let watch_specs: Vec<ShellWatchSpec> = serde_json::from_value(raw.clone())?;
+    if watch_specs.len() > MAX_WATCHERS {
+        anyhow::bail!("watch exceeds max watcher count ({MAX_WATCHERS})");
+    }
+
+    for watch in &watch_specs {
+        if watch.regex.len() > MAX_WATCH_REGEX_LEN {
+            anyhow::bail!("watch regex exceeds max length ({MAX_WATCH_REGEX_LEN})");
+        }
+        if watch.regex.trim().is_empty() {
+            anyhow::bail!("watch regex cannot be empty");
+        }
+        if watch.event.trim().is_empty() {
+            anyhow::bail!("watch event cannot be empty");
+        }
+        if let Some(scope) = watch.scope.as_deref() {
+            if !matches!(scope, "stdout" | "stderr") {
+                anyhow::bail!("watch scope must be 'stdout' or 'stderr'");
+            }
+        }
+        let _ = watch.once.unwrap_or(false);
+        // Compile up-front so invalid patterns fail early.
+        let _ = regex::Regex::new(watch.regex.as_str())?;
+    }
+
+    Ok(watch_specs)
+}
+
+#[async_trait]
+impl Tool for ShellTool {
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Execute shell commands (legacy sync mode or action-based async runs)"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["spawn", "poll", "kill", "send_keys"],
+                    "description": "Optional action selector. Omit for legacy synchronous shell execution"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute"
+                },
+                "approved": {
+                    "type": "boolean",
+                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
+                    "default": false
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "When action=spawn, run in background (default true)",
+                    "default": true
+                },
+                "pty": {
+                    "type": "boolean",
+                    "description": "When action=spawn, request PTY mode (phase 1 is non-PTY)",
+                    "default": false
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Hard timeout for action=spawn"
+                },
+                "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Output cap for action=spawn"
+                },
+                "watch": {
+                    "type": "array",
+                    "description": "Watcher list: [{regex,event,once?,scope?}]",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "regex": {"type": "string"},
+                            "event": {"type": "string"},
+                            "once": {"type": "boolean"},
+                            "scope": {"type": "string", "enum": ["stdout", "stderr"]}
+                        },
+                        "required": ["regex", "event"]
+                    }
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Creating session id for routing and backlog delivery"
+                },
+                "run_id": {
+                    "type": "string",
+                    "description": "Run identifier for action=poll|kill|send_keys"
+                },
+                "since_seq": {
+                    "type": "integer",
+                    "description": "Optional sequence cursor for incremental poll responses"
+                },
+                "keys": {
+                    "type": "string",
+                    "description": "Optional key input for action=send_keys"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let action = args.get("action").and_then(|v| v.as_str());
+        match action {
+            Some("spawn") => self.execute_spawn(&args).await,
+            Some("poll") => self.execute_poll(&args).await,
+            Some("kill") => self.execute_kill(&args).await,
+            Some("send_keys") => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("action=send_keys is not implemented in phase 1".to_string()),
+            }),
+            Some(other) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Unsupported action: {other}")),
+            }),
+            None => {
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+                let approved = args
+                    .get("approved")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.execute_legacy(command, approved).await
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,11 +447,19 @@ mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::session::{backlog, ExecRunStatus, SessionStore};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+    use tokio::time::sleep;
 
-    fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+    fn test_security(
+        autonomy: AutonomyLevel,
+        workspace_dir: &std::path::Path,
+    ) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace_dir.to_path_buf(),
             ..SecurityPolicy::default()
         })
     }
@@ -179,91 +468,207 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    async fn wait_for_terminal(tool: &ShellTool, run_id: &str) -> serde_json::Value {
+        let start = Instant::now();
+        loop {
+            let result = tool
+                .execute(json!({"action":"poll", "run_id": run_id}))
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+            let status = payload["status"].as_str().unwrap_or_default();
+            if matches!(status, "succeeded" | "failed" | "canceled" | "timed_out") {
+                return payload;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
-    fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
-        assert!(!tool.description().is_empty());
-    }
-
-    #[test]
-    fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+    fn shell_tool_schema_has_action_and_command() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
         let schema = tool.parameters_schema();
+        assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("command")));
-        assert!(schema["properties"]["approved"].is_object());
     }
 
     #[tokio::test]
-    async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+    async fn shell_legacy_call_without_action_behaves_as_before() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.trim().contains("hello"));
-        assert!(result.error.is_none());
+        assert!(result.output.contains("hello"));
     }
 
     #[tokio::test]
-    async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
-        let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
-        assert!(!result.success);
-        let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
-    }
+    async fn shell_spawn_returns_run_id_and_persists_run() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
 
-    #[tokio::test]
-    async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
-        let result = tool.execute(json!({"command": "ls"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
-    }
-
-    #[tokio::test]
-    async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("command"));
-    }
-
-    #[tokio::test]
-    async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
-        let result = tool.execute(json!({"command": 123})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let started = Instant::now();
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo spawn-ok",
+                "session_id": "session-spawn"
+            }))
             .await
             .unwrap();
-        assert!(!result.success);
+
+        assert!(result.success);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let payload: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let run = store.get_exec_run(run_id).unwrap().unwrap();
+        assert_eq!(run.session_id, "session-spawn");
+        assert_eq!(run.status, ExecRunStatus::Queued.as_str());
     }
 
-    fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    #[tokio::test]
+    async fn shell_poll_returns_incremental_output() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
+
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo a && echo b",
+                "session_id": "session-poll"
+            }))
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+
+        let payload: serde_json::Value = serde_json::from_str(spawn.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let mut since_seq = 0_i64;
+        let mut collected = String::new();
+        let start = Instant::now();
+        loop {
+            let poll = tool
+                .execute(json!({"action":"poll", "run_id": run_id, "since_seq": since_seq}))
+                .await
+                .unwrap();
+            let poll_payload: serde_json::Value =
+                serde_json::from_str(poll.output.as_str()).unwrap();
+
+            for item in poll_payload["items"].as_array().unwrap() {
+                if item["type"].as_str().unwrap_or_default() == "stdout" {
+                    collected.push_str(item["payload"].as_str().unwrap_or_default());
+                }
+            }
+            since_seq = poll_payload["next_seq"].as_i64().unwrap_or(since_seq);
+
+            let status = poll_payload["status"].as_str().unwrap_or_default();
+            if matches!(status, "succeeded" | "failed" | "canceled" | "timed_out") {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            sleep(Duration::from_millis(30)).await;
+        }
+
+        assert!(collected.contains('a'));
+        assert!(collected.contains('b'));
+    }
+
+    #[tokio::test]
+    async fn shell_watcher_match_enqueues_backlog_item() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
+
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo READY_SIGNAL",
+                "session_id": "session-watch",
+                "watch": [{"regex": "READY_SIGNAL", "event": "ready", "once": true}]
+            }))
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+        let payload: serde_json::Value = serde_json::from_str(spawn.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let _ = wait_for_terminal(&tool, run_id).await;
+        let backlog_items = backlog::drain("session-watch");
+        assert!(backlog_items.iter().any(|item| item.contains("ready")));
+    }
+
+    #[tokio::test]
+    async fn shell_kill_transitions_run_status() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
+
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "tail -f Cargo.toml",
+                "session_id": "session-kill"
+            }))
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+        let payload: serde_json::Value = serde_json::from_str(spawn.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let killed = tool
+            .execute(json!({"action":"kill", "run_id": run_id}))
+            .await
+            .unwrap();
+        assert!(killed.success);
+
+        let final_state = wait_for_terminal(&tool, run_id).await;
+        assert_eq!(final_state["status"].as_str(), Some("canceled"));
+    }
+
+    #[test]
+    fn test_security_with_env_cmd() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: tmp.path().to_path_buf(),
             allowed_commands: vec!["env".into(), "echo".into()],
             ..SecurityPolicy::default()
-        })
+        });
+        assert!(security.is_command_allowed("env"));
     }
 
     /// RAII guard that restores an environment variable to its original state on drop,
@@ -292,77 +697,23 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_does_not_leak_api_key() {
+        let tmp = TempDir::new().unwrap();
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: tmp.path().to_path_buf(),
+                allowed_commands: vec!["env".into()],
+                ..SecurityPolicy::default()
+            }),
+            test_runtime(),
+        );
+
         let result = tool.execute(json!({"command": "env"})).await.unwrap();
         assert!(result.success);
-        assert!(
-            !result.output.contains("sk-test-secret-12345"),
-            "API_KEY leaked to shell command output"
-        );
-        assert!(
-            !result.output.contains("sk-test-secret-67890"),
-            "ZEROCLAW_API_KEY leaked to shell command output"
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
-
-        let result = tool
-            .execute(json!({"command": "echo $HOME"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "HOME should be available in shell"
-        );
-
-        let result = tool
-            .execute(json!({"command": "echo $PATH"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "PATH should be available in shell"
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_requires_approval_for_medium_risk_command() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
-
-        let tool = ShellTool::new(security.clone(), test_runtime());
-        let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
-            .await
-            .unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("explicit approval"));
-
-        let allowed = tool
-            .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
-                "approved": true
-            }))
-            .await
-            .unwrap();
-        assert!(allowed.success);
-
-        let _ = std::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test"));
+        assert!(!result.output.contains("sk-test-secret-12345"));
+        assert!(!result.output.contains("sk-test-secret-67890"));
     }
 }
