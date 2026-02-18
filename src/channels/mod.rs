@@ -38,7 +38,9 @@ use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
-use crate::session::{SessionContext, SessionId, SessionResolver, SessionStore};
+use crate::session::{
+    SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionStore,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -299,11 +301,23 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             match session_store.load_recent_messages(session_id, ctx.session_history_limit) {
                 Ok(messages) => {
                     for message in messages {
-                        match message.role.as_str() {
-                            "system" => history.push(ChatMessage::system(message.content)),
-                            "user" => history.push(ChatMessage::user(message.content)),
-                            "assistant" => history.push(ChatMessage::assistant(message.content)),
-                            _ => {}
+                        match SessionMessageRole::from_str(message.role.as_str()) {
+                            Some(SessionMessageRole::User) => {
+                                history.push(ChatMessage::user(message.content))
+                            }
+                            Some(SessionMessageRole::Assistant) => {
+                                history.push(ChatMessage::assistant(message.content))
+                            }
+                            Some(SessionMessageRole::Tool) => {
+                                history.push(ChatMessage::tool(message.content))
+                            }
+                            None => {
+                                tracing::warn!(
+                                    role = message.role.as_str(),
+                                    session_id = %session_id.as_str(),
+                                    "Skipping unsupported role from stored session history"
+                                );
+                            }
                         }
                     }
                 }

@@ -26,6 +26,32 @@ impl fmt::Display for SessionId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionMessageRole {
+    User,
+    Assistant,
+    Tool,
+}
+
+impl SessionMessageRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+
+    pub fn from_str(role: &str) -> Option<Self> {
+        match role {
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            "tool" => Some(Self::Tool),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionMessage {
     pub role: String,
@@ -213,13 +239,22 @@ impl SessionStore {
         content: &str,
         meta_json: Option<&str>,
     ) -> Result<()> {
+        let Some(role) = SessionMessageRole::from_str(role) else {
+            tracing::warn!(
+                session_id = %session_id.as_str(),
+                role,
+                "Skipping session message with unsupported role"
+            );
+            return Ok(());
+        };
+
         let conn = self.connect()?;
         let now = Self::now();
 
         conn.execute(
             "INSERT INTO session_messages (session_id, role, content, created_at, meta_json)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id.as_str(), role, content, now, meta_json],
+            params![session_id.as_str(), role.as_str(), content, now, meta_json],
         )
         .context("Failed to append session message")?;
 
@@ -243,6 +278,7 @@ impl SessionStore {
                 "SELECT role, content, created_at, meta_json
                  FROM session_messages
                  WHERE session_id = ?1
+                   AND role IN ('user', 'assistant', 'tool')
                  ORDER BY id DESC
                  LIMIT ?2",
             )
@@ -300,6 +336,7 @@ impl SessionStore {
 mod tests {
     use super::SessionStore;
     use crate::session::SessionKey;
+    use rusqlite::{params, Connection};
     use tempfile::TempDir;
 
     #[test]
@@ -329,5 +366,32 @@ mod tests {
 
         let active = store.get_or_create_active(&session_key).unwrap();
         assert_eq!(active.as_str(), newer_session.as_str());
+    }
+
+    #[test]
+    fn session_store_skips_unsupported_roles() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let session_key = SessionKey::new("group:telegram:chat-123");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+
+        store
+            .append_message(&session_id, "system", "internal marker", None)
+            .unwrap();
+
+        let messages = store.load_recent_messages(&session_id, 10).unwrap();
+        assert!(messages.is_empty());
+
+        let db_path = workspace.path().join("memory").join("sessions.db");
+        let conn = Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+                params![session_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
