@@ -60,6 +60,9 @@ pub struct Config {
     pub memory: MemoryConfig,
 
     #[serde(default)]
+    pub session: SessionConfig,
+
+    #[serde(default)]
     pub gateway: GatewayConfig,
 
     #[serde(default)]
@@ -691,6 +694,31 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+        }
+    }
+}
+
+// ── Session ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Enable session-first conversation management for channels.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Number of recent session messages to load per request.
+    #[serde(default = "default_session_history_limit")]
+    pub history_limit: u32,
+}
+
+fn default_session_history_limit() -> u32 {
+    40
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history_limit: default_session_history_limit(),
         }
     }
 }
@@ -1493,6 +1521,7 @@ impl Default for Config {
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            session: SessionConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
@@ -2127,6 +2156,7 @@ default_temperature = 0.7
                 qq: None,
             },
             memory: MemoryConfig::default(),
+            session: SessionConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
@@ -2233,6 +2263,7 @@ tool_dispatcher = "xml"
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            session: SessionConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),

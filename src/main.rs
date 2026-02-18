@@ -57,6 +57,7 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod session;
 mod skills;
 mod tools;
 mod util;

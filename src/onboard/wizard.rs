@@ -118,6 +118,7 @@ pub fn run_wizard() -> Result<Config> {
         cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
+        session: crate::config::SessionConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
         secrets: secrets_config,
@@ -333,6 +334,7 @@ pub fn run_quick_setup(
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
+        session: crate::config::SessionConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
         secrets: SecretsConfig::default(),
