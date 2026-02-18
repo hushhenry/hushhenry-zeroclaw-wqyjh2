@@ -708,7 +708,7 @@ async fn handle_whatsapp_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::traits::ChannelMessage;
+    use crate::channels::traits::{ChannelMessage, ChatType};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use async_trait::async_trait;
@@ -832,7 +832,8 @@ mod tests {
             reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),
-            chat_type: "direct".into(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
             chat_id: "+1234567890".into(),
             thread_id: None,
             timestamp: 1,

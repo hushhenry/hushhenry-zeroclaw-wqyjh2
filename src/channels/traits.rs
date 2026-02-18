@@ -1,5 +1,24 @@
 use async_trait::async_trait;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatType {
+    Direct,
+    Group,
+    Thread,
+    Unknown,
+}
+
+impl ChatType {
+    pub fn from_raw(raw_chat_type: &str) -> Self {
+        match raw_chat_type.to_ascii_lowercase().as_str() {
+            "direct" | "dm" | "private" | "p2p" | "c2c" => Self::Direct,
+            "group" | "channel" | "supergroup" | "room" => Self::Group,
+            "thread" => Self::Thread,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -8,7 +27,8 @@ pub struct ChannelMessage {
     pub reply_target: String,
     pub content: String,
     pub channel: String,
-    pub chat_type: String,
+    pub chat_type: ChatType,
+    pub raw_chat_type: Option<String>,
     pub chat_id: String,
     pub thread_id: Option<String>,
     pub timestamp: u64,
@@ -108,7 +128,8 @@ mod tests {
                 reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
-                chat_type: "direct".into(),
+                chat_type: ChatType::Direct,
+                raw_chat_type: None,
                 chat_id: "tester".into(),
                 thread_id: None,
                 timestamp: 123,
@@ -126,7 +147,8 @@ mod tests {
             reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
-            chat_type: "direct".into(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
             chat_id: "alice".into(),
             thread_id: None,
             timestamp: 999,
@@ -138,7 +160,8 @@ mod tests {
         assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
-        assert_eq!(cloned.chat_type, "direct");
+        assert_eq!(cloned.chat_type, ChatType::Direct);
+        assert!(cloned.raw_chat_type.is_none());
         assert_eq!(cloned.chat_id, "alice");
         assert!(cloned.thread_id.is_none());
         assert_eq!(cloned.timestamp, 999);

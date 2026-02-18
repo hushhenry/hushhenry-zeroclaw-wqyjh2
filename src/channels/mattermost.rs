@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 
@@ -219,7 +219,8 @@ impl MattermostChannel {
             reply_target,
             content: text.to_string(),
             channel: "mattermost".to_string(),
-            chat_type: "group".to_string(),
+            chat_type: ChatType::Thread,
+            raw_chat_type: None,
             chat_id: channel_id.to_string(),
             thread_id: Some(if root_id.is_empty() {
                 id.to_string()

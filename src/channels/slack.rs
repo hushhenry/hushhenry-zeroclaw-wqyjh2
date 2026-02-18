@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 
 /// Slack channel — polls conversations.history via Web API
@@ -162,10 +162,12 @@ impl Channel for SlackChannel {
                         .and_then(|t| t.as_str())
                         .filter(|t| !t.is_empty())
                         .map(ToString::to_string);
-                    let chat_type = if channel_id.starts_with('D') {
-                        "direct"
+                    let chat_type = if thread_id.is_some() {
+                        ChatType::Thread
+                    } else if channel_id.starts_with('D') {
+                        ChatType::Direct
                     } else {
-                        "group"
+                        ChatType::Group
                     };
 
                     let channel_msg = ChannelMessage {
@@ -174,7 +176,8 @@ impl Channel for SlackChannel {
                         reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
-                        chat_type: chat_type.to_string(),
+                        chat_type,
+                        raw_chat_type: None,
                         chat_id: channel_id.clone(),
                         thread_id,
                         timestamp: std::time::SystemTime::now()

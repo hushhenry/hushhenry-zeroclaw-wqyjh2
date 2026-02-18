@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -243,9 +243,9 @@ impl SignalChannel {
             .as_ref()
             .and_then(|g| g.group_id.as_deref());
         let chat_type = if group_id.is_some() {
-            "group"
+            ChatType::Group
         } else {
-            "direct"
+            ChatType::Direct
         };
         let chat_id = group_id.unwrap_or(sender.as_str()).to_string();
 
@@ -268,7 +268,8 @@ impl SignalChannel {
             reply_target: target,
             content: text.to_string(),
             channel: "signal".to_string(),
-            chat_type: chat_type.to_string(),
+            chat_type,
+            raw_chat_type: None,
             chat_id,
             thread_id: None,
             timestamp: timestamp / 1000, // millis → secs

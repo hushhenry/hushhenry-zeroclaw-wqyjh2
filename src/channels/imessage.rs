@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
@@ -175,7 +175,8 @@ end tell"#
                             reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
-                            chat_type: "direct".to_string(),
+                            chat_type: ChatType::Direct,
+                            raw_chat_type: None,
                             chat_id: sender,
                             thread_id: None,
                             timestamp: std::time::SystemTime::now()

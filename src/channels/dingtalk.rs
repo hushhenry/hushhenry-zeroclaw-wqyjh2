@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -233,9 +233,9 @@ impl Channel for DingTalkChannel {
                     // Private chat uses sender ID, group chat uses conversation ID.
                     let chat_id = Self::resolve_chat_id(&data, sender_id);
                     let chat_type = if Self::is_private_chat(&data) {
-                        "direct"
+                        ChatType::Direct
                     } else {
-                        "group"
+                        ChatType::Group
                     };
 
                     // Store session webhook for later replies
@@ -271,7 +271,8 @@ impl Channel for DingTalkChannel {
                         reply_target: chat_id.clone(),
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
-                        chat_type: chat_type.to_string(),
+                        chat_type,
+                        raw_chat_type: None,
                         chat_id: chat_id,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()

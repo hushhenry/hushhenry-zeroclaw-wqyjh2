@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::channels::traits::ChatType;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey(String);
 
@@ -22,7 +24,7 @@ impl fmt::Display for SessionKey {
 #[derive(Debug, Clone)]
 pub struct SessionContext {
     pub channel: String,
-    pub chat_type: String,
+    pub chat_type: ChatType,
     pub sender_id: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
@@ -51,12 +53,8 @@ impl SessionResolver {
             ));
         }
 
-        let chat_type = context.chat_type.to_ascii_lowercase();
-        if matches!(chat_type.as_str(), "group" | "channel" | "supergroup") {
-            return SessionKey::new(format!(
-                "group:{}:{}",
-                context.channel, context.chat_id
-            ));
+        if matches!(context.chat_type, ChatType::Group | ChatType::Thread) {
+            return SessionKey::new(format!("group:{}:{}", context.channel, context.chat_id));
         }
 
         SessionKey::new(format!("direct:{}:{}", context.channel, context.sender_id))
@@ -66,13 +64,14 @@ impl SessionResolver {
 #[cfg(test)]
 mod tests {
     use super::{SessionContext, SessionResolver};
+    use crate::channels::traits::ChatType;
 
     #[test]
     fn resolver_uses_thread_format_when_thread_is_present() {
         let resolver = SessionResolver::new();
         let context = SessionContext {
             channel: "telegram".into(),
-            chat_type: "group".into(),
+            chat_type: ChatType::Group,
             sender_id: "user-1".into(),
             chat_id: "chat-42".into(),
             thread_id: Some("17".into()),
@@ -87,7 +86,7 @@ mod tests {
         let resolver = SessionResolver::new();
         let context = SessionContext {
             channel: "discord".into(),
-            chat_type: "channel".into(),
+            chat_type: ChatType::Group,
             sender_id: "user-2".into(),
             chat_id: "chan-88".into(),
             thread_id: None,
@@ -102,7 +101,7 @@ mod tests {
         let resolver = SessionResolver::new();
         let context = SessionContext {
             channel: "imessage".into(),
-            chat_type: "direct".into(),
+            chat_type: ChatType::Direct,
             sender_id: "alice".into(),
             chat_id: "alice".into(),
             thread_id: None,

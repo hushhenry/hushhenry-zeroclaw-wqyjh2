@@ -25,7 +25,7 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,7 +432,8 @@ impl Channel for EmailChannel {
                             sender: sender.clone(),
                             content,
                             channel: "email".to_string(),
-                            chat_type: "direct".to_string(),
+                            chat_type: ChatType::Direct,
+                            raw_chat_type: None,
                             chat_id: sender,
                             thread_id: None,
                             timestamp: ts,

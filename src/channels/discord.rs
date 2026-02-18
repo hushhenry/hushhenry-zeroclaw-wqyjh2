@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -397,7 +397,11 @@ impl Channel for DiscordChannel {
                     } else {
                         channel_id.clone()
                     };
-                    let chat_type = if msg_guild.is_some() { "group" } else { "direct" };
+                    let chat_type = if msg_guild.is_some() {
+                        ChatType::Group
+                    } else {
+                        ChatType::Direct
+                    };
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -413,7 +417,8 @@ impl Channel for DiscordChannel {
                         },
                         content: clean_content,
                         channel: channel_id,
-                        chat_type: chat_type.to_string(),
+                        chat_type,
+                        raw_chat_type: None,
                         chat_id,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
