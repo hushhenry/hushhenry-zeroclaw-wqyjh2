@@ -822,80 +822,10 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills(&config.workspace_dir);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
-    }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
-        ));
-    }
+    let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -904,7 +834,7 @@ pub async fn run(
     let mut system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,
-        &tool_descs,
+        &tool_prompt_entries,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -1135,22 +1065,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     )?;
 
     let skills = crate::skills::load_skills(&config.workspace_dir);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
-    ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
+    let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -1159,7 +1077,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let mut system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         &model_name,
-        &tool_descs,
+        &tool_prompt_entries,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,

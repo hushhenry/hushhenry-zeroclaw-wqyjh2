@@ -512,58 +512,6 @@ impl Agent {
     }
 }
 
-pub async fn run(
-    config: Config,
-    message: Option<String>,
-    provider_override: Option<String>,
-    model_override: Option<String>,
-    temperature: f64,
-) -> Result<()> {
-    let start = Instant::now();
-
-    let mut effective_config = config;
-    if let Some(p) = provider_override {
-        effective_config.default_provider = Some(p);
-    }
-    if let Some(m) = model_override {
-        effective_config.default_model = Some(m);
-    }
-    effective_config.default_temperature = temperature;
-
-    let mut agent = Agent::from_config(&effective_config)?;
-
-    let provider_name = effective_config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter")
-        .to_string();
-    let model_name = effective_config
-        .default_model
-        .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name,
-        model: model_name,
-    });
-
-    if let Some(msg) = message {
-        let response = agent.run_single(&msg).await?;
-        println!("{response}");
-    } else {
-        agent.run_interactive().await?;
-    }
-
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        duration: start.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
-    });
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
