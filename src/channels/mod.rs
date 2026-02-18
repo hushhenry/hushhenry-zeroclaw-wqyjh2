@@ -44,8 +44,8 @@ use crate::session::{
         load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
         SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
-    SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionRouteMetadata,
-    SessionStore,
+    SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
+    SessionRouteMetadata, SessionStore,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -59,6 +59,9 @@ use std::time::{Duration, Instant};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
+const DEFAULT_QUEUE_MODE: &str = "steer-backlog";
+const COMMAND_LIST_LIMIT: u32 = 20;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -110,20 +113,292 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
-fn is_new_session_command(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("/new") {
-        return false;
-    }
-    trimmed.chars().nth(4).is_none_or(|ch| ch.is_whitespace())
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashCommand {
+    New,
+    Compact,
+    Queue { mode: Option<String> },
+    Subagents,
+    Sessions,
 }
 
-fn is_compact_session_command(content: &str) -> bool {
+fn parse_slash_command(content: &str) -> Option<SlashCommand> {
     let trimmed = content.trim_start();
-    if !trimmed.starts_with("/compact") {
-        return false;
+    if !trimmed.starts_with('/') {
+        return None;
     }
-    trimmed.chars().nth(8).is_none_or(|ch| ch.is_whitespace())
+
+    let mut parts = trimmed.split_whitespace();
+    let command = parts.next()?;
+
+    match command {
+        "/new" => Some(SlashCommand::New),
+        "/compact" => Some(SlashCommand::Compact),
+        "/queue" => Some(SlashCommand::Queue {
+            mode: parts.next().map(str::to_string),
+        }),
+        "/subagents" => Some(SlashCommand::Subagents),
+        "/sessions" => Some(SlashCommand::Sessions),
+        _ => None,
+    }
+}
+
+fn decode_session_string_state(value_json: Option<String>) -> Option<String> {
+    value_json.and_then(|raw| {
+        serde_json::from_str::<String>(&raw).ok().or_else(|| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    })
+}
+
+fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> String {
+    decode_session_string_state(
+        session_store
+            .get_state_key(session_id, SESSION_QUEUE_MODE_KEY)
+            .ok()
+            .flatten(),
+    )
+    .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string())
+}
+
+async fn send_command_response(
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    content: String,
+) {
+    if let Some(channel) = target_channel {
+        if let Err(error) = channel.send(&SendMessage::new(content, reply_target)).await {
+            tracing::error!(
+                "Failed to send command response on {}: {error}",
+                channel.name()
+            );
+        }
+    }
+}
+
+async fn handle_slash_command(
+    ctx: &ChannelRuntimeContext,
+    target_channel: Option<&Arc<dyn Channel>>,
+    msg: &traits::ChannelMessage,
+    session_key: &SessionKey,
+    command: SlashCommand,
+    merged_system_prompt: &str,
+) -> bool {
+    if !ctx.session_enabled {
+        send_command_response(
+            target_channel,
+            &msg.reply_target,
+            "Session commands require `session.enabled = true`.".to_string(),
+        )
+        .await;
+        return true;
+    }
+
+    let Some(session_store) = ctx.session_store.as_ref() else {
+        send_command_response(
+            target_channel,
+            &msg.reply_target,
+            "Session store is unavailable.".to_string(),
+        )
+        .await;
+        return true;
+    };
+
+    match command {
+        SlashCommand::New => match session_store.create_new(session_key) {
+            Ok(session_id) => {
+                if let Err(error) =
+                    session_store.upsert_route_metadata(&session_id, &build_route_metadata(msg))
+                {
+                    tracing::warn!(
+                        "Failed to persist route metadata for session {}: {error}",
+                        session_id.as_str()
+                    );
+                }
+
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    format!(
+                        "Started a new session `{}` for this conversation.",
+                        short_session_id(&session_id)
+                    ),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to create new session for key {}: {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to create a new session. Please try again.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Compact => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                run_manual_session_compaction(
+                    ctx,
+                    target_channel,
+                    &msg.reply_target,
+                    &session_id,
+                    merged_system_prompt,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to resolve active session for compact command ({}): {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to load the active session for compaction.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Queue { mode } => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                if let Some(mode) = mode {
+                    if mode != DEFAULT_QUEUE_MODE {
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            format!(
+                                "Unsupported queue mode `{mode}`. Supported modes: `{DEFAULT_QUEUE_MODE}`."
+                            ),
+                        )
+                        .await;
+                        return true;
+                    }
+
+                    if let Err(error) = session_store.set_state_key(
+                        &session_id,
+                        SESSION_QUEUE_MODE_KEY,
+                        &serde_json::to_string(DEFAULT_QUEUE_MODE)
+                            .unwrap_or_else(|_| format!("\"{DEFAULT_QUEUE_MODE}\"")),
+                    ) {
+                        tracing::error!(
+                            "Failed to persist queue mode for session {}: {error}",
+                            session_id.as_str()
+                        );
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            "⚠️ Failed to persist queue mode.".to_string(),
+                        )
+                        .await;
+                        return true;
+                    }
+                }
+
+                let active_mode = current_queue_mode(session_store, &session_id);
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    format!(
+                        "Queue mode for session `{}` is `{active_mode}`.",
+                        short_session_id(&session_id)
+                    ),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to resolve active session for queue command ({}): {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to configure queue mode.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Subagents => {
+            let specs = session_store
+                .list_subagent_specs(COMMAND_LIST_LIMIT)
+                .unwrap_or_default();
+            let sessions = session_store
+                .list_subagent_sessions(COMMAND_LIST_LIMIT)
+                .unwrap_or_default();
+            let runs = session_store
+                .list_subagent_runs(COMMAND_LIST_LIMIT)
+                .unwrap_or_default();
+
+            let mut text = String::new();
+            let _ = writeln!(text, "Subagents");
+            let _ = writeln!(text, "specs: {}", specs.len());
+            for spec in specs.iter().take(5) {
+                let _ = writeln!(text, "- {} ({})", spec.name, spec.spec_id);
+            }
+            let _ = writeln!(text, "sessions: {}", sessions.len());
+            for session in sessions.iter().take(5) {
+                let _ = writeln!(
+                    text,
+                    "- {} [{}]",
+                    session.subagent_session_id, session.status
+                );
+            }
+            let _ = writeln!(text, "runs: {}", runs.len());
+            for run in runs.iter().take(5) {
+                let _ = writeln!(
+                    text,
+                    "- {} [{}] session={}",
+                    run.run_id, run.status, run.subagent_session_id
+                );
+            }
+
+            send_command_response(target_channel, &msg.reply_target, text.trim().to_string()).await;
+        }
+        SlashCommand::Sessions => match session_store.get_or_create_active(session_key) {
+            Ok(current_session_id) => {
+                let sessions = session_store
+                    .list_sessions(Some(session_key.as_str()), COMMAND_LIST_LIMIT)
+                    .unwrap_or_default();
+                let mut text = String::new();
+                let _ = writeln!(text, "Current session: `{}`", current_session_id.as_str());
+                let _ = writeln!(text, "Sessions for key `{}`:", session_key.as_str());
+                for session in sessions.iter().take(10) {
+                    let marker = if session.session_id == current_session_id.as_str() {
+                        "*"
+                    } else {
+                        "-"
+                    };
+                    let _ = writeln!(
+                        text,
+                        "{marker} {} status={} messages={}",
+                        session.session_id, session.status, session.message_count
+                    );
+                }
+
+                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to resolve active session for sessions command ({}): {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to list sessions.".to_string(),
+                )
+                .await;
+            }
+        },
+    }
+
+    true
 }
 
 fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
@@ -311,56 +586,25 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     );
     let mut active_session: Option<SessionId> = None;
     let mut session_turn_guard: Option<SessionTurnGuard> = None;
+    let parsed_command = parse_slash_command(&msg.content);
 
     if ctx.session_enabled {
         let session_context = normalize_session_context(&msg);
         let session_key = ctx.session_resolver.resolve(&session_context);
 
-        if is_new_session_command(&msg.content) {
-            if let Some(session_store) = ctx.session_store.as_ref() {
-                match session_store.create_new(&session_key) {
-                    Ok(session_id) => {
-                        if let Err(error) = session_store
-                            .upsert_route_metadata(&session_id, &build_route_metadata(&msg))
-                        {
-                            tracing::warn!(
-                                "Failed to persist route metadata for session {}: {error}",
-                                session_id.as_str()
-                            );
-                        }
-                        let confirmation = format!(
-                            "Started a new session `{}` for this conversation.",
-                            short_session_id(&session_id)
-                        );
-                        if let Some(channel) = target_channel.as_ref() {
-                            if let Err(error) = channel
-                                .send(&SendMessage::new(confirmation, &msg.reply_target))
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to send /new confirmation on {}: {error}",
-                                    channel.name()
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            "Failed to create new session for key {}: {error}",
-                            session_key
-                        );
-                        if let Some(channel) = target_channel.as_ref() {
-                            let _ = channel
-                                .send(&SendMessage::new(
-                                    "⚠️ Failed to create a new session. Please try again.",
-                                    &msg.reply_target,
-                                ))
-                                .await;
-                        }
-                    }
-                }
+        if let Some(command) = parsed_command {
+            let handled = handle_slash_command(
+                &ctx,
+                target_channel.as_ref(),
+                &msg,
+                &session_key,
+                command,
+                &merged_system_prompt,
+            )
+            .await;
+            if handled {
+                return;
             }
-            return;
         }
 
         if let Some(session_store) = ctx.session_store.as_ref() {
@@ -385,20 +629,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
 
-        if is_compact_session_command(&msg.content) {
-            if let Some(session_id) = active_session.as_ref() {
-                run_manual_session_compaction(
-                    &ctx,
-                    target_channel.as_ref(),
-                    &msg.reply_target,
-                    session_id,
-                    &merged_system_prompt,
-                )
-                .await;
-            }
-            return;
-        }
-
         if let Some(session_id) = active_session.as_ref() {
             let session_key = session_id.as_str().to_string();
             if let Some(guard) = SessionTurnGuard::acquire(session_key.clone()) {
@@ -409,16 +639,38 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     session_id = %session_id.as_str(),
                     "Session busy; queued message in backlog"
                 );
+                let queue_mode = ctx
+                    .session_store
+                    .as_ref()
+                    .map(|store| current_queue_mode(store, session_id))
+                    .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string());
                 if let Some(channel) = target_channel.as_ref() {
                     let _ = channel
                         .send(&SendMessage::new(
-                            "⏳ Session is busy. Your message was queued and will be applied as steering context shortly.",
+                            format!(
+                                "⏳ Session is busy. Your message was queued with mode `{queue_mode}` and will be applied as steering context shortly."
+                            ),
                             &msg.reply_target,
                         ))
                         .await;
                 }
                 return;
             }
+        }
+    } else if let Some(command) = parsed_command {
+        let session_context = normalize_session_context(&msg);
+        let session_key = ctx.session_resolver.resolve(&session_context);
+        let handled = handle_slash_command(
+            &ctx,
+            target_channel.as_ref(),
+            &msg,
+            &session_key,
+            command,
+            &merged_system_prompt,
+        )
+        .await;
+        if handled {
+            return;
         }
     }
 
@@ -1827,6 +2079,222 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    fn session_test_message(content: &str, id: &str) -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: id.to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-session".to_string(),
+            content: content.to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-session".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        }
+    }
+
+    fn session_runtime_ctx(
+        session_store: Arc<SessionStore>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(1),
+            }),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store),
+            session_resolver: SessionResolver::new(),
+        })
+    }
+
+    #[test]
+    fn parse_slash_command_recognizes_supported_commands() {
+        assert_eq!(parse_slash_command("/new"), Some(SlashCommand::New));
+        assert_eq!(
+            parse_slash_command("   /compact"),
+            Some(SlashCommand::Compact)
+        );
+        assert_eq!(
+            parse_slash_command("/queue steer-backlog"),
+            Some(SlashCommand::Queue {
+                mode: Some("steer-backlog".to_string())
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/queue"),
+            Some(SlashCommand::Queue { mode: None })
+        );
+        assert_eq!(
+            parse_slash_command("/subagents"),
+            Some(SlashCommand::Subagents)
+        );
+        assert_eq!(
+            parse_slash_command("/sessions"),
+            Some(SlashCommand::Sessions)
+        );
+    }
+
+    #[test]
+    fn parse_slash_command_rejects_unsupported_or_partial_commands() {
+        assert_eq!(parse_slash_command("hello"), None);
+        assert_eq!(parse_slash_command("/new-session"), None);
+        assert_eq!(parse_slash_command("/sessionss"), None);
+        assert_eq!(parse_slash_command("/unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn command_new_creates_new_active_session_without_persisting_command_message() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = session_test_message("/new", "cmd-new");
+        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
+        let previous_session_id = session_store.get_or_create_active(&session_key).unwrap();
+
+        process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+
+        let active_after = session_store.get_or_create_active(&session_key).unwrap();
+        assert_ne!(active_after.as_str(), previous_session_id.as_str());
+        let previous_messages = session_store
+            .load_recent_messages(&previous_session_id, 10)
+            .unwrap();
+        let active_messages = session_store
+            .load_recent_messages(&active_after, 10)
+            .unwrap();
+        assert!(previous_messages.is_empty());
+        assert!(active_messages.is_empty());
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Started a new session"));
+    }
+
+    #[tokio::test]
+    async fn command_compact_returns_confirmation_without_persisting_command_message() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let msg = session_test_message("/compact", "cmd-compact");
+        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+
+        process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+
+        let messages = session_store.load_recent_messages(&session_id, 10).unwrap();
+        assert!(messages.is_empty());
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("No compaction needed"));
+    }
+
+    #[tokio::test]
+    async fn command_queue_sets_mode_and_rejects_invalid_modes() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = session_runtime_ctx(session_store.clone(), channel);
+        let base_msg = session_test_message("hello", "seed");
+        let session_key = SessionResolver::new().resolve(&normalize_session_context(&base_msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            session_test_message("/queue steer-backlog", "cmd-queue-1"),
+        )
+        .await;
+        process_channel_message(
+            runtime_ctx,
+            session_test_message("/queue fifo", "cmd-queue-2"),
+        )
+        .await;
+
+        let stored_mode = decode_session_string_state(
+            session_store
+                .get_state_key(&session_id, SESSION_QUEUE_MODE_KEY)
+                .unwrap(),
+        );
+        assert_eq!(stored_mode.as_deref(), Some("steer-backlog"));
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("`steer-backlog`"));
+        assert!(sent[1].contains("Unsupported queue mode"));
+    }
+
+    #[tokio::test]
+    async fn command_sessions_lists_current_session_id() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = session_test_message("/sessions", "cmd-sessions");
+        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+
+        process_channel_message(session_runtime_ctx(session_store, channel), msg).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains(session_id.as_str()));
+        assert!(sent[0].contains("Sessions for key"));
+    }
+
+    #[tokio::test]
+    async fn command_subagents_lists_specs_sessions_and_runs() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let spec = session_store
+            .upsert_subagent_spec("reviewer", r#"{"model":"test"}"#)
+            .unwrap();
+        let subagent_session = session_store
+            .create_subagent_session(Some(spec.spec_id.as_str()), None)
+            .unwrap();
+        let _run = session_store
+            .enqueue_subagent_run(
+                subagent_session.subagent_session_id.as_str(),
+                "check code",
+                None,
+            )
+            .unwrap();
+
+        process_channel_message(
+            session_runtime_ctx(session_store, channel),
+            session_test_message("/subagents", "cmd-subagents"),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Subagents"));
+        assert!(sent[0].contains("specs: 1"));
+        assert!(sent[0].contains("sessions: 1"));
+        assert!(sent[0].contains("runs: 1"));
     }
 
     #[tokio::test]

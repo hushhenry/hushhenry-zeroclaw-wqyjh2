@@ -788,6 +788,31 @@ impl SessionStore {
         .context("Failed to query subagent spec by name")
     }
 
+    pub fn list_subagent_specs(&self, limit: u32) -> Result<Vec<SubagentSpec>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT spec_id, name, config_json, created_at, updated_at
+                 FROM subagent_specs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_subagent_specs query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(SubagentSpec {
+                    spec_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .context("Failed to query subagent specs list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode subagent specs list")
+    }
+
     pub fn enqueue_subagent_run(
         &self,
         subagent_session_id: &str,
@@ -995,6 +1020,32 @@ impl SessionStore {
         .context("Failed to query subagent session")
     }
 
+    pub fn list_subagent_sessions(&self, limit: u32) -> Result<Vec<SubagentSession>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT subagent_session_id, spec_id, status, created_at, updated_at, meta_json
+                 FROM subagent_sessions
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_subagent_sessions query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(SubagentSession {
+                    subagent_session_id: row.get(0)?,
+                    spec_id: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    meta_json: row.get(5)?,
+                })
+            })
+            .context("Failed to query subagent sessions list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode subagent sessions list")
+    }
+
     pub fn get_subagent_spec_by_id(&self, spec_id: &str) -> Result<Option<SubagentSpec>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -1042,6 +1093,38 @@ impl SessionStore {
         )
         .optional()
         .context("Failed to query subagent run")
+    }
+
+    pub fn list_subagent_runs(&self, limit: u32) -> Result<Vec<SubagentRun>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, subagent_session_id, status, prompt, input_json, output_json, error_message,
+                        queued_at, started_at, finished_at, updated_at
+                 FROM subagent_runs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_subagent_runs query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(SubagentRun {
+                    run_id: row.get(0)?,
+                    subagent_session_id: row.get(1)?,
+                    status: row.get(2)?,
+                    prompt: row.get(3)?,
+                    input_json: row.get(4)?,
+                    output_json: row.get(5)?,
+                    error_message: row.get(6)?,
+                    queued_at: row.get(7)?,
+                    started_at: row.get(8)?,
+                    finished_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            })
+            .context("Failed to query subagent runs list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode subagent runs list")
     }
 }
 
