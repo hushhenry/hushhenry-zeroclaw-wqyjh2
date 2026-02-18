@@ -1,3 +1,15 @@
+//! Shell exec runtime: async run queue, worker, and event sink.
+//!
+//! ## Output and snippet caps
+//!
+//! - **Per-chunk cap** (`CHUNK_MAX_CHARS`): each stdout/stderr chunk is capped before processing
+//!   and before inclusion in the callback snippet to avoid huge single-chunk amplification.
+//! - **Total cap**: per-run `max_output_bytes` (from spawn request) limits total persisted output;
+//!   truncation is recorded and an `output_truncated` event may be written.
+//! - **Snippet cap** (`SNIPPET_MAX_CHARS`): poll response and callback payloads include a bounded
+//!   recent-output snippet (tail of concatenated stdout/stderr) so size stays small and stable.
+//! - **Log cap** (`MAX_LOG_LIMIT`): action=log item count per request is server-capped.
+
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::session::{backlog, ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
@@ -18,6 +30,12 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_POLL_LIMIT: u32 = 256;
+/// Server cap for action=log item count per request.
+const MAX_LOG_LIMIT: u32 = 500;
+/// Maximum character count for poll snippet and callback snippet (stable, small size).
+pub const SNIPPET_MAX_CHARS: usize = 4096;
+/// Per-chunk cap for stdout/stderr to avoid huge single-chunk amplification.
+pub const CHUNK_MAX_CHARS: usize = 65536;
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -35,6 +53,15 @@ pub struct SpawnExecRunRequest {
 #[derive(Debug, Clone)]
 pub struct PollExecRunResponse {
     pub run: ExecRun,
+    pub items: Vec<ExecRunItem>,
+    pub next_seq: i64,
+    /// Bounded recent-output snippet (same builder as runtime callbacks).
+    pub snippet: String,
+}
+
+/// Result of action=log: items after since_seq and cursor for next request.
+#[derive(Debug, Clone)]
+pub struct LogExecRunResult {
     pub items: Vec<ExecRunItem>,
     pub next_seq: i64,
 }
@@ -68,6 +95,37 @@ struct OutputChunk {
     text: String,
 }
 
+/// Sink for exec events (status change, watcher hit, output). Decouples notifications from
+/// backlog; default implementation bridges watcher hits to session backlog.
+pub trait ExecEventSink: Send + Sync {
+    /// Called when a watcher regex matches. Include bounded snippet so consumers can react without an extra poll.
+    fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, snippet: &str);
+    /// Called when run status changes (e.g. succeeded, failed). Optional override.
+    fn on_status_change(&self, _run_id: &str, _session_id: &str, _status: &str, _snippet: &str) {}
+    /// Called on each output chunk (bounded). Optional override.
+    fn on_output(
+        &self,
+        _run_id: &str,
+        _session_id: &str,
+        _stream: &str,
+        _chunk: &str,
+        _snippet: &str,
+    ) {
+    }
+}
+
+/// Default sink: bridges watcher hits to session backlog (current system behavior).
+struct BacklogSink;
+
+impl ExecEventSink for BacklogSink {
+    fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, _snippet: &str) {
+        backlog::enqueue(
+            session_id,
+            format!("Shell watcher `{event}` matched for run `{run_id}`."),
+        );
+    }
+}
+
 pub struct ShellExecRuntime {
     store: Arc<SessionStore>,
     security: Arc<SecurityPolicy>,
@@ -76,6 +134,7 @@ pub struct ShellExecRuntime {
     worker_notify: Notify,
     worker_started: AtomicBool,
     poll_interval: Duration,
+    event_sink: Arc<dyn ExecEventSink>,
 }
 
 impl ShellExecRuntime {
@@ -101,6 +160,7 @@ impl ShellExecRuntime {
             worker_notify: Notify::new(),
             worker_started: AtomicBool::new(false),
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
+            event_sink: Arc::new(BacklogSink),
         });
         runtime_instance.start_background_worker();
 
@@ -135,10 +195,39 @@ impl ShellExecRuntime {
             .store
             .load_exec_run_items_since(run_id, since_seq, DEFAULT_POLL_LIMIT)?;
         let next_seq = items.last().map_or(since_seq.unwrap_or(0), |item| item.seq);
+        let snippet = build_snippet(&items, SNIPPET_MAX_CHARS);
 
         Ok(Some(PollExecRunResponse {
             run,
             items,
+            next_seq,
+            snippet,
+        }))
+    }
+
+    /// Returns incremental exec_run_items for action=log. Optional stream filter: "stdout" or "stderr".
+    /// Returns None if run_id is not found.
+    pub async fn log_run(
+        &self,
+        run_id: &str,
+        since_seq: Option<i64>,
+        limit: u32,
+        stream_filter: Option<&str>,
+    ) -> Result<Option<LogExecRunResult>> {
+        if self.store.get_exec_run(run_id)?.is_none() {
+            return Ok(None);
+        }
+        let limit = limit.min(MAX_LOG_LIMIT);
+        let items = self
+            .store
+            .load_exec_run_items_since(run_id, since_seq, limit)?;
+        let next_seq = items.last().map_or(since_seq.unwrap_or(0), |item| item.seq);
+        let filtered: Vec<ExecRunItem> = match stream_filter {
+            Some(ty) => items.into_iter().filter(|i| i.item_type == ty).collect(),
+            None => items,
+        };
+        Ok(Some(LogExecRunResult {
+            items: filtered,
             next_seq,
         }))
     }
@@ -287,6 +376,8 @@ impl ShellExecRuntime {
         let mut truncated = false;
         let mut truncation_event_written = false;
         let mut timed_out = false;
+        let mut recent_snippet = String::new();
+        let sink = Arc::clone(&self.event_sink);
         let timeout = Duration::from_secs(run.timeout_secs.max(1) as u64);
         let timeout_sleep = time::sleep(timeout);
         tokio::pin!(timeout_sleep);
@@ -318,6 +409,8 @@ impl ShellExecRuntime {
                                 &mut output_bytes,
                                 &mut truncated,
                                 &mut truncation_event_written,
+                                &mut recent_snippet,
+                                &sink,
                             )?;
                         }
                         None => {
@@ -340,6 +433,8 @@ impl ShellExecRuntime {
                                 &mut output_bytes,
                                 &mut truncated,
                                 &mut truncation_event_written,
+                                &mut recent_snippet,
+                                &sink,
                             )?;
                         }
                         break;
@@ -390,8 +485,33 @@ impl ShellExecRuntime {
         output_bytes: &mut i64,
         truncated: &mut bool,
         truncation_event_written: &mut bool,
+        recent_snippet: &mut String,
+        sink: &Arc<dyn ExecEventSink>,
     ) -> Result<()> {
-        self.apply_watchers(run, watchers, chunk.stream, chunk.text.as_str())?;
+        let mut text = chunk.text.clone();
+        if text.len() > CHUNK_MAX_CHARS {
+            let boundary = text.floor_char_boundary(CHUNK_MAX_CHARS);
+            text.truncate(boundary);
+        }
+        if !text.is_empty() {
+            recent_snippet.push_str(&text);
+            if recent_snippet.len() > SNIPPET_MAX_CHARS {
+                let keep = recent_snippet
+                    .char_indices()
+                    .nth(recent_snippet.chars().count() - SNIPPET_MAX_CHARS)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                recent_snippet.replace_range(..keep, "");
+            }
+        }
+        self.apply_watchers(
+            run,
+            watchers,
+            chunk.stream,
+            text.as_str(),
+            recent_snippet.as_str(),
+            sink,
+        )?;
 
         if *output_bytes >= run.max_output_bytes {
             if !*truncated {
@@ -417,7 +537,6 @@ impl ShellExecRuntime {
         }
 
         let remaining = (run.max_output_bytes - *output_bytes).max(0) as usize;
-        let mut text = chunk.text.clone();
         if text.len() > remaining {
             text.truncate(text.floor_char_boundary(remaining));
             *truncated = true;
@@ -442,6 +561,8 @@ impl ShellExecRuntime {
         watchers: &mut [CompiledWatcher],
         stream: &str,
         text: &str,
+        snippet: &str,
+        sink: &Arc<dyn ExecEventSink>,
     ) -> Result<()> {
         for watcher in watchers {
             if watcher.once && watcher.fired {
@@ -466,12 +587,11 @@ impl ShellExecRuntime {
                     watcher.event.as_str(),
                     Some(meta_json.as_str()),
                 )?;
-                backlog::enqueue(
+                sink.on_watcher_hit(
+                    run.run_id.as_str(),
                     run.session_id.as_str(),
-                    format!(
-                        "Shell watcher `{}` matched for run `{}`.",
-                        watcher.event, run.run_id
-                    ),
+                    watcher.event.as_str(),
+                    snippet,
                 );
             }
         }
@@ -485,6 +605,28 @@ impl ShellExecRuntime {
             .flatten()
             .is_some_and(|run| run.status == ExecRunStatus::Canceled.as_str())
     }
+}
+
+/// Builds a bounded snippet from exec run items (stdout/stderr payloads only). Returns the tail of
+/// concatenated output up to max_chars. Used by poll response and by runtime callback payloads.
+pub fn build_snippet(items: &[ExecRunItem], max_chars: usize) -> String {
+    let mut combined = String::new();
+    for item in items {
+        if item.item_type == "stdout" || item.item_type == "stderr" {
+            combined.push_str(&item.payload);
+        }
+    }
+    let total_chars = combined.chars().count();
+    if total_chars <= max_chars {
+        return combined;
+    }
+    let skip = total_chars - max_chars;
+    let start = combined
+        .char_indices()
+        .nth(skip)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    combined[start..].to_string()
 }
 
 fn compile_watchers(watch_json: Option<&str>) -> Result<Vec<CompiledWatcher>> {
@@ -529,4 +671,56 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_snippet, SNIPPET_MAX_CHARS};
+    use crate::session::ExecRunItem;
+
+    fn item(seq: i64, item_type: &str, payload: &str) -> ExecRunItem {
+        ExecRunItem {
+            seq,
+            run_id: "run-1".to_string(),
+            item_type: item_type.to_string(),
+            payload: payload.to_string(),
+            meta_json: None,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn build_snippet_returns_bounded_tail() {
+        let mut items = Vec::new();
+        let chunk = "a".repeat(2000);
+        for i in 0..10 {
+            items.push(item(i, "stdout", &chunk));
+        }
+        let snippet = build_snippet(&items, SNIPPET_MAX_CHARS);
+        assert!(
+            snippet.chars().count() <= SNIPPET_MAX_CHARS,
+            "snippet must be at most {} chars, got {}",
+            SNIPPET_MAX_CHARS,
+            snippet.chars().count()
+        );
+        assert!(!snippet.is_empty());
+    }
+
+    #[test]
+    fn build_snippet_ignores_event_items() {
+        let items = vec![
+            item(1, "stdout", "out1"),
+            item(2, "event", "watcher_fired"),
+            item(3, "stderr", "err1"),
+        ];
+        let snippet = build_snippet(&items, 100);
+        assert_eq!(snippet, "out1err1");
+    }
+
+    #[test]
+    fn build_snippet_small_output_unchanged() {
+        let items = vec![item(1, "stdout", "hello")];
+        let snippet = build_snippet(&items, 100);
+        assert_eq!(snippet, "hello");
+    }
 }

@@ -1,4 +1,6 @@
-use super::shell_exec_runtime::{PollExecRunResponse, ShellExecRuntime, SpawnExecRunRequest};
+use super::shell_exec_runtime::{
+    LogExecRunResult, PollExecRunResponse, ShellExecRuntime, SpawnExecRunRequest,
+};
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
@@ -228,6 +230,7 @@ impl ShellTool {
             run,
             items,
             next_seq,
+            snippet,
         }) = exec_runtime.poll_run(run_id, since_seq).await?
         else {
             return Ok(ToolResult {
@@ -252,6 +255,65 @@ impl ShellTool {
                 "started_at": run.started_at,
                 "finished_at": run.finished_at,
                 "updated_at": run.updated_at,
+                "since_seq": since_seq,
+                "next_seq": next_seq,
+                "snippet": snippet,
+                "items": items.iter().map(|item| json!({
+                    "seq": item.seq,
+                    "type": item.item_type,
+                    "payload": item.payload,
+                    "meta_json": item.meta_json,
+                    "created_at": item.created_at
+                })).collect::<Vec<_>>()
+            }))?,
+            error: None,
+        })
+    }
+
+    async fn execute_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let run_id = args
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
+        let since_seq = args.get("since_seq").and_then(|v| v.as_i64());
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(256);
+        let stream = args
+            .get("stream")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if let Some(s) = stream {
+            if s != "stdout" && s != "stderr" {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("stream must be 'stdout' or 'stderr' when provided".into()),
+                });
+            }
+        }
+
+        let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
+        let Some(LogExecRunResult { items, next_seq }) = exec_runtime
+            .log_run(run_id, since_seq, limit, stream)
+            .await?
+        else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Exec run not found: {run_id}")),
+            });
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "run_id": run_id,
                 "since_seq": since_seq,
                 "next_seq": next_seq,
                 "items": items.iter().map(|item| json!({
@@ -345,7 +407,7 @@ impl Tool for ShellTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "poll", "kill", "send_keys"],
+                    "enum": ["spawn", "poll", "log", "kill", "send_keys"],
                     "description": "Optional action selector. Omit for legacy synchronous shell execution"
                 },
                 "command": {
@@ -397,11 +459,20 @@ impl Tool for ShellTool {
                 },
                 "run_id": {
                     "type": "string",
-                    "description": "Run identifier for action=poll|kill|send_keys"
+                    "description": "Run identifier for action=poll|log|kill|send_keys"
                 },
                 "since_seq": {
                     "type": "integer",
-                    "description": "Optional sequence cursor for incremental poll responses"
+                    "description": "Optional sequence cursor for incremental poll/log responses"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max items to return for action=log (server-capped)"
+                },
+                "stream": {
+                    "type": "string",
+                    "enum": ["stdout", "stderr"],
+                    "description": "Optional stream filter for action=log"
                 },
                 "keys": {
                     "type": "string",
@@ -416,6 +487,7 @@ impl Tool for ShellTool {
         match action {
             Some("spawn") => self.execute_spawn(&args).await,
             Some("poll") => self.execute_poll(&args).await,
+            Some("log") => self.execute_log(&args).await,
             Some("kill") => self.execute_kill(&args).await,
             Some("send_keys") => Ok(ToolResult {
                 success: false,
@@ -692,6 +764,100 @@ mod tests {
                 Some(val) => std::env::set_var(self.key, val),
                 None => std::env::remove_var(self.key),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_log_pagination_returns_items_and_next_seq() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
+
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo one && echo two && echo three",
+                "session_id": "session-log"
+            }))
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+        let payload: serde_json::Value = serde_json::from_str(spawn.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let _ = wait_for_terminal(&tool, run_id).await;
+
+        let log1 = tool
+            .execute(json!({
+                "action": "log",
+                "run_id": run_id,
+                "since_seq": 0,
+                "limit": 2
+            }))
+            .await
+            .unwrap();
+        assert!(log1.success, "log failed: {:?}", log1.error);
+        let out1: serde_json::Value = serde_json::from_str(log1.output.as_str()).unwrap();
+        let items1 = out1["items"].as_array().unwrap();
+        let next_seq1 = out1["next_seq"].as_i64().unwrap();
+        assert!(!items1.is_empty(), "first log page should return items");
+        assert!(next_seq1 >= 0);
+
+        let log2 = tool
+            .execute(json!({
+                "action": "log",
+                "run_id": run_id,
+                "since_seq": next_seq1,
+                "limit": 10
+            }))
+            .await
+            .unwrap();
+        assert!(log2.success);
+        let out2: serde_json::Value = serde_json::from_str(log2.output.as_str()).unwrap();
+        let items2 = out2["items"].as_array().unwrap();
+        assert!(
+            items2.is_empty() || out2["next_seq"].as_i64().unwrap() >= next_seq1,
+            "second page cursor should advance or be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_log_with_stream_filter_returns_only_that_stream() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised, tmp.path()),
+            test_runtime(),
+        );
+
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": "echo one && echo two",
+                "session_id": "session-log-stream"
+            }))
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+        let payload: serde_json::Value = serde_json::from_str(spawn.output.as_str()).unwrap();
+        let run_id = payload["run_id"].as_str().unwrap();
+
+        let _ = wait_for_terminal(&tool, run_id).await;
+
+        let log_stdout = tool
+            .execute(json!({
+                "action": "log",
+                "run_id": run_id,
+                "stream": "stdout",
+                "limit": 50
+            }))
+            .await
+            .unwrap();
+        assert!(log_stdout.success);
+        let out: serde_json::Value = serde_json::from_str(log_stdout.output.as_str()).unwrap();
+        for item in out["items"].as_array().unwrap() {
+            assert_eq!(item["type"].as_str(), Some("stdout"));
         }
     }
 
