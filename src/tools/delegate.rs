@@ -9,6 +9,7 @@ use std::time::Duration;
 
 /// Default timeout for sub-agent provider calls.
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
+const DELEGATE_DEPRECATION_NOTICE: &str = "[DEPRECATED] The `delegate` tool uses a legacy one-shot provider call path and will be replaced by subagent-run based delegation in a future release.";
 
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
@@ -57,9 +58,9 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
-         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt and returns its response."
+        "DEPRECATED: Delegate a subtask to a specialized agent via a legacy one-shot provider call. \
+         Prefer subagent-run based delegation when available. The sub-agent runs a single prompt and \
+         returns its response."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -104,7 +105,7 @@ impl Tool for DelegateTool {
         if agent_name.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                 error: Some("'agent' parameter must not be empty".into()),
             });
         }
@@ -118,7 +119,7 @@ impl Tool for DelegateTool {
         if prompt.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                 error: Some("'prompt' parameter must not be empty".into()),
             });
         }
@@ -137,7 +138,7 @@ impl Tool for DelegateTool {
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                     error: Some(format!(
                         "Unknown agent '{agent_name}'. Available agents: {}",
                         if available.is_empty() {
@@ -154,7 +155,7 @@ impl Tool for DelegateTool {
         if self.depth >= agent_config.max_depth {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                 error: Some(format!(
                     "Delegation depth limit reached ({depth}/{max}). \
                      Cannot delegate further to prevent infinite loops.",
@@ -178,7 +179,7 @@ impl Tool for DelegateTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                         error: Some(format!(
                             "Failed to create provider '{}' for agent '{agent_name}': {e}",
                             agent_config.provider
@@ -222,7 +223,7 @@ impl Tool for DelegateTool {
             Err(_elapsed) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
                     )),
@@ -240,7 +241,7 @@ impl Tool for DelegateTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
+                        "{DELEGATE_DEPRECATION_NOTICE}\n[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
                         provider = agent_config.provider,
                         model = agent_config.model
                     ),
@@ -249,7 +250,7 @@ impl Tool for DelegateTool {
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: DELEGATE_DEPRECATION_NOTICE.to_string(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
             }),
         }
@@ -307,6 +308,7 @@ mod tests {
     fn description_not_empty() {
         let tool = DelegateTool::new(sample_agents(), None);
         assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("DEPRECATED"));
     }
 
     #[test]
@@ -342,6 +344,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Unknown agent"));
+        assert!(result.output.contains("[DEPRECATED]"));
     }
 
     #[tokio::test]
@@ -409,6 +412,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("must not be empty"));
+        assert!(result.output.contains("[DEPRECATED]"));
     }
 
     #[tokio::test]

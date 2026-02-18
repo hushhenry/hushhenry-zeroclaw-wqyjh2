@@ -90,7 +90,8 @@ pub struct Config {
 
 // ── Delegate Agents ──────────────────────────────────────────────
 
-/// Configuration for a delegate sub-agent used by the `delegate` tool.
+/// Configuration for a delegate sub-agent used by the deprecated `delegate` tool.
+/// This legacy one-shot path is kept for compatibility while subagent-run migration lands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
