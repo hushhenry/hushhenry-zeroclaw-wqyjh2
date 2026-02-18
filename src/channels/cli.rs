@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -43,6 +43,10 @@ impl Channel for CliChannel {
                 reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
+                chat_type: ChatType::Direct,
+                raw_chat_type: None,
+                chat_id: "user".to_string(),
+                thread_id: None,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -106,6 +110,10 @@ mod tests {
             reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "user".into(),
+            thread_id: None,
             timestamp: 1_234_567_890,
         };
         assert_eq!(msg.id, "test-id");
@@ -124,6 +132,10 @@ mod tests {
             reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "s".into(),
+            thread_id: None,
             timestamp: 0,
         };
         let cloned = msg.clone();

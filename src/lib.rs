@@ -60,6 +60,7 @@ pub mod rag;
 pub mod runtime;
 pub mod security;
 pub mod service;
+pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod util;

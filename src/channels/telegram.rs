@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use crate::config::Config;
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -556,18 +556,38 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(|chat| chat.get("id"))
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string())?;
+        let chat_type = message
+            .get("chat")
+            .and_then(|chat| chat.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("private")
+            .to_string();
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
 
         let message_id = message
             .get("message_id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
+        let normalized_chat_type = if thread_id.is_some() {
+            ChatType::Thread
+        } else {
+            ChatType::from_raw(&chat_type)
+        };
+
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
-            reply_target: chat_id,
+            reply_target: chat_id.clone(),
             content: text.to_string(),
             channel: "telegram".to_string(),
+            chat_type: normalized_chat_type,
+            raw_chat_type: Some(chat_type),
+            chat_id,
+            thread_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

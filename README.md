@@ -378,6 +378,10 @@ keyword_weight = 0.3
 
 # backend = "none" disables persistent memory via no-op backend
 
+[session]
+enabled = false                 # enable session-first channel conversation state
+history_limit = 40              # recent session messages loaded per turn
+
 [gateway]
 require_pairing = true          # require pairing code on first connect
 allow_public_bind = false       # refuse 0.0.0.0 without tunnel

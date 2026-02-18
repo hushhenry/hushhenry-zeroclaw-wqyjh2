@@ -38,6 +38,14 @@ use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::session::{
+    compaction::{
+        build_compaction_summary_message, build_merged_system_prompt, estimate_tokens,
+        load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+    },
+    SessionContext, SessionId, SessionMessageRole, SessionResolver, SessionStore,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -71,10 +79,44 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    session_enabled: bool,
+    session_history_limit: u32,
+    session_store: Option<Arc<SessionStore>>,
+    session_resolver: SessionResolver,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+fn is_new_session_command(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("/new") {
+        return false;
+    }
+    trimmed.chars().nth(4).is_none_or(|ch| ch.is_whitespace())
+}
+
+fn is_compact_session_command(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("/compact") {
+        return false;
+    }
+    trimmed.chars().nth(8).is_none_or(|ch| ch.is_whitespace())
+}
+
+fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
+    SessionContext {
+        channel: msg.channel.clone(),
+        chat_type: msg.chat_type,
+        sender_id: msg.sender.clone(),
+        chat_id: msg.chat_id.clone(),
+        thread_id: msg.thread_id.clone(),
+    }
+}
+
+fn short_session_id(session_id: &SessionId) -> String {
+    session_id.as_str().chars().take(8).collect::<String>()
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -86,10 +128,73 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
+async fn run_manual_session_compaction(
+    ctx: &ChannelRuntimeContext,
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    session_id: &SessionId,
+    merged_system_prompt: &str,
+) {
+    let Some(session_store) = ctx.session_store.as_ref() else {
+        return;
+    };
+
+    match maybe_compact(
+        session_store.as_ref(),
+        session_id,
+        ctx.provider.as_ref(),
+        ctx.model.as_str(),
+        merged_system_prompt,
+        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(channel) = target_channel {
+                let confirmation = if result.compacted {
+                    format!(
+                        "Session compacted successfully for `{}`.",
+                        short_session_id(session_id)
+                    )
+                } else {
+                    "No compaction needed yet. Session tail is already small.".to_string()
+                };
+                if let Err(error) = channel
+                    .send(&SendMessage::new(confirmation, reply_target))
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to send /compact confirmation on {}: {error}",
+                        channel.name()
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "Manual session compaction failed for {}: {error}",
+                session_id.as_str()
+            );
+            if let Some(channel) = target_channel {
+                let _ = channel
+                    .send(&SendMessage::new(
+                        "⚠️ Failed to compact this session. Please try again.",
+                        reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+}
+
+async fn build_memory_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -165,28 +270,112 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let merged_system_prompt = build_merged_system_prompt(
+        ctx.system_prompt.as_str(),
+        channel_delivery_instructions(&msg.channel),
+    );
+    let mut active_session: Option<SessionId> = None;
 
-    if ctx.auto_save_memory {
-        let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                None,
-            )
-            .await;
+    if ctx.session_enabled {
+        let session_context = normalize_session_context(&msg);
+        let session_key = ctx.session_resolver.resolve(&session_context);
+
+        if is_new_session_command(&msg.content) {
+            if let Some(session_store) = ctx.session_store.as_ref() {
+                match session_store.create_new(&session_key) {
+                    Ok(session_id) => {
+                        let confirmation = format!(
+                            "Started a new session `{}` for this conversation.",
+                            short_session_id(&session_id)
+                        );
+                        if let Some(channel) = target_channel.as_ref() {
+                            if let Err(error) = channel
+                                .send(&SendMessage::new(confirmation, &msg.reply_target))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to send /new confirmation on {}: {error}",
+                                    channel.name()
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "Failed to create new session for key {}: {error}",
+                            session_key
+                        );
+                        if let Some(channel) = target_channel.as_ref() {
+                            let _ = channel
+                                .send(&SendMessage::new(
+                                    "⚠️ Failed to create a new session. Please try again.",
+                                    &msg.reply_target,
+                                ))
+                                .await;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(session_store) = ctx.session_store.as_ref() {
+            match session_store.get_or_create_active(&session_key) {
+                Ok(session_id) => active_session = Some(session_id),
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to get active session for key {}: {error}",
+                        session_key
+                    );
+                }
+            }
+        }
+
+        if is_compact_session_command(&msg.content) {
+            if let Some(session_id) = active_session.as_ref() {
+                run_manual_session_compaction(
+                    &ctx,
+                    target_channel.as_ref(),
+                    &msg.reply_target,
+                    session_id,
+                    &merged_system_prompt,
+                )
+                .await;
+            }
+            return;
+        }
     }
 
-    let enriched_message = if memory_context.is_empty() {
+    let enriched_message = if ctx.session_enabled {
         msg.content.clone()
     } else {
-        format!("{memory_context}{}", msg.content)
-    };
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            active_session.as_ref().map(SessionId::as_str),
+        )
+        .await;
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+        if ctx.auto_save_memory {
+            let autosave_key = conversation_memory_key(&msg);
+            let _ = ctx
+                .memory
+                .store(
+                    &autosave_key,
+                    &msg.content,
+                    crate::memory::MemoryCategory::Conversation,
+                    active_session.as_ref().map(SessionId::as_str),
+                )
+                .await;
+        }
+
+        if memory_context.is_empty() {
+            msg.content.clone()
+        } else {
+            format!("{memory_context}{}", msg.content)
+        }
+    };
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.reply_target).await {
@@ -197,13 +386,117 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![
-        ChatMessage::system(ctx.system_prompt.as_str()),
-        ChatMessage::user(&enriched_message),
-    ];
+    let mut history = vec![ChatMessage::system(merged_system_prompt.clone())];
 
-    if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
-        history.push(ChatMessage::system(instructions));
+    if ctx.session_enabled {
+        if let (Some(session_store), Some(session_id)) =
+            (ctx.session_store.as_ref(), active_session.as_ref())
+        {
+            let mut compaction_state = match load_compaction_state(session_store, session_id) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load compaction state for session {}: {error}",
+                        session_id.as_str()
+                    );
+                    Default::default()
+                }
+            };
+
+            let mut tail_messages = match session_store
+                .load_messages_after_id(session_id, compaction_state.after_message_id)
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load session tail history {}: {error}",
+                        session_id.as_str()
+                    );
+                    Vec::new()
+                }
+            };
+
+            if let Some(summary) = compaction_state.summary.as_deref() {
+                history.push(build_compaction_summary_message(summary));
+            }
+            for message in tail_messages.iter().cloned() {
+                match SessionMessageRole::from_str(message.role.as_str()) {
+                    Some(SessionMessageRole::User) => {
+                        history.push(ChatMessage::user(message.content))
+                    }
+                    Some(SessionMessageRole::Assistant) => {
+                        history.push(ChatMessage::assistant(message.content))
+                    }
+                    Some(SessionMessageRole::Tool) => {
+                        history.push(ChatMessage::tool(message.content))
+                    }
+                    None => {
+                        tracing::warn!(
+                            role = message.role.as_str(),
+                            session_id = %session_id.as_str(),
+                            "Skipping unsupported role from stored session history"
+                        );
+                    }
+                }
+            }
+
+            history.push(ChatMessage::user(&enriched_message));
+            if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
+                let keep_recent = usize::try_from(ctx.session_history_limit)
+                    .ok()
+                    .map(|limit| limit.clamp(1, SESSION_COMPACTION_KEEP_RECENT_MESSAGES))
+                    .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES);
+
+                match maybe_compact(
+                    session_store.as_ref(),
+                    session_id,
+                    ctx.provider.as_ref(),
+                    ctx.model.as_str(),
+                    &merged_system_prompt,
+                    keep_recent,
+                )
+                .await
+                {
+                    Ok(outcome) if outcome.compacted => {
+                        compaction_state.summary = outcome.summary;
+                        compaction_state.after_message_id = outcome.after_message_id;
+                        tail_messages = session_store
+                            .load_messages_after_id(session_id, compaction_state.after_message_id)
+                            .unwrap_or_default();
+                        history = vec![ChatMessage::system(merged_system_prompt)];
+                        if let Some(summary) = compaction_state.summary.as_deref() {
+                            history.push(build_compaction_summary_message(summary));
+                        }
+                        for message in tail_messages {
+                            match SessionMessageRole::from_str(message.role.as_str()) {
+                                Some(SessionMessageRole::User) => {
+                                    history.push(ChatMessage::user(message.content))
+                                }
+                                Some(SessionMessageRole::Assistant) => {
+                                    history.push(ChatMessage::assistant(message.content))
+                                }
+                                Some(SessionMessageRole::Tool) => {
+                                    history.push(ChatMessage::tool(message.content))
+                                }
+                                None => {}
+                            }
+                        }
+                        history.push(ChatMessage::user(&enriched_message));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "Auto-compaction failed for session {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
+                }
+            }
+        } else {
+            history.push(ChatMessage::user(&enriched_message));
+        }
+    } else {
+        history.push(ChatMessage::user(&enriched_message));
     }
 
     let llm_result = tokio::time::timeout(
@@ -238,10 +531,33 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(&response, &msg.reply_target))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+            }
+
+            if ctx.session_enabled {
+                if let (Some(session_store), Some(session_id)) =
+                    (ctx.session_store.as_ref(), active_session.as_ref())
+                {
+                    if let Err(error) =
+                        session_store.append_message(session_id, "user", &msg.content, None)
+                    {
+                        tracing::warn!(
+                            "Failed to persist user session message {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
+                    if let Err(error) =
+                        session_store.append_message(session_id, "assistant", &response, None)
+                    {
+                        tracing::warn!(
+                            "Failed to persist assistant session message {}: {error}",
+                            session_id.as_str()
+                        );
+                    }
                 }
             }
         }
@@ -984,6 +1300,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let session_store = if config.session.enabled {
+        Some(Arc::new(SessionStore::new(&config.workspace_dir)?))
+    } else {
+        None
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -1221,6 +1542,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        session_enabled: config.session.enabled,
+        session_history_limit: config.session.history_limit,
+        session_store,
+        session_resolver: SessionResolver::new(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1236,6 +1561,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::traits::ChatType;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
@@ -1445,6 +1771,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         process_channel_message(
@@ -1455,6 +1785,10 @@ mod tests {
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-42".to_string(),
+                thread_id: None,
                 timestamp: 1,
             },
         )
@@ -1486,6 +1820,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         process_channel_message(
@@ -1496,6 +1834,10 @@ mod tests {
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-84".to_string(),
+                thread_id: None,
                 timestamp: 2,
             },
         )
@@ -1561,6 +1903,278 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TrackingMemory {
+        recall_calls: AtomicUsize,
+        conversation_store_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for TrackingMemory {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            if matches!(category, crate::memory::MemoryCategory::Conversation) {
+                self.conversation_store_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.recall_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![crate::memory::MemoryEntry {
+                id: "id-1".to_string(),
+                key: "k".to_string(),
+                content: "memory-fact".to_string(),
+                category: crate::memory::MemoryCategory::Conversation,
+                timestamp: "1970-01-01T00:00:00Z".to_string(),
+                score: Some(0.99),
+                session_id: None,
+            }])
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct HistoryCaptureProvider {
+        captured_history: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for HistoryCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let captured = messages
+                .iter()
+                .map(|msg| (msg.role.clone(), msg.content.clone()))
+                .collect::<Vec<_>>();
+            let mut lock = self.captured_history.lock().await;
+            *lock = captured;
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_session_mode_skips_memory_context_and_conversation_autosave() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let memory = Arc::new(TrackingMemory::default());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = traits::ChannelMessage {
+            id: "msg-3".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-168".to_string(),
+            content: "current question".to_string(),
+            channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-168".to_string(),
+            thread_id: None,
+            timestamp: 3,
+        };
+
+        let session_resolver = SessionResolver::new();
+        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        session_store
+            .append_message(&session_id, "user", "past-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "past-assistant", None)
+            .unwrap();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            memory: memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: true,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store.clone()),
+            session_resolver,
+        });
+
+        process_channel_message(runtime_ctx, msg).await;
+
+        assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(memory.conversation_store_calls.load(Ordering::Relaxed), 0);
+
+        let captured_history = provider.captured_history.lock().await;
+        let final_user = captured_history
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.clone())
+            .unwrap();
+        assert_eq!(final_user, "current question");
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "user" && content == "past-user"));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == "past-assistant"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_session_mode_uses_compaction_summary_and_boundary_tail() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let memory = Arc::new(TrackingMemory::default());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let msg = traits::ChannelMessage {
+            id: "msg-4".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-200".to_string(),
+            content: "latest question".to_string(),
+            channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-200".to_string(),
+            thread_id: None,
+            timestamp: 4,
+        };
+
+        let session_resolver = SessionResolver::new();
+        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
+        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        session_store
+            .append_message(&session_id, "user", "old-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "old-assistant", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "user", "recent-user", None)
+            .unwrap();
+        session_store
+            .append_message(&session_id, "assistant", "recent-assistant", None)
+            .unwrap();
+
+        let all_messages = session_store
+            .load_messages_after_id(&session_id, None)
+            .unwrap();
+        let boundary_message_id = all_messages[1].id;
+        session_store
+            .set_state_key(
+                &session_id,
+                crate::session::compaction::SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY,
+                &serde_json::to_string(&boundary_message_id).unwrap(),
+            )
+            .unwrap();
+        session_store
+            .set_state_key(
+                &session_id,
+                crate::session::compaction::SESSION_COMPACTION_SUMMARY_KEY,
+                "\"summary-v2\"",
+            )
+            .unwrap();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            memory: memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: true,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store.clone()),
+            session_resolver,
+        });
+
+        process_channel_message(runtime_ctx, msg).await;
+
+        assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
+
+        let captured_history = provider.captured_history.lock().await;
+        assert!(captured_history.iter().any(|(role, content)| {
+            role == "assistant" && content.contains("[Session Compaction Summary]")
+        }));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == "recent-assistant"));
+        assert!(captured_history
+            .iter()
+            .any(|(role, content)| role == "user" && content == "recent-user"));
+        assert!(!captured_history
+            .iter()
+            .any(|(_, content)| content == "old-user"));
+        assert!(!captured_history
+            .iter()
+            .any(|(_, content)| content == "old-assistant"));
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -1581,6 +2195,10 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -1590,6 +2208,10 @@ mod tests {
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "alice".to_string(),
+            thread_id: None,
             timestamp: 1,
         })
         .await
@@ -1600,6 +2222,10 @@ mod tests {
             reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "bob".to_string(),
+            thread_id: None,
             timestamp: 2,
         })
         .await
@@ -1863,6 +2489,10 @@ mod tests {
             reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
 
@@ -1877,6 +2507,10 @@ mod tests {
             reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
         let msg2 = traits::ChannelMessage {
@@ -1885,6 +2519,10 @@ mod tests {
             reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".into(),
+            thread_id: None,
             timestamp: 2,
         };
 
@@ -1905,6 +2543,10 @@ mod tests {
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".into(),
+            thread_id: None,
             timestamp: 1,
         };
         let msg2 = traits::ChannelMessage {
@@ -1913,6 +2555,10 @@ mod tests {
             reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".into(),
+            thread_id: None,
             timestamp: 2,
         };
 
@@ -1947,7 +2593,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age").await;
+        let context = build_memory_context(&mem, "age", None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }

@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -453,6 +453,10 @@ impl LarkChannel {
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
+                        chat_type: ChatType::from_raw(&lark_msg.chat_type),
+                        raw_chat_type: Some(lark_msg.chat_type.clone()),
+                        chat_id: lark_msg.chat_id.clone(),
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -610,6 +614,10 @@ impl LarkChannel {
             .pointer("/message/chat_id")
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
+        let chat_type = event
+            .pointer("/message/chat_type")
+            .and_then(|c| c.as_str())
+            .unwrap_or("p2p");
 
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
@@ -617,6 +625,10 @@ impl LarkChannel {
             reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
+            chat_type: ChatType::from_raw(chat_type),
+            raw_chat_type: Some(chat_type.to_string()),
+            chat_id: chat_id.to_string(),
+            thread_id: None,
             timestamp,
         });
 

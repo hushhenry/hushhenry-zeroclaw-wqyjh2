@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -120,9 +120,13 @@ impl WhatsAppChannel {
                     messages.push(ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         reply_target: normalized_from.clone(),
-                        sender: normalized_from,
+                        sender: normalized_from.clone(),
                         content,
                         channel: "whatsapp".to_string(),
+                        chat_type: ChatType::Direct,
+                        raw_chat_type: None,
+                        chat_id: normalized_from,
+                        thread_id: None,
                         timestamp,
                     });
                 }

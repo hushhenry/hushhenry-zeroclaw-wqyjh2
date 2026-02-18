@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -233,6 +233,10 @@ impl Channel for MatrixChannel {
                         reply_target: event.sender.clone(),
                         content: body.clone(),
                         channel: "matrix".to_string(),
+                        chat_type: ChatType::Group,
+                        raw_chat_type: None,
+                        chat_id: self.room_id.clone(),
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

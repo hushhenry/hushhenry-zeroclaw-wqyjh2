@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -355,6 +355,10 @@ impl Channel for QQChannel {
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
+                                chat_type: ChatType::Direct,
+                        raw_chat_type: None,
+                                chat_id: user_openid.to_string(),
+                                thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -393,6 +397,10 @@ impl Channel for QQChannel {
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
+                                chat_type: ChatType::Group,
+                        raw_chat_type: None,
+                                chat_id: group_openid.to_string(),
+                                thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()

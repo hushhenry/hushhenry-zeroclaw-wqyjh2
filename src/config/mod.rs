@@ -7,8 +7,8 @@ pub use schema::{
     DiscordConfig, DockerRuntimeConfig, GatewayConfig, HeartbeatConfig, HttpRequestConfig,
     IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig,
     ObservabilityConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
-    SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig,
-    WebhookConfig,
+    SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SessionConfig, SlackConfig,
+    TelegramConfig, WebhookConfig,
 };
 
 #[cfg(test)]

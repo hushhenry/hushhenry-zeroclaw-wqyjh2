@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -561,14 +561,23 @@ impl Channel for IrcChannel {
                     } else {
                         format!("{IRC_STYLE_PREFIX}{text}")
                     };
+                    let chat_type = if is_channel {
+                        ChatType::Group
+                    } else {
+                        ChatType::Direct
+                    };
 
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: sender_nick.to_string(),
-                        reply_target: reply_to,
+                        reply_target: reply_to.clone(),
                         content,
                         channel: "irc".to_string(),
+                        chat_type,
+                        raw_chat_type: None,
+                        chat_id: reply_to,
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

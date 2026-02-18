@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -372,9 +372,9 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
+                    let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
                     // Guild filter
                     if let Some(ref gid) = guild_filter {
-                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
                         // DMs have no guild_id — let them through; for guild messages, enforce the filter
                         if let Some(g) = msg_guild {
                             if g != gid {
@@ -392,6 +392,16 @@ impl Channel for DiscordChannel {
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let chat_id = if channel_id.is_empty() {
+                        author_id.to_string()
+                    } else {
+                        channel_id.clone()
+                    };
+                    let chat_type = if msg_guild.is_some() {
+                        ChatType::Group
+                    } else {
+                        ChatType::Direct
+                    };
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -407,6 +417,10 @@ impl Channel for DiscordChannel {
                         },
                         content: clean_content,
                         channel: channel_id,
+                        chat_type,
+                        raw_chat_type: None,
+                        chat_id,
+                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

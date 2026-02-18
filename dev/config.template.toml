@@ -6,6 +6,10 @@ default_provider = "ollama"
 default_model = "llama3.2"
 default_temperature = 0.7
 
+[session]
+enabled = false
+history_limit = 40
+
 [gateway]
 port = 3000
 host = "[::]"
