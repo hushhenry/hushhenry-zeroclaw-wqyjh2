@@ -220,6 +220,29 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+fn maybe_bind_source_session_id(
+    tool_name: &str,
+    arguments: serde_json::Value,
+    source_session_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(source_session_id) = source_session_id else {
+        return arguments;
+    };
+
+    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule") {
+        return arguments;
+    }
+
+    match arguments {
+        serde_json::Value::Object(mut obj) => {
+            obj.entry("source_session_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(source_session_id.to_string()));
+            serde_json::Value::Object(obj)
+        }
+        _ => arguments,
+    }
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
@@ -654,8 +677,10 @@ pub(crate) async fn run_tool_call_loop(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
+            let tool_args =
+                maybe_bind_source_session_id(&call.name, call.arguments.clone(), backlog_key);
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                match tool.execute(tool_args).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),

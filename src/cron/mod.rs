@@ -13,8 +13,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_agent_job_with_source, add_job, add_shell_job, add_shell_job_with_source,
+    due_jobs, get_job, list_jobs, list_runs, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
@@ -111,9 +112,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 }
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_with_source(config, delay, command, None)
+}
+
+pub fn add_once_with_source(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    source_session_id: Option<String>,
+) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at(config, at, command)
+    add_once_at_with_source(config, at, command, source_session_id)
 }
 
 pub fn add_once_at(
@@ -121,8 +131,17 @@ pub fn add_once_at(
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
+    add_once_at_with_source(config, at, command, None)
+}
+
+pub fn add_once_at_with_source(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    source_session_id: Option<String>,
+) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job_with_source(config, None, schedule, command, source_session_id)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

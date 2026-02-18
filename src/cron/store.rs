@@ -13,7 +13,7 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job_with_source(config, None, schedule, command, None)
 }
 
 pub fn add_shell_job(
@@ -21,6 +21,16 @@ pub fn add_shell_job(
     name: Option<String>,
     schedule: Schedule,
     command: &str,
+) -> Result<CronJob> {
+    add_shell_job_with_source(config, name, schedule, command, None)
+}
+
+pub fn add_shell_job_with_source(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    source_session_id: Option<String>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -33,8 +43,8 @@ pub fn add_shell_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8)",
+                enabled, delivery, source_session_id, delete_after_run, created_at, next_run
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, 0, ?8, ?9)",
             params![
                 id,
                 expression,
@@ -42,6 +52,7 @@ pub fn add_shell_job(
                 schedule_json,
                 name,
                 serde_json::to_string(&DeliveryConfig::default())?,
+                source_session_id,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
             ],
@@ -64,6 +75,31 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
 ) -> Result<CronJob> {
+    add_agent_job_with_source(
+        config,
+        name,
+        schedule,
+        prompt,
+        session_target,
+        model,
+        delivery,
+        delete_after_run,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_agent_job_with_source(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    prompt: &str,
+    session_target: SessionTarget,
+    model: Option<String>,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    source_session_id: Option<String>,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -76,8 +112,8 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11)",
+                enabled, delivery, source_session_id, delete_after_run, created_at, next_run
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 expression,
@@ -87,6 +123,7 @@ pub fn add_agent_job(
                 session_target.as_str(),
                 model,
                 serde_json::to_string(&delivery)?,
+                source_session_id,
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
@@ -103,7 +140,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, source_session_id, delete_after_run, created_at, next_run, last_run, last_status, last_output
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -121,7 +158,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, source_session_id, delete_after_run, created_at, next_run, last_run, last_status, last_output
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -152,7 +189,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, source_session_id, delete_after_run, created_at, next_run, last_run, last_status, last_output
              FROM cron_jobs WHERE enabled = 1 AND next_run <= ?1 ORDER BY next_run ASC",
         )?;
 
@@ -191,6 +228,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     if let Some(delivery) = patch.delivery {
         job.delivery = delivery;
     }
+    if let Some(source_session_id) = patch.source_session_id {
+        job.source_session_id = Some(source_session_id);
+    }
     if let Some(model) = patch.model {
         job.model = Some(model);
     }
@@ -209,9 +249,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         conn.execute(
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 next_run = ?12
-             WHERE id = ?13",
+                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, source_session_id = ?11,
+                 delete_after_run = ?12, next_run = ?13
+             WHERE id = ?14",
             params![
                 job.expression,
                 job.command,
@@ -223,6 +263,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 job.model,
                 if job.enabled { 1 } else { 0 },
                 serde_json::to_string(&job.delivery)?,
+                job.source_session_id,
                 if job.delete_after_run { 1 } else { 0 },
                 job.next_run.to_rfc3339(),
                 job.id,
@@ -376,9 +417,9 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let delivery_raw: Option<String> = row.get(10)?;
     let delivery = decode_delivery(delivery_raw.as_deref()).map_err(sql_conversion_error)?;
 
-    let next_run_raw: String = row.get(13)?;
-    let last_run_raw: Option<String> = row.get(14)?;
-    let created_at_raw: String = row.get(12)?;
+    let next_run_raw: String = row.get(14)?;
+    let last_run_raw: Option<String> = row.get(15)?;
+    let created_at_raw: String = row.get(13)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -392,15 +433,16 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         model: row.get(8)?,
         enabled: row.get::<_, i64>(9)? != 0,
         delivery,
-        delete_after_run: row.get::<_, i64>(11)? != 0,
+        source_session_id: row.get(11)?,
+        delete_after_run: row.get::<_, i64>(12)? != 0,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
             Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_conversion_error)?),
             None => None,
         },
-        last_status: row.get(15)?,
-        last_output: row.get(16)?,
+        last_status: row.get(16)?,
+        last_output: row.get(17)?,
     })
 }
 
@@ -476,6 +518,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             model            TEXT,
             enabled          INTEGER NOT NULL DEFAULT 1,
             delivery         TEXT,
+            source_session_id TEXT,
             delete_after_run INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL,
             next_run         TEXT NOT NULL,
@@ -508,6 +551,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "model", "TEXT")?;
     add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(&conn, "delivery", "TEXT")?;
+    add_column_if_missing(&conn, "source_session_id", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
 
     f(&conn)
@@ -664,5 +708,42 @@ mod tests {
         remove_job(&config, &job.id).unwrap();
         let runs = list_runs(&config, &job.id, 10).unwrap();
         assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn add_job_with_source_session_id_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job_with_source(
+            &config,
+            Some("bound".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            Some("session-123".into()),
+        )
+        .unwrap();
+
+        let fetched = get_job(&config, &job.id).unwrap();
+        assert_eq!(fetched.source_session_id.as_deref(), Some("session-123"));
+    }
+
+    #[test]
+    fn migration_adds_source_session_id_column() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        with_connection(&config, |conn| {
+            let has_column: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cron_jobs') WHERE name = 'source_session_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(has_column, 1);
+            Ok(())
+        })
+        .unwrap();
     }
 }

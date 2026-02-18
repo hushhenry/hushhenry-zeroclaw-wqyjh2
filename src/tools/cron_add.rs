@@ -42,7 +42,8 @@ impl Tool for CronAddTool {
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
                 "delivery": { "type": "object" },
-                "delete_after_run": { "type": "boolean" }
+                "delete_after_run": { "type": "boolean" },
+                "source_session_id": { "type": "string" }
             },
             "required": ["schedule"]
         })
@@ -106,6 +107,10 @@ impl Tool for CronAddTool {
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
+        let source_session_id = args
+            .get("source_session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
 
         let result = match job_type {
             JobType::Shell => {
@@ -128,7 +133,13 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job_with_source(
+                    &self.config,
+                    name,
+                    schedule,
+                    command,
+                    source_session_id,
+                )
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -175,7 +186,7 @@ impl Tool for CronAddTool {
                     None => None,
                 };
 
-                cron::add_agent_job(
+                cron::add_agent_job_with_source(
                     &self.config,
                     name,
                     schedule,
@@ -184,6 +195,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    source_session_id,
                 )
             }
         };

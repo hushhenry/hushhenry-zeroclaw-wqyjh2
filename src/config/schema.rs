@@ -1090,10 +1090,22 @@ pub struct CronConfig {
     pub enabled: bool,
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    #[serde(default = "default_cron_execution_timeout_secs")]
+    pub execution_timeout_secs: u64,
+    #[serde(default = "default_cron_delivery_timeout_secs")]
+    pub delivery_timeout_secs: u64,
 }
 
 fn default_max_run_history() -> u32 {
     50
+}
+
+fn default_cron_execution_timeout_secs() -> u64 {
+    120
+}
+
+fn default_cron_delivery_timeout_secs() -> u64 {
+    20
 }
 
 impl Default for CronConfig {
@@ -1101,6 +1113,8 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+            execution_timeout_secs: default_cron_execution_timeout_secs(),
+            delivery_timeout_secs: default_cron_delivery_timeout_secs(),
         }
     }
 }
@@ -2061,6 +2075,8 @@ mod tests {
         let c = CronConfig::default();
         assert!(c.enabled);
         assert_eq!(c.max_run_history, 50);
+        assert_eq!(c.execution_timeout_secs, 120);
+        assert_eq!(c.delivery_timeout_secs, 20);
     }
 
     #[test]
@@ -2068,11 +2084,15 @@ mod tests {
         let c = CronConfig {
             enabled: false,
             max_run_history: 100,
+            execution_timeout_secs: 60,
+            delivery_timeout_secs: 10,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
+        assert_eq!(parsed.execution_timeout_secs, 60);
+        assert_eq!(parsed.delivery_timeout_secs, 10);
     }
 
     #[test]
@@ -2086,6 +2106,8 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(parsed.cron.enabled);
         assert_eq!(parsed.cron.max_run_history, 50);
+        assert_eq!(parsed.cron.execution_timeout_secs, 120);
+        assert_eq!(parsed.cron.delivery_timeout_secs, 20);
     }
 
     #[test]

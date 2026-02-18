@@ -58,7 +58,11 @@ impl Tool for ScheduleTool {
                 "id": {
                     "type": "string",
                     "description": "Task ID. Required for get/cancel/remove/pause/resume."
-                }
+                },
+                "source_session_id": {
+                    "type": "string",
+                    "description": "Optional source session binding for compat delivery routing."
+                },
             },
             "required": ["action"]
         })
@@ -229,6 +233,10 @@ impl ScheduleTool {
         let expression = args.get("expression").and_then(|value| value.as_str());
         let delay = args.get("delay").and_then(|value| value.as_str());
         let run_at = args.get("run_at").and_then(|value| value.as_str());
+        let source_session_id = args
+            .get("source_session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
         match action {
             "add" => {
@@ -275,7 +283,16 @@ impl ScheduleTool {
         }
 
         if let Some(value) = expression {
-            let job = cron::add_job(&self.config, value, command)?;
+            let job = cron::add_shell_job_with_source(
+                &self.config,
+                None,
+                crate::cron::Schedule::Cron {
+                    expr: value.to_string(),
+                    tz: None,
+                },
+                command,
+                source_session_id.clone(),
+            )?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -290,7 +307,12 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = cron::add_once(&self.config, value, command)?;
+            let job = cron::add_once_with_source(
+                &self.config,
+                value,
+                command,
+                source_session_id.clone(),
+            )?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -308,7 +330,8 @@ impl ScheduleTool {
             .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
             .with_timezone(&Utc);
 
-        let job = cron::add_once_at(&self.config, run_at_parsed, command)?;
+        let job =
+            cron::add_once_at_with_source(&self.config, run_at_parsed, command, source_session_id)?;
         Ok(ToolResult {
             success: true,
             output: format!(

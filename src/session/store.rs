@@ -477,6 +477,33 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn load_route_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRouteMetadata>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title
+             FROM session_meta
+             WHERE session_id = ?1",
+            params![session_id.as_str()],
+            |row| {
+                Ok(SessionRouteMetadata {
+                    agent_id: row.get(0)?,
+                    channel: row.get(1)?,
+                    account_id: row.get(2)?,
+                    chat_type: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    route_id: row.get(5)?,
+                    sender_id: row.get(6)?,
+                    title: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query session route metadata")
+    }
+
     pub fn append_message(
         &self,
         session_id: &SessionId,
@@ -1470,5 +1497,34 @@ mod tests {
         assert_eq!(candidates[0].chat_type, "group");
         assert!(!candidates[0].last_seen.is_empty());
         assert_eq!(candidates[1].chat_id, "chat-alpha");
+    }
+
+    #[test]
+    fn session_store_loads_route_metadata_by_session_id() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let session = store
+            .get_or_create_active(&SessionKey::new("group:slack:team-1"))
+            .unwrap();
+        store
+            .upsert_route_metadata(
+                &session,
+                &SessionRouteMetadata {
+                    agent_id: Some("zeroclaw-bot".into()),
+                    channel: "slack".into(),
+                    account_id: Some("acc-1".into()),
+                    chat_type: "group".into(),
+                    chat_id: "chat-1".into(),
+                    route_id: Some("thread-1".into()),
+                    sender_id: "user-1".into(),
+                    title: Some("Ops".into()),
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load_route_metadata(&session).unwrap().unwrap();
+        assert_eq!(loaded.channel, "slack");
+        assert_eq!(loaded.route_id.as_deref(), Some("thread-1"));
+        assert_eq!(loaded.chat_id, "chat-1");
     }
 }
