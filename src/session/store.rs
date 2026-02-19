@@ -102,7 +102,12 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 4;
+const SESSION_SCHEMA_VERSION: i64 = 5;
+
+/// Session state key for the active AgentSpec id (or name) driving this session's turns.
+pub const SESSION_STATE_ACTIVE_AGENT_ID: &str = "active_agent_id";
+/// Session state key for model override: "provider/model" (e.g. "openai/gpt-4o").
+pub const SESSION_STATE_MODEL_OVERRIDE: &str = "model_override";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubagentRunStatus {
@@ -184,6 +189,16 @@ pub struct SubagentSession {
 #[derive(Debug, Clone)]
 pub struct SubagentSpec {
     pub spec_id: String,
+    pub name: String,
+    pub config_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// AgentSpec registry row (multi-agent session switching).
+#[derive(Debug, Clone)]
+pub struct AgentSpec {
+    pub agent_id: String,
     pub name: String,
     pub config_json: String,
     pub created_at: String,
@@ -440,6 +455,23 @@ impl SessionStore {
             conn.pragma_update(None, "user_version", 4_i64)
                 .context("Failed to set sessions schema version to 4")?;
             version = 4;
+        }
+
+        if version < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_specs (
+                    agent_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_agent_specs_name ON agent_specs(name);",
+            )
+            .context("Failed to apply sessions schema migration v5 (agent_specs)")?;
+            conn.pragma_update(None, "user_version", 5_i64)
+                .context("Failed to set sessions schema version to 5")?;
+            version = 5;
         }
 
         if version != SESSION_SCHEMA_VERSION {
@@ -799,6 +831,161 @@ impl SessionStore {
 
     pub fn set_state(&self, session_id: &SessionId, key: &str, value_json: &str) -> Result<()> {
         self.set_state_key(session_id, key, value_json)
+    }
+
+    /// Returns the session's active agent id (id or name) if set.
+    pub fn get_active_agent_id(&self, session_id: &SessionId) -> Result<Option<String>> {
+        let raw = self.get_state_key(session_id, SESSION_STATE_ACTIVE_AGENT_ID)?;
+        Ok(Self::decode_state_string(raw))
+    }
+
+    /// Sets the session's active agent id (id or name). Pass empty string to clear.
+    pub fn set_active_agent_id(&self, session_id: &SessionId, id_or_name: &str) -> Result<()> {
+        let value_json =
+            serde_json::to_string(id_or_name).unwrap_or_else(|_| format!("\"{}\"", id_or_name));
+        self.set_state_key(session_id, SESSION_STATE_ACTIVE_AGENT_ID, &value_json)
+    }
+
+    /// Returns the session's model override ("provider/model") if set.
+    pub fn get_model_override(&self, session_id: &SessionId) -> Result<Option<String>> {
+        let raw = self.get_state_key(session_id, SESSION_STATE_MODEL_OVERRIDE)?;
+        Ok(Self::decode_state_string(raw))
+    }
+
+    /// Sets the session's model override ("provider/model"). Pass empty string to clear.
+    pub fn set_model_override(&self, session_id: &SessionId, provider_model: &str) -> Result<()> {
+        let value_json = serde_json::to_string(provider_model)
+            .unwrap_or_else(|_| format!("\"{}\"", provider_model));
+        self.set_state_key(session_id, SESSION_STATE_MODEL_OVERRIDE, &value_json)
+    }
+
+    fn decode_state_string(value_json: Option<String>) -> Option<String> {
+        value_json.and_then(|raw| {
+            serde_json::from_str::<String>(&raw).ok().or_else(|| {
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        })
+    }
+
+    pub fn list_agent_specs(&self, limit: u32) -> Result<Vec<AgentSpec>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, name, config_json, created_at, updated_at
+                 FROM agent_specs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_agent_specs query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .context("Failed to query agent_specs list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode agent_specs list")
+    }
+
+    pub fn get_agent_spec(&self, agent_id: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE agent_id = ?1",
+            params![agent_id],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent_spec by id")
+    }
+
+    pub fn get_agent_spec_by_name(&self, name: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent_spec by name")
+    }
+
+    /// Resolve AgentSpec by id or name (exact match). Returns None if not found.
+    pub fn resolve_agent_spec(&self, id_or_name: &str) -> Result<Option<AgentSpec>> {
+        if let Some(spec) = self.get_agent_spec(id_or_name)? {
+            return Ok(Some(spec));
+        }
+        self.get_agent_spec_by_name(id_or_name)
+    }
+
+    pub fn upsert_agent_spec(&self, name: &str, config_json: &str) -> Result<AgentSpec> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO agent_specs (agent_id, name, config_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at",
+            params![agent_id, name, config_json, now],
+        )
+        .context("Failed to upsert agent_spec")?;
+
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to load upserted agent_spec")?
+        .ok_or_else(|| anyhow::anyhow!("Upserted agent_spec missing for name '{name}'"))
+    }
+
+    pub fn delete_agent_spec(&self, agent_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "DELETE FROM agent_specs WHERE agent_id = ?1",
+                params![agent_id],
+            )
+            .context("Failed to delete agent_spec")?;
+        Ok(changed > 0)
     }
 
     pub fn find_chat_candidates_by_title(
@@ -1798,6 +1985,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exec_runs_exists, 1);
+
+        let agent_specs_exists: i64 = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_specs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_specs_exists, 1);
+    }
+
+    #[test]
+    fn agent_specs_crud_list_get_upsert_delete() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let spec = store
+            .upsert_agent_spec(
+                "coder",
+                r#"{"defaults":{"provider":"openai","model":"gpt-4o"}}"#,
+            )
+            .unwrap();
+        assert_eq!(spec.name, "coder");
+        assert!(spec.agent_id.len() > 0);
+
+        let list = store.list_agent_specs(10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "coder");
+
+        let by_id = store
+            .get_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id.agent_id, spec.agent_id);
+        let by_name = store.get_agent_spec_by_name("coder").unwrap().unwrap();
+        assert_eq!(by_name.agent_id, spec.agent_id);
+
+        let resolved = store
+            .resolve_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.agent_id, spec.agent_id);
+        let resolved_name = store.resolve_agent_spec("coder").unwrap().unwrap();
+        assert_eq!(resolved_name.name, "coder");
+
+        let session_key = SessionKey::new("group:telegram:chat-agent");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+        store
+            .set_active_agent_id(&session_id, spec.agent_id.as_str())
+            .unwrap();
+        assert_eq!(
+            store.get_active_agent_id(&session_id).unwrap().as_deref(),
+            Some(spec.agent_id.as_str())
+        );
+        store
+            .set_model_override(&session_id, "openai/gpt-4o")
+            .unwrap();
+        assert_eq!(
+            store.get_model_override(&session_id).unwrap().as_deref(),
+            Some("openai/gpt-4o")
+        );
+
+        let deleted = store.delete_agent_spec(spec.agent_id.as_str()).unwrap();
+        assert!(deleted);
+        assert!(store
+            .get_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::session::{
         load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
         SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
-    SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
+    AgentSpec, SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
 };
 use crate::tools::{self, Tool};
@@ -87,6 +87,8 @@ struct ChannelRuntimeContext {
     session_history_limit: u32,
     session_store: Option<Arc<SessionStore>>,
     session_resolver: SessionResolver,
+    /// When present, used to resolve per-session provider/model overrides (AgentSpec + model_override).
+    config: Option<Arc<Config>>,
 }
 
 struct SessionTurnGuard {
@@ -120,6 +122,10 @@ enum SlashCommand {
     Queue { mode: Option<String> },
     Subagents,
     Sessions,
+    Agents,
+    Agent { id_or_name: Option<String> },
+    Models,
+    Model { provider_model: Option<String> },
 }
 
 fn parse_slash_command(content: &str) -> Option<SlashCommand> {
@@ -139,6 +145,14 @@ fn parse_slash_command(content: &str) -> Option<SlashCommand> {
         }),
         "/subagents" => Some(SlashCommand::Subagents),
         "/sessions" => Some(SlashCommand::Sessions),
+        "/agents" => Some(SlashCommand::Agents),
+        "/agent" => Some(SlashCommand::Agent {
+            id_or_name: parts.next().map(str::to_string),
+        }),
+        "/models" => Some(SlashCommand::Models),
+        "/model" => Some(SlashCommand::Model {
+            provider_model: parts.next().map(str::to_string),
+        }),
         _ => None,
     }
 }
@@ -160,6 +174,109 @@ fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> S
             .flatten(),
     )
     .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string())
+}
+
+/// Effective provider name, model name, and system prompt for a session turn.
+/// When no overrides apply, returns the context defaults.
+struct ResolvedSessionTurn {
+    provider: Arc<dyn Provider>,
+    provider_name: String,
+    model: String,
+    system_prompt: String,
+}
+
+fn resolve_session_turn(
+    ctx: &ChannelRuntimeContext,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    channel_name: &str,
+    merged_system_prompt: &str,
+) -> Result<ResolvedSessionTurn> {
+    let default_provider = ctx
+        .config
+        .as_ref()
+        .and_then(|c| c.default_provider.clone())
+        .unwrap_or_else(|| "openrouter".to_string());
+    let default_model = ctx
+        .config
+        .as_ref()
+        .and_then(|c| c.default_model.clone())
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".to_string());
+
+    let active_agent_id = session_store.get_active_agent_id(session_id).ok().flatten();
+    let model_override = session_store.get_model_override(session_id).ok().flatten();
+
+    let (spec_provider, spec_model, spec_system_prompt) =
+        if let Some(ref id_or_name) = active_agent_id {
+            match session_store.resolve_agent_spec(id_or_name) {
+                Ok(Some(spec)) => parse_agent_spec_config(&spec.config_json),
+                _ => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+
+    let effective_provider_name = spec_provider
+        .as_deref()
+        .unwrap_or(default_provider.as_str());
+    let effective_model = model_override
+        .as_deref()
+        .or(spec_model.as_deref())
+        .unwrap_or(default_model.as_str())
+        .to_string();
+    let effective_system_prompt = spec_system_prompt
+        .as_deref()
+        .map(|s| build_merged_system_prompt(s, channel_delivery_instructions(channel_name)))
+        .unwrap_or_else(|| merged_system_prompt.to_string());
+
+    let (provider, provider_name) = if ctx.config.is_some()
+        && (effective_provider_name != default_provider.as_str()
+            || effective_model != default_model.as_str())
+    {
+        let config = ctx.config.as_ref().unwrap();
+        match providers::create_routed_provider(
+            effective_provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &effective_model,
+        ) {
+            Ok(p) => (Arc::from(p), effective_provider_name.to_string()),
+            Err(e) => {
+                tracing::warn!("Session override provider creation failed, using default: {e}");
+                (Arc::clone(&ctx.provider), default_provider)
+            }
+        }
+    } else {
+        (Arc::clone(&ctx.provider), default_provider)
+    };
+
+    Ok(ResolvedSessionTurn {
+        provider,
+        provider_name,
+        model: effective_model,
+        system_prompt: effective_system_prompt,
+    })
+}
+
+fn parse_agent_spec_config(config_json: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let value: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(v) => v,
+        Err(_) => return (None, None, None),
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return (None, None, None),
+    };
+    let from_defaults = obj.get("defaults").and_then(|d| d.as_object());
+    let get = |key: &str| -> Option<String> {
+        from_defaults
+            .and_then(|d| d.get(key))
+            .or_else(|| obj.get(key))
+            .and_then(|v| v.as_str().map(String::from))
+    };
+    (get("provider"), get("model"), get("system_prompt"))
 }
 
 async fn send_command_response(
@@ -396,6 +513,212 @@ async fn handle_slash_command(
                 .await;
             }
         },
+        SlashCommand::Agents => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                let specs = session_store
+                    .list_agent_specs(COMMAND_LIST_LIMIT)
+                    .unwrap_or_default();
+                let active = session_store
+                    .get_active_agent_id(&session_id)
+                    .ok()
+                    .flatten();
+                let mut text = String::new();
+                let _ = writeln!(
+                    text,
+                    "Agent specs (session active: {})",
+                    match &active {
+                        Some(a) => a.as_str(),
+                        None => "(none)",
+                    }
+                );
+                for spec in specs.iter().take(10) {
+                    let mark = active.as_deref() == Some(spec.agent_id.as_str())
+                        || active.as_deref() == Some(spec.name.as_str());
+                    let _ = writeln!(
+                        text,
+                        "  {} {} ({})",
+                        if mark { "*" } else { "-" },
+                        spec.name,
+                        spec.agent_id
+                    );
+                }
+                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
+                    .await;
+            }
+            Err(_) => {
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to resolve session for /agents.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Agent { id_or_name } => {
+            match session_store.get_or_create_active(session_key) {
+                Ok(session_id) => {
+                    let id_or_name = match id_or_name {
+                        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                        _ => {
+                            send_command_response(
+                                target_channel,
+                                &msg.reply_target,
+                                "Usage: /agent <id|name> (exact match).".to_string(),
+                            )
+                            .await;
+                            return true;
+                        }
+                    };
+                    if id_or_name.eq_ignore_ascii_case("none") || id_or_name == "-" {
+                        if let Err(e) = session_store.set_active_agent_id(&session_id, "") {
+                            tracing::warn!("Failed to clear active_agent_id: {e}");
+                        }
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            format!(
+                                "Cleared active agent for session `{}`.",
+                                short_session_id(&session_id)
+                            ),
+                        )
+                        .await;
+                        return true;
+                    }
+                    match session_store.resolve_agent_spec(&id_or_name) {
+                        Ok(Some(spec)) => {
+                            if let Err(e) = session_store
+                                .set_active_agent_id(&session_id, spec.agent_id.as_str())
+                            {
+                                tracing::warn!("Failed to set active_agent_id: {e}");
+                                send_command_response(
+                                    target_channel,
+                                    &msg.reply_target,
+                                    "⚠️ Failed to persist active agent.".to_string(),
+                                )
+                                .await;
+                                return true;
+                            }
+                            send_command_response(
+                                target_channel,
+                                &msg.reply_target,
+                                format!(
+                                    "Active agent for session `{}` set to **{}** ({}).",
+                                    short_session_id(&session_id),
+                                    spec.name,
+                                    spec.agent_id
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(None) => {
+                            send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            format!("No agent spec found for id or name `{id_or_name}` (exact match)."),
+                        )
+                        .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("resolve_agent_spec error: {e}");
+                            send_command_response(
+                                target_channel,
+                                &msg.reply_target,
+                                "⚠️ Failed to resolve agent spec.".to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(_) => {
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        "⚠️ Failed to resolve session for /agent.".to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
+        SlashCommand::Models => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                let override_model = session_store.get_model_override(&session_id).ok().flatten();
+                let mut text = String::new();
+                let _ = writeln!(
+                    text,
+                    "Session model override: {}",
+                    override_model
+                        .as_deref()
+                        .unwrap_or("(none — using default or agent spec)")
+                );
+                let _ = writeln!(text, "Set override: /model <provider>/<model> (e.g. openai/gpt-4o). Clear: /model none");
+                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
+                    .await;
+            }
+            Err(_) => {
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to resolve session for /models.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Model { provider_model } => {
+            match session_store.get_or_create_active(session_key) {
+                Ok(session_id) => {
+                    let provider_model = match provider_model {
+                        Some(s) => s.trim().to_string(),
+                        None => String::new(),
+                    };
+                    if provider_model.is_empty()
+                        || provider_model.eq_ignore_ascii_case("none")
+                        || provider_model == "-"
+                    {
+                        if let Err(e) = session_store.set_model_override(&session_id, "") {
+                            tracing::warn!("Failed to clear model_override: {e}");
+                        }
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            format!(
+                                "Cleared model override for session `{}`.",
+                                short_session_id(&session_id)
+                            ),
+                        )
+                        .await;
+                        return true;
+                    }
+                    if let Err(e) = session_store.set_model_override(&session_id, &provider_model) {
+                        tracing::warn!("Failed to set model_override: {e}");
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            "⚠️ Failed to persist model override.".to_string(),
+                        )
+                        .await;
+                        return true;
+                    }
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        format!(
+                            "Model override for session `{}` set to `{}`.",
+                            short_session_id(&session_id),
+                            provider_model
+                        ),
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        "⚠️ Failed to resolve session for /model.".to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     true
@@ -713,7 +1036,43 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![ChatMessage::system(merged_system_prompt.clone())];
+    let (turn_provider, turn_model, turn_system_prompt) = if ctx.session_enabled {
+        if let (Some(session_store), Some(session_id)) =
+            (ctx.session_store.as_ref(), active_session.as_ref())
+        {
+            match resolve_session_turn(
+                &ctx,
+                session_store,
+                session_id,
+                msg.channel.as_str(),
+                &merged_system_prompt,
+            ) {
+                Ok(resolved) => (resolved.provider, resolved.model, resolved.system_prompt),
+                Err(e) => {
+                    tracing::warn!("Session turn resolution failed, using defaults: {e}");
+                    (
+                        Arc::clone(&ctx.provider),
+                        ctx.model.to_string(),
+                        merged_system_prompt.clone(),
+                    )
+                }
+            }
+        } else {
+            (
+                Arc::clone(&ctx.provider),
+                ctx.model.to_string(),
+                merged_system_prompt.clone(),
+            )
+        }
+    } else {
+        (
+            Arc::clone(&ctx.provider),
+            ctx.model.to_string(),
+            merged_system_prompt.clone(),
+        )
+    };
+
+    let mut history = vec![ChatMessage::system(turn_system_prompt.clone())];
 
     if ctx.session_enabled {
         if let (Some(session_store), Some(session_id)) =
@@ -777,9 +1136,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 match maybe_compact(
                     session_store.as_ref(),
                     session_id,
-                    ctx.provider.as_ref(),
-                    ctx.model.as_str(),
-                    &merged_system_prompt,
+                    turn_provider.as_ref(),
+                    turn_model.as_str(),
+                    &turn_system_prompt,
                     keep_recent,
                 )
                 .await
@@ -790,7 +1149,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         tail_messages = session_store
                             .load_messages_after_id(session_id, compaction_state.after_message_id)
                             .unwrap_or_default();
-                        history = vec![ChatMessage::system(merged_system_prompt)];
+                        history = vec![ChatMessage::system(turn_system_prompt.clone())];
                         if let Some(summary) = compaction_state.summary.as_deref() {
                             history.push(build_compaction_summary_message(summary));
                         }
@@ -829,12 +1188,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
         run_tool_call_loop(
-            ctx.provider.as_ref(),
+            turn_provider.as_ref(),
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
             "channel-runtime",
-            ctx.model.as_str(),
+            turn_model.as_str(),
             ctx.temperature,
             true, // silent — channels don't write to stdout
             None,
@@ -1876,6 +2235,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         session_history_limit: config.session.history_limit,
         session_store,
         session_resolver: SessionResolver::new(),
+        config: Some(Arc::new(config.clone())),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2122,6 +2482,7 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
+            config: None,
         })
     }
 
@@ -2149,6 +2510,20 @@ mod tests {
         assert_eq!(
             parse_slash_command("/sessions"),
             Some(SlashCommand::Sessions)
+        );
+        assert_eq!(parse_slash_command("/agents"), Some(SlashCommand::Agents));
+        assert_eq!(
+            parse_slash_command("/agent coder"),
+            Some(SlashCommand::Agent {
+                id_or_name: Some("coder".to_string())
+            })
+        );
+        assert_eq!(parse_slash_command("/models"), Some(SlashCommand::Models));
+        assert_eq!(
+            parse_slash_command("/model openai/gpt-4o"),
+            Some(SlashCommand::Model {
+                provider_model: Some("openai/gpt-4o".to_string())
+            })
         );
     }
 
@@ -2319,6 +2694,7 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: None,
         });
 
         process_channel_message(
@@ -2371,6 +2747,7 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: None,
         });
 
         process_channel_message(
@@ -2601,6 +2978,7 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
+            config: None,
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -2701,6 +3079,7 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
+            config: None,
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -2750,6 +3129,7 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver: SessionResolver::new(),
+            config: None,
         });
 
         process_channel_message(
@@ -2806,6 +3186,7 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

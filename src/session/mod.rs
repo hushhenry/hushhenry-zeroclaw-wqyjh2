@@ -6,7 +6,7 @@ mod store;
 pub use resolver::{SessionContext, SessionKey, SessionResolver};
 #[allow(unused_imports)]
 pub use store::{
-    ExecRun, ExecRunItem, ExecRunStatus, SessionChatCandidate, SessionId, SessionMessageRole,
-    SessionRouteMetadata, SessionStore, SessionSummary, SubagentRun, SubagentRunStatus,
-    SubagentSession, SubagentSpec,
+    AgentSpec, ExecRun, ExecRunItem, ExecRunStatus, SessionChatCandidate, SessionId,
+    SessionMessageRole, SessionRouteMetadata, SessionStore, SessionSummary, SubagentRun,
+    SubagentRunStatus, SubagentSession, SubagentSpec,
 };
