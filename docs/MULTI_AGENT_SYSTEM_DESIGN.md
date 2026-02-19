@@ -23,27 +23,37 @@ This document proposes an architecture for Zeroclaw that adopts the proven desig
 
 ---
 
-## 2. Design Principles (Lessons from OpenClaw)
+## 2. Design Principles
 
-OpenClaw’s multi‑agent/subagent behavior is stable in practice because it separates concerns:
+This design is compatible with OpenClaw patterns, but is grounded in first principles.
 
-1) **Session = durable conversation state**
-- Subagents are independent sessions (child sessions).
+A multi-agent system must solve three problems:
 
-2) **Internal execution ≠ external delivery**
-- An agent turn can run and persist to transcript while `deliver=false` prevents sending to external channels.
-- A dedicated internal “message channel” is used for agent-to-agent injections.
+1) **State** — durable, multi-turn conversations
+2) **Capability** — configurable differences between agents
+3) **Scheduling** — safe concurrency without reentrancy, loops, or duplication
 
-3) **Announce flow (structured report) rather than raw forward**
-- Child results are summarized/packaged into a “system/announce” style message which is injected into the parent session to drive orchestration.
+From that, the simplest effective architecture is:
 
-4) **Queue/lane aware scheduling**
-- When the parent is busy, child completion messages are queued/steered to avoid interrupting a running tool loop.
+- **Session** (state): persistent transcript + session config
+- **AgentSpec** (capability): model + skills/tools/context policies
+- **TurnJob** (scheduling): a queued unit of work that runs *one* session turn
 
-5) **Hard loop prevention**
-- Idempotency keys, TTL/hop limits, self-send protection.
+Everything else ("subagents", "announce", "lanes") is an implementation detail built on these primitives.
 
-Zeroclaw should implement these **as system mechanics**, not prompt conventions.
+### 2.1 Hard rules (mechanics, not prompt conventions)
+
+- **Per-session serialization:** at most 1 active TurnJob per session.
+- **Internal execution ≠ external delivery:** internal events default to `deliver=false`.
+- **Ephemeral context:** recall/context blocks are built per turn and **must not** be persisted into chat history.
+- **Loop prevention:** idempotency + TTL/hop + no self-send.
+
+### 2.2 Subagents are just sessions
+
+A “subagent” is not a special runtime. It is simply:
+
+- a **child session** (with its own transcript) whose input events come from a parent session,
+- and whose output is converted into a parent-session followup event (typically via announce meta payload).
 
 ---
 
