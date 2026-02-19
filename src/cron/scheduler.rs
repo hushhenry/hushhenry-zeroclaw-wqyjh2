@@ -800,6 +800,7 @@ mod tests {
                     route_id: Some("thread-99".into()),
                     sender_id: "user-x".into(),
                     title: None,
+                    deliver: true,
                 },
             )
             .unwrap();
@@ -856,6 +857,7 @@ mod tests {
                     route_id: None,
                     sender_id: "ou_test".into(),
                     title: None,
+                    deliver: true,
                 },
             )
             .unwrap();

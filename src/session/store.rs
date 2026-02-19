@@ -89,6 +89,7 @@ pub struct SessionRouteMetadata {
     pub route_id: Option<String>,
     pub sender_id: String,
     pub title: Option<String>,
+    pub deliver: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +105,7 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 5;
+const SESSION_SCHEMA_VERSION: i64 = 6;
 
 /// Session state key for the active AgentSpec id (or name) driving this session's turns.
 pub const SESSION_STATE_ACTIVE_AGENT_ID: &str = "active_agent_id";
@@ -478,6 +479,16 @@ impl SessionStore {
             version = 5;
         }
 
+        if version < 6 {
+            conn.execute_batch(
+                "ALTER TABLE session_meta ADD COLUMN deliver INTEGER NOT NULL DEFAULT 1;",
+            )
+            .context("Failed to apply sessions schema migration v6")?;
+            conn.pragma_update(None, "user_version", 6_i64)
+                .context("Failed to set sessions schema version to 6")?;
+            version = 6;
+        }
+
         if version != SESSION_SCHEMA_VERSION {
             bail!(
                 "Unsupported sessions schema version {}, expected {}",
@@ -589,9 +600,9 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO session_meta (
                 session_id, agent_id, channel, account_id, chat_type, chat_id, route_id,
-                sender_id, title, created_at, updated_at, last_seen_at
+                sender_id, title, deliver, created_at, updated_at, last_seen_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
              ON CONFLICT(session_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 channel = excluded.channel,
@@ -601,6 +612,7 @@ impl SessionStore {
                 route_id = excluded.route_id,
                 sender_id = excluded.sender_id,
                 title = excluded.title,
+                deliver = excluded.deliver,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at",
             params![
@@ -613,6 +625,7 @@ impl SessionStore {
                 metadata.route_id.as_deref(),
                 metadata.sender_id.as_str(),
                 metadata.title.as_deref(),
+                if metadata.deliver { 1_i64 } else { 0_i64 },
                 now,
             ],
         )
@@ -626,7 +639,7 @@ impl SessionStore {
     ) -> Result<Option<SessionRouteMetadata>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title
+            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver
              FROM session_meta
              WHERE session_id = ?1",
             params![session_id.as_str()],
@@ -640,6 +653,7 @@ impl SessionStore {
                     route_id: row.get(5)?,
                     sender_id: row.get(6)?,
                     title: row.get(7)?,
+                    deliver: row.get::<_, i64>(8)? != 0,
                 })
             },
         )
@@ -1032,30 +1046,39 @@ impl SessionStore {
             .context("Failed to decode title-based session chat candidates")
     }
 
-    pub fn create_subagent_session(
+    pub fn create_subagent_session_with_id(
         &self,
+        subagent_session_id: &str,
         spec_id: Option<&str>,
         meta_json: Option<&str>,
     ) -> Result<SubagentSession> {
         let conn = self.conn.lock();
         let now = Self::now();
-        let subagent_session_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO subagent_sessions (
                 subagent_session_id, spec_id, status, created_at, updated_at, meta_json
              ) VALUES (?1, ?2, 'active', ?3, ?3, ?4)",
             params![subagent_session_id, spec_id, now, meta_json],
         )
-        .context("Failed to create subagent session")?;
+        .context("Failed to create subagent session with id")?;
 
         Ok(SubagentSession {
-            subagent_session_id,
+            subagent_session_id: subagent_session_id.to_string(),
             spec_id: spec_id.map(ToOwned::to_owned),
             status: "active".to_string(),
             created_at: now.clone(),
             updated_at: now,
             meta_json: meta_json.map(ToOwned::to_owned),
         })
+    }
+
+    pub fn create_subagent_session(
+        &self,
+        spec_id: Option<&str>,
+        meta_json: Option<&str>,
+    ) -> Result<SubagentSession> {
+        let subagent_session_id = uuid::Uuid::new_v4().to_string();
+        self.create_subagent_session_with_id(&subagent_session_id, spec_id, meta_json)
     }
 
     pub fn upsert_subagent_spec(&self, name: &str, config_json: &str) -> Result<SubagentSpec> {
@@ -2179,6 +2202,7 @@ mod tests {
                     route_id: Some("thread-1".into()),
                     sender_id: "user-a".into(),
                     title: Some("Engineering Group".into()),
+                    deliver: true,
                 },
             )
             .unwrap();
@@ -2198,6 +2222,7 @@ mod tests {
                     route_id: None,
                     sender_id: "user-b".into(),
                     title: Some("operations group".into()),
+                    deliver: true,
                 },
             )
             .unwrap();
@@ -2231,6 +2256,7 @@ mod tests {
                     route_id: Some("thread-1".into()),
                     sender_id: "user-1".into(),
                     title: Some("Ops".into()),
+                    deliver: true,
                 },
             )
             .unwrap();

@@ -50,6 +50,7 @@ use crate::session::{
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
@@ -62,6 +63,9 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
 const DEFAULT_QUEUE_MODE: &str = "steer-backlog";
 const COMMAND_LIST_LIMIT: u32 = 20;
+
+/// Reserved internal channel identifier for subagent sessions.
+pub const INTERNAL_MESSAGE_CHANNEL: &str = "agent";
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -748,6 +752,7 @@ fn build_route_metadata(msg: &traits::ChannelMessage) -> SessionRouteMetadata {
         route_id: msg.thread_id.clone(),
         sender_id: msg.sender.clone(),
         title: msg.title.clone(),
+        deliver: msg.channel != INTERNAL_MESSAGE_CHANNEL,
     }
 }
 
@@ -1254,12 +1259,75 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&response, 80)
             );
+            let mut deliver = true;
+            let mut session_meta: Option<SessionRouteMetadata> = None;
+            if let Some(session_store) = ctx.session_store.as_ref() {
+                if let Some(session_id) = active_session.as_ref() {
+                    if let Ok(Some(meta)) = session_store.load_route_metadata(session_id) {
+                        deliver = meta.deliver;
+                        session_meta = Some(meta);
+                    }
+                }
+            }
+
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel
-                    .send(&SendMessage::new(&response, &msg.reply_target))
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                if deliver {
+                    if let Err(e) = channel
+                        .send(&SendMessage::new(&response, &msg.reply_target))
+                        .await
+                    {
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    }
+                } else {
+                    println!("  🔇 Delivery disabled for this session (internal channel or muted)");
+                }
+            }
+
+            // Milestone 4: Announce subagent completion to parent session
+            if let Some(meta) = session_meta {
+                if meta.channel == INTERNAL_MESSAGE_CHANNEL {
+                    // Logic to find parent session and announce
+                    // For now, we assume parent context can be extracted from session_key or meta
+                    // In a more robust system, we'd have a `parent_session_id` field.
+                    // For this milestone, we'll try to find a parent session by looking for 
+                    // matching subagent session records.
+                    if let Some(session_store) = ctx.session_store.as_ref() {
+                        if let Some(session_id) = active_session.as_ref() {
+                            // Find which parent session spawned this
+                            // This usually requires a link. Let's look at the subagent_sessions table.
+                            if let Ok(Some(sub_session)) = session_store.get_subagent_session(meta.chat_id.as_str()) {
+                                // Extract parent session info from sub_session.meta_json if present
+                                if let Some(parent_info) = sub_session.meta_json.and_then(|m| {
+                                    serde_json::from_str::<serde_json::Value>(&m).ok()
+                                }) {
+                                    if let Some(parent_session_id) = parent_info.get("parent_session_id").and_then(|v| v.as_str()) {
+                                        let agent_name = meta.agent_id.as_deref().unwrap_or("subagent");
+                                        let announce_msg = format!("[@agent:{agent_name}] finish");
+                                        let announce_meta = json!({
+                                            "task": meta.title,
+                                            "result": {
+                                                "status": "success",
+                                                "summary": response
+                                            },
+                                            "source": {
+                                                "agent_id": meta.agent_id,
+                                                "child_session_id": session_id.as_str()
+                                            }
+                                        });
+                                        
+                                        if let Err(e) = session_store.append_message(
+                                            &SessionId::from_string(parent_session_id.to_string()),
+                                            "user",
+                                            &announce_msg,
+                                            Some(&announce_meta.to_string())
+                                        ) {
+                                            tracing::warn!("Failed to announce to parent session {}: {e}", parent_session_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
