@@ -367,27 +367,40 @@ Support per-agent bootstrap overlays:
 
 If overlay files exist, use them; otherwise fall back to root workspace files.
 
-### 10.4 Memory
+### 10.4 Memory (**Step 0: refactor to sqlite-only**)
 
-Current state: memory writes often pass `session_id=None` and use fixed keys like `user_msg`.
+To reduce complexity and future coding surface area, Zeroclaw should adopt a **single memory backend**.
 
-Target state:
+**Decision:** The first refactor step is **sqlite-only** memory (keep `brain.db` as source of truth).
 
-- Memory operations must always carry `session_id` (or `session_key`).
-- Keys must be session-scoped to avoid collisions.
-- Memory policy should allow:
-  - per-session recall (conversation-local)
-  - per-agent recall (agent preferences)
-  - global recall (user facts)
+Rationale:
 
-This enables multi-agent isolation while retaining shared facts where desired.
+- Multi-agent needs stable, testable primitives (FTS/vector/hybrid search, metadata, indexing, snapshots).
+- Multiple backends (markdown + sqlite) create ambiguous semantics and multiply migration paths.
+- sqlite aligns with the "ephemeral context, not persisted" rule: recall blocks are generated per turn and never written into chat history.
+
+Implications:
+
+- Deprecate/remove `MarkdownMemory` backend.
+- Provide optional **export** commands (e.g. `memory export --format md|jsonl`) for human-readable audits and Git diffing.
+
+Current state:
+
+- Memory writes often pass `session_id=None` and use fixed keys like `user_msg`.
+
+Target state (still shared/global memory, with better context control):
+
+- Memory operations must always carry `session_id` (or `session_key`) for *ranking/weighting* and collision avoidance.
+- Keys must be namespaced to avoid collisions.
+- Recall should be configurable per agent via `context_policy` (memory on/off, budgets, filters), but **recall content is never persisted as chat messages**.
 
 ---
 
 ## 11. Suggested Implementation Phases (for later)
 
-### Phase 1 (core multi-agent skeleton)
+### Phase 1 (reduce complexity first: sqlite-only + core multi-agent skeleton)
 
+- **Step 0:** Refactor memory to **sqlite-only** (remove markdown backend; keep optional export tooling).
 - Add AgentSpec registry + `/agents` `/agent` + tools.
 - Add session-level model overrides + `/models` `/model`.
 - Add internal channel + deliver gating.
