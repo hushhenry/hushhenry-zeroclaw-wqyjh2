@@ -292,7 +292,6 @@ Semantics:
 
 Implementation notes:
 
-- No time-based collect/debounce window in core.
 - Backlog items are drained and merged into a single `[Backlog]` user message at the start of the next turn.
 - If steering is not possible (no safe boundary), fall back to **backlog-only** for the new message (i.e. enqueue it and run after the current turn).
 
@@ -597,7 +596,6 @@ Acceptance:
 
 ### Non-goals (for this plan)
 
-- Time-based collect/debounce window (explicitly out of scope).
 - Agent-isolated memory stores (memory remains global; agents differ via model/skills/tools/context_policy).
 
 ---
