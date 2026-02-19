@@ -422,30 +422,205 @@ Target state (still shared/global memory, with better context control):
 
 ---
 
-## 11. Suggested Implementation Phases (for later)
+## 11. Module Impact Map (what changes where)
 
-### Phase 1 (reduce complexity first: sqlite-only + core multi-agent skeleton)
+This section connects the design to concrete Zeroclaw modules so implementation work is scoped and reviewable.
 
-- **Step 0:** Refactor memory to **sqlite-only** (remove markdown backend; keep optional export tooling).
-- Add AgentSpec registry + `/agents` `/agent` + tools.
-- Add session-level model overrides + `/models` `/model`.
-- Add internal channel + deliver gating.
-- Convert subagent concept from `subagent_runs` to child sessions + announce injections.
+### 11.1 Core runtime / loop
 
-### Phase 2 (stability)
+- `src/agent/loop_.rs`
+  - Must support **steer-backlog** semantics (safe tool boundaries, resume token/backlog injection).
+  - Must support "ephemeral context" injection for announce meta payloads (rendered only for the next turn, not persisted).
 
-- lanes + per-session serialization + busy-parent strategies.
-- idempotency + TTL/hop.
+- `src/agent/agent.rs`
+  - Ensure tool-loop boundaries are explicit enough for steering.
 
-### Phase 3 (ergonomics)
+### 11.2 Session persistence & state
 
-- agent builder (natural language creation).
-- overlay workspace files.
-- memory scoping policy.
+- `src/session/store.rs`
+  - Add **AgentSpec registry** storage (new table) and session-level `active_agent_id` + model override fields.
+  - Store per-session queue state (already stores `queue_mode`; we will collapse to steer-backlog-only).
+
+- `src/session/backlog.rs`
+  - Backlog queue used by steer-backlog (resume tokens + deferred messages).
+  - Consider extending backlog entries from `String` to a structured JSON payload when needed (idempotency/meta).
+
+### 11.3 Channels / routing
+
+- `src/channels/mod.rs` (and per-channel adapters)
+  - Resolve inbound messages → session_key/session_id.
+  - Enforce **deliver gating** for internal message channel.
+  - Expose `/models`, `/model`, `/agents`, `/agent`, `/queue` (steer-backlog-only) commands.
+
+### 11.4 Memory
+
+- `src/memory/*`
+  - Step 0: sqlite-only backend (remove markdown backend).
+  - Ensure memory recall is optional per agent via `context_policy`.
+
+### 11.5 Skills & tools
+
+- `src/skills/mod.rs`
+  - Provide global skill discovery, but filter injected skill list per `AgentSpec.policy.skills`.
+
+- `src/tools/mod.rs` + individual tools
+  - Filter tool registry per `AgentSpec.policy.tools`.
+  - Deprecate legacy delegate→subagent-spec mappings once AgentSpec is first-class.
+
+### 11.6 Subagents (re-architecture)
+
+- `src/subagent/*` + `src/tools/subagent_*`
+  - Current `subagent_runs` queue is a compatibility layer.
+  - Target: subagents are **child sessions** + announce meta payload + minimal injected message.
 
 ---
 
-## 12. Compatibility Notes (current Zeroclaw)
+## 12. Detailed Implementation Plan
+
+This plan is ordered to reduce complexity early and keep the system shippable at each step.
+
+### Milestone 0 — Make memory sqlite-only (complexity reduction)
+
+Goal: one memory backend; reduce migration/testing surface.
+
+Tasks:
+
+1) Remove/disable markdown backend selection
+   - Update config schema to accept only `sqlite` (or default to sqlite and ignore others).
+2) Delete or deprecate `MarkdownMemory` code paths
+   - Ensure no tools/tests depend on it.
+3) Add optional export tooling (non-blocking)
+   - `memory export --format md|jsonl` for audits.
+
+Acceptance:
+
+- All tests pass with sqlite-only.
+- No runtime flags reference markdown memory.
+
+### Milestone 1 — AgentSpec registry + session-level switching
+
+Goal: represent "agent" as a first-class profile that controls model + skills/tools + context policy.
+
+Tasks:
+
+1) DB schema
+   - Add `agent_specs` table (id, name, config_json, created_at, updated_at).
+   - Add session state fields for `active_agent_id`, `model_override` (if not present).
+2) Commands
+   - `/agents` lists specs + current session active agent.
+   - `/agent <id|name>` exact switch.
+   - `/models` and `/model` (provider/model) switch.
+3) Runtime resolution
+   - On each turn, resolve `active_agent_id` → AgentSpec → effective model/tools/skills/context policy.
+
+Acceptance:
+
+- Can create a few static AgentSpecs (seeded) and switch sessions between them.
+- Switching changes model/tools exposure for subsequent turns.
+
+### Milestone 2 — Skill/tool filtering by AgentSpec
+
+Goal: make agent differences real (not just prompt text).
+
+Tasks:
+
+1) Skill injection filter
+   - Only list allowed skills in system prompt.
+2) Tool registry filter
+   - Only register allowed tools.
+   - High-risk tools default-deny for non-main agents unless explicitly allowed.
+
+Acceptance:
+
+- Switching agent changes available tools/skills immediately.
+- Disallowed tools cannot be called.
+
+### Milestone 3 — Steer-backlog-only queue semantics (correctness + UX)
+
+Goal: match the steer-backlog semantics: interrupt long tool loops without losing the original task.
+
+Tasks:
+
+1) Identify "safe tool boundary" points in the tool loop.
+2) When a new inbound message arrives during an active turn:
+   - schedule the new message to run next (steer)
+   - push a resume token for the interrupted task into backlog
+3) On next turn start:
+   - drain backlog and merge into a single `[Backlog]` user message
+
+Acceptance:
+
+- A long tool loop can be interrupted by a new user message.
+- After responding to the new message, the previous task resumes from backlog.
+
+### Milestone 4 — Subagents as child sessions + announce meta payload (B)
+
+Goal: replace subagent-as-job with subagent-as-session.
+
+Tasks:
+
+1) Spawn child session (deliver=false, internal channel)
+2) Parent→child message injection uses internal channel + deliver gating
+3) Child→parent announce:
+   - inject minimal user message (e.g. `[@agent] finish`)
+   - attach semantic payload to `meta_json` (task/result/artifacts)
+4) Parent consumes announce payload in next turn via ephemeral rendering (not persisted)
+
+Acceptance:
+
+- Parent can spawn N subagents in parallel (N child sessions).
+- Child results are routed back without external delivery.
+
+### Milestone 5 — Hardening (idempotency/TTL/observability)
+
+Tasks:
+
+- Deterministic idempotency keys for announce injections.
+- TTL/hop enforcement.
+- Basic debug logging for steering/backlog events.
+
+Acceptance:
+
+- No duplicate announces.
+- No self-send loops.
+
+### Milestone 6 — Cleanup & compatibility removal
+
+Tasks:
+
+- Deprecate/remove `subagent_runs` queue and oneshot wrappers.
+- Remove legacy agent mappings.
+
+Acceptance:
+
+- Only Session + AgentSpec + TurnJob model remains.
+
+### Non-goals (for this plan)
+
+- Time-based collect/debounce window (explicitly out of scope).
+- Agent-isolated memory stores (memory remains global; agents differ via model/skills/tools/context_policy).
+
+---
+
+## 13. Suggested Implementation Phases (legacy summary)
+
+(Kept only as a short index; the detailed plan above is authoritative.)
+
+- Phase 0: sqlite-only memory
+- Phase 1: AgentSpec + switching
+- Phase 2: skills/tools filtering
+- Phase 3: steer-backlog correctness
+- Phase 4: subagents as sessions + announce meta payload
+- Phase 5: hardening + cleanup
+
+### 13.1 Ergonomics (optional follow-ons)
+
+- Agent builder (natural language creation).
+- Workspace overlays (persona/bootstrap overrides).
+
+---
+
+## 14. Compatibility Notes (current Zeroclaw)
 
 - Existing `subagent_spawn_oneshot` should become a **compatibility wrapper** or a **skill**.
 - Existing `subagent_specs` can be migrated into AgentSpecs (model/system prompt fields map cleanly).
