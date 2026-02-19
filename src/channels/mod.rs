@@ -2017,9 +2017,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     ));
 
-    let skills = crate::skills::load_skills(&workspace);
+    let skills = crate::skills::load_skills(&workspace, None);
 
     let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
         .iter()

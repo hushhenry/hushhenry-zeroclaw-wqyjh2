@@ -253,6 +253,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     ));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =

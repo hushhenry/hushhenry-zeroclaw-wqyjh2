@@ -238,6 +238,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -278,7 +279,7 @@ impl Agent {
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills(&config.workspace_dir, None))
             .auto_save(config.memory.auto_save)
             .build()
     }

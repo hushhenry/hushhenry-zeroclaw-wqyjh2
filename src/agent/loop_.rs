@@ -1,5 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::identity;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
@@ -795,6 +796,20 @@ pub async fn run(
     } else {
         (None, None)
     };
+    let aieos_identity = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+        .ok()
+        .flatten();
+
+    let (allowed_skills, allowed_tools) = if let Some(ref identity) = aieos_identity {
+        if let Some(ref capabilities) = identity.capabilities {
+            (capabilities.skills.clone(), capabilities.tools.clone())
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -808,6 +823,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        allowed_tools,
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -836,7 +852,7 @@ pub async fn run(
     });
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills(&config.workspace_dir, allowed_skills);
     let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
         .iter()
         .map(|tool| (tool.name(), tool.description()))
@@ -1053,6 +1069,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
+    let aieos_identity = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+        .ok()
+        .flatten();
+
+    let (allowed_skills, allowed_tools) = if let Some(ref identity) = aieos_identity {
+        if let Some(ref capabilities) = identity.capabilities {
+            (capabilities.skills.clone(), capabilities.tools.clone())
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -1066,6 +1096,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        allowed_tools,
     );
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -1081,7 +1112,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
     )?;
 
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills(&config.workspace_dir, allowed_skills);
     let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
         .iter()
         .map(|tool| (tool.name(), tool.description()))

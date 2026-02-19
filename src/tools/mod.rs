@@ -118,6 +118,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        None,
     )
 }
 
@@ -136,6 +137,7 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    allowed_tools: Option<Vec<String>>,
 ) -> Vec<Box<dyn Tool>> {
     sync_legacy_delegate_agents_to_subagent_specs(workspace_dir, agents, fallback_api_key);
 
@@ -214,6 +216,10 @@ pub fn all_tools_with_runtime(
         if !key.is_empty() {
             tools.push(Box::new(ComposioTool::new(key, composio_entity_id)));
         }
+    }
+
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|tool| allowed.contains(&tool.name().to_string()));
     }
 
     tools
