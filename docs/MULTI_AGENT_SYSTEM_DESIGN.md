@@ -258,6 +258,8 @@ External delivery is only allowed if explicitly requested and must obey deliver 
 
 Without scheduling, multi-agent systems become unstable (interruptions, reentrancy, loops).
 
+This section also defines **steer-backlog** semantics precisely.
+
 ### 7.1 Lanes
 
 Introduce lanes similar to OpenClaw:
@@ -275,33 +277,52 @@ Even with lane concurrency, enforce:
 
 - **At most 1 active agent turn per session**
 
-### 7.3 Busy parent: **backlog + collect window** (default), steer optional
+### 7.3 Queue modes (per session) — including **steer-backlog**
+
+A session may have an in-flight agent turn (often with many tool iterations). If a new inbound
+message arrives, we must decide whether to:
+
+- respond immediately (even if it means pausing the current tool loop), or
+- wait and handle it after the current turn finishes.
+
+We define queue modes as **session-level behavior**:
+
+- **followup**: enqueue the new message to run after the current turn ends.
+- **collect**: like followup, but coalesce multiple queued inbound messages into a single followup turn (default).
+- **steer**: *steer now*: pause the current run at the next safe tool boundary and run the new message immediately.
+  - This typically cancels pending tool calls after the boundary.
+  - If the current run cannot be safely steered (no boundary / not streaming / etc.), fall back to followup.
+- **steer-backlog** (aka **steer+backlog**): **steer now AND preserve the message for a followup turn**.
+  - Mechanically: when steering, we also append the **previous user message that initiated the tool loop** (or equivalent continuation token) into backlog so the original long task can resume after the steered turn completes.
+  - This yields two responses: one for the steered interruption, and one later when the backlog resumes.
+- **interrupt** (legacy): abort the active run immediately, then run the newest message (drops the old task unless separately preserved).
+
+Why steer-backlog exists:
+
+- Pure FIFO makes the user wait for a long tool loop to finish.
+- Pure steer improves responsiveness but risks losing the original long task.
+- **steer-backlog preserves both**: immediate response + eventual completion.
+
+### 7.4 Default policy by traffic type
+
+- **External user messages**: allow configurable modes (`collect` default; `steer-backlog` optional for high-interactivity).
+- **Internal announce traffic**: default **backlog + collect window** (see below), steer off.
+
+### 7.5 Internal announce: backlog + collect window (default)
 
 When the parent session is running, the default behavior for internal announce traffic should be:
 
 - **backlog**: do not interrupt the in-flight turn; enqueue internal announce events to be handled after the current turn completes.
 - **collect window**: buffer/merge multiple internal announce events that arrive within a short time window into a single followup injection.
 
-Rationale:
-
-- Prevents tool-loop reentrancy and state corruption.
-- Avoids "announce storms" when many subagents complete around the same time.
-- Keeps the parent transcript clean (best practice B stores semantic payload in meta_json; the merged followup can reference multiple payloads).
-
 Suggested defaults:
 
 - `collect_window_ms`: 500–2000ms (start with **1000ms**)
 - `max_items_per_batch`: 10 (beyond this, emit multiple batches)
-- `max_total_chars_rendered`: keep low; prefer references to meta payloads
 - `flush_triggers`:
   - window elapsed, or
   - parent turn finished, or
   - reached max_items_per_batch
-
-Optional (advanced):
-
-- **steer**: append announce events into an in-flight run’s queue only when the run declares a safe checkpoint.
-  Default should be **off** for internal announces; reserve for interactive user messages or explicit interrupt modes.
 
 ---
 
