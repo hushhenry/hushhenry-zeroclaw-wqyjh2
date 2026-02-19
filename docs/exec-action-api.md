@@ -1,92 +1,68 @@
-# Shell Exec Action API (Background Model)
+# Shell Exec Action API (Persistent Background Runtime)
 
-This document defines the `shell` tool exec-upgrade model.
+This document defines the architecture and API for the `shell` tool's persistent, asynchronous execution model.
 
-## Scope
+## 1. Overview & Motivation
 
-- No new tool name is introduced.
-- The existing `shell` tool now supports action multiplexing via `action`.
-- Legacy behavior remains backward compatible when `action` is omitted.
+Traditional `shell` executions are blocking—the agent waits for the command to finish before moving to the next turn. This is impractical for long-running tasks like compiling large projects, running servers, or monitoring logs.
 
-## API Shape
+The **Exec Action API** introduces a non-blocking, action-driven model that allows the agent to:
+1. **Spawn** a process and immediately regain control.
+2. **Poll** for status or snippets of output.
+3. **Log** through large outputs using incremental cursors.
+4. **Kill** processes that are no longer needed.
 
-`shell` accepts:
+## 2. API Schema
 
-- `action`: `spawn` | `poll` | `log` | `kill` | `send_keys` (phase-1 stub)
-- `command`: required for `action=spawn`
-- `background`: optional bool (defaults to `true` for `spawn`)
-- `pty`: optional bool (phase-1 stores flag; non-PTY execution)
-- `timeout_secs`: optional hard timeout
-- `max_output_bytes`: optional output cap
-- `watch`: optional watcher list `[{regex,event,once?,scope?}]`
-- `run_id`: required for `poll`/`log`/`kill`
-- `since_seq`: optional incremental cursor for `poll` and `log`
-- `limit`: optional max items for `action=log` (server-capped)
-- `stream`: optional `"stdout"` or `"stderr"` filter for `action=log`
-- `session_id`: creating session identifier used for routing/backlog
+The `shell` tool accepts an `action` parameter. If omitted, it defaults to legacy synchronous execution.
 
-When `action` is omitted, `shell` behaves as the legacy synchronous one-shot command executor.
+### Actions
+- **`spawn`**: Starts a process in the background.
+    - `command`: The shell command to run.
+    - `background`: Defaults to `true`.
+    - `watch`: Optional list of regex patterns to monitor (see **Watchers** below).
+- **`poll`**: Quick status check.
+    - `run_id`: The identifier returned by `spawn`.
+    - Returns: Status (`running`, `success`, `failed`), exit code, and a **small output snippet** (tail).
+- **`log`**: Incremental log retrieval.
+    - `run_id`: The identifier.
+    - `since_seq`: Monotonic sequence number to fetch logs *after* this point.
+    - `limit`: Max items to return.
+- **`kill`**: Terminates a running process.
 
-## Poll vs Log Semantics
+## 3. Persistent Execution Model
 
-- **`poll`** is for state checks: it returns run metadata (`status`, `exit_code`, `truncated`, `error_message`, timestamps), a bounded **snippet** of recent output (small, stable size), and incremental `items` with `next_seq`. Use it to check run status and get a quick tail of output without fetching full history.
-- **`log`** is for ranged output/event retrieval: it reads `exec_run_items` strictly after `since_seq` and up to `limit` (server-capped), and returns `items` and `next_seq`. Optional `stream` filters to `stdout` or `stderr` only. Use it to page through full output or events when you need more than the snippet (e.g. after completion, or for logs/audit).
-- Both use the same cursor contract: pass `since_seq` from the previous response’s `next_seq` to get the next batch.
+Process states and outputs are persisted in the `sessions.db` database.
 
-## Blocking-Avoidance Rule
+### Database Tables
+- **`exec_runs`**: Stores metadata, run status, process IDs (PID), and the session the task belongs to.
+- **`exec_run_items`**: Stores every chunk of `stdout` and `stderr`, along with events (like watcher hits), each assigned a monotonic `seq` ID.
 
-- `spawn`/`poll`/`kill` return quickly.
-- Long-running process execution is handled by a background worker.
-- The worker claims queued runs from persisted storage and executes asynchronously.
+### Restart Recovery
+ZeroClaw is "Restart-Safe." If the agent process is killed or restarted:
+1. Upon startup, the background worker scans `exec_runs` for any tasks still marked as `running`.
+2. These tasks are marked as `queued` or `recovered`.
+3. The worker attempts to resume tracking or cleanly handles the orphaned process state.
 
-## Persistence Model
+## 4. Watcher Flow & Backlog Steering
 
-Exec state is persisted in `memory/sessions.db`:
+Watchers allow the agent to "subscribe" to specific output patterns without constantly polling.
 
-- `exec_runs`: run metadata, status, limits, timestamps, session binding
-- `exec_run_items`: streamed output/events with monotonic `seq`
+1. **Detection**: As the process runs, the worker matches chunks of output against the `regex` patterns defined during `spawn`.
+2. **Persistence**: Every match is recorded as an `event` in `exec_run_items`.
+3. **Decoupled Sink**: The `ExecEventSink` trait allows the worker to notify the agent. The default implementation enqueues a message into the **Session Backlog**.
+4. **Steering**: On the agent's next turn, it sees the backlog message (e.g., `"Build finished successfully"`) and can react accordingly.
 
-`poll` and `log` both read from `exec_run_items`; `poll` also returns run row and a bounded snippet. Cursor `since_seq` / `next_seq` is shared.
+## 5. Output Management & Snippets
 
-## Retention Notes
+To prevent large logs from overwhelming the agent's context:
+- **Snippets**: Every `poll` and watcher notification includes a bounded "snippet" (the last ~1-2 KB of output). This gives the agent enough context to decide if it needs to fetch full logs.
+- **Cursors**: Using `since_seq` and `next_seq` in the `log` action allows the agent to page through megabytes of logs incrementally, rather than loading everything at once.
 
-`exec_run_items` grows with command output and watcher events. Keep retention operationally bounded by periodic DB maintenance/compaction (e.g. pruning old completed runs and their items) so `sessions.db` growth remains predictable. The same cursor-based `log` API works regardless of retention policy.
+## 6. Wait-on-Conditions Guidance
 
-## Recovery Model
-
-On worker startup:
-
-- runs left in `running` state are recovered to `queued`
-- recovered runs are eligible for normal claim-and-execute processing
-
-This guarantees restart-safe polling and continuation behavior.
-
-## Concurrency Model
-
-- Runs are serialized per `session_id`.
-- Runs can execute in parallel across different sessions.
-
-## Snippet and Callback Guidance
-
-- **Snippet**: Poll responses and runtime event callbacks include a bounded recent-output snippet (same builder: tail of concatenated stdout/stderr, capped in size). This lets consumers react without issuing an immediate extra `poll`.
-- **Event sink**: Notifications are decoupled from backlog via an `ExecEventSink` trait (status change, watcher hit, output). The default sink bridges watcher hits to the existing session backlog enqueue behavior. Custom sinks can implement the same trait and receive the same bounded snippet in callbacks.
-- **Output caps**: Per-chunk and total caps avoid huge stdout/stderr amplification (see `shell_exec_runtime` module docs and constants: `CHUNK_MAX_CHARS`, `SNIPPET_MAX_CHARS`, run `max_output_bytes`).
-
-## Watcher Flow to Steer Backlog
-
-1. Worker captures `stdout`/`stderr` chunks while the run is active (chunks and callback payloads are capped).
-2. Configured regex watchers are evaluated against incoming chunks.
-3. On match, worker persists an `event` item in `exec_run_items`.
-4. Worker invokes the event sink (default: enqueues a backlog message keyed by `session_id`, with a bounded snippet available to the callback).
-5. Existing steer-backlog injection path delivers this message on the next checkpoint turn.
-
-## Wait-on-Conditions Guidance
-
-Use `spawn` + `poll` (or `log`) instead of blocking on process completion:
-
-1. `spawn` run and store `run_id`
-2. `poll` with `since_seq` for status and incremental output/events (and a bounded snippet), or use `log` with `since_seq`/`limit`/`stream` to page through full output
-3. React to watcher events/status transitions
-4. Call `kill` if a condition indicates cancellation
-
-This keeps the agent loop responsive and avoids long blocking tool calls.
+Instead of blocking, the agent should follow this pattern:
+1. Call `spawn` with a `watch` pattern for the expected success/error message.
+2. Inform the user that the task is running in the background.
+3. Wait for the watcher event to appear in the backlog or periodically `poll` if no specific pattern is known.
+4. Use `log` to fetch details only if an error is detected.
