@@ -23,6 +23,7 @@ pub mod sessions_history;
 pub mod sessions_list;
 pub mod sessions_send;
 pub mod shell;
+mod shell_exec_runtime;
 pub mod subagent_poll;
 pub mod subagent_send;
 pub mod subagent_spawn_oneshot;
