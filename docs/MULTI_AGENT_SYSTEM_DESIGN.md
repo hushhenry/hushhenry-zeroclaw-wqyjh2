@@ -277,39 +277,29 @@ Even with lane concurrency, enforce:
 
 - **At most 1 active agent turn per session**
 
-### 7.3 Queue modes (per session) — **steer-backlog** as the simple default
+### 7.3 Queue mode (per session): **steer-backlog only**
 
-A session may have an in-flight agent turn (often with many tool iterations). If a new inbound
-message arrives, we must decide whether to:
+To keep Zeroclaw minimal and predictable, we support exactly **one** queue mode:
 
-- respond immediately (even if it means pausing the current tool loop), or
-- wait and handle it after the current turn finishes.
+- **steer-backlog** (aka **steer+backlog**) — always on.
 
-To keep Zeroclaw simple, we do **not** implement a time-based collect/debounce window in the core.
-Instead, we rely on a per-session **backlog queue** that is drained at the next turn boundary.
+Semantics:
 
-We define queue modes as **session-level behavior**:
+- If a session has an in-flight agent turn (often with many tool iterations) and a new inbound message arrives,
+  the runtime **steers** to the new message at the next safe tool boundary (so the user does not wait for the long task).
+- To avoid losing the interrupted work, the runtime also appends a **resume token** for the interrupted task into a
+  per-session **backlog** so it can continue after the steered turn completes.
 
-- **followup**: enqueue the new message into the session backlog to run after the current turn ends.
-  - Implementation detail: backlog messages are drained and merged into a single `[Backlog]` user message at the start of the next turn.
-- **steer**: *steer now*: pause the current run at the next safe tool boundary and run the new message immediately.
-  - This typically cancels pending tool calls after the boundary.
-  - If the current run cannot be safely steered (no boundary / not streaming / etc.), fall back to followup.
-- **steer-backlog** (aka **steer+backlog**) — **default**: steer now AND preserve the interrupted task for a followup turn.
-  - Mechanically: when steering, append the **previous user message that initiated the tool loop** (or a resume token that references it) into backlog so the original long task can resume after the steered turn completes.
-  - This yields two responses: one for the steered interruption, and one later when the backlog resumes.
-- **interrupt** (legacy): abort the active run immediately, then run the newest message (drops the old task unless separately preserved).
+Implementation notes:
 
-Why steer-backlog exists:
+- No time-based collect/debounce window in core.
+- Backlog items are drained and merged into a single `[Backlog]` user message at the start of the next turn.
+- If steering is not possible (no safe boundary), fall back to followup-by-backlog (i.e. enqueue the new message).
 
-- Pure FIFO makes the user wait for a long tool loop to finish.
-- Pure steer improves responsiveness but risks losing the original long task.
-- **steer-backlog preserves both**: immediate response + eventual completion.
+Defaults:
 
-### 7.4 Default policy by traffic type
-
-- **External user messages**: default `steer-backlog`.
-- **Internal announce traffic**: default `followup` (backlog). Keep announce payloads short in text and store semantics in meta_json (best practice B).
+- External user messages: steer-backlog.
+- Internal announce traffic: also uses backlog (steer is generally not meaningful), keeping announce text short and storing semantics in meta_json (best practice B).
 
 ---
 
