@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -265,23 +265,23 @@ impl Channel for DingTalkChannel {
                     });
                     let _ = write.send(Message::Text(ack.to_string())).await;
 
-                    let channel_msg = ChannelMessage::new_ingress(
-                        Uuid::new_v4().to_string(),
-                        None,
-                        sender_id.to_string(),
-                        chat_id.clone(),
-                        content.to_string(),
-                        "dingtalk",
-                        None,
+                    let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: Uuid::new_v4().to_string(),
+                        account_id: None,
+                        sender: sender_id.to_string(),
+                        reply_target: chat_id.clone(),
+                        content: content.to_string(),
+                        channel: "dingtalk".to_string(),
+                        title: None,
                         chat_type,
-                        None,
+                        raw_chat_type: None,
                         chat_id,
-                        None,
-                        std::time::SystemTime::now()
+                        thread_id: None,
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    );
+                    });
 
                     if tx.send(channel_msg).await.is_err() {
                         tracing::warn!("DingTalk: message channel closed");

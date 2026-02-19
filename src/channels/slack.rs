@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 
 /// Slack channel — polls conversations.history via Web API
@@ -170,23 +170,23 @@ impl Channel for SlackChannel {
                         ChatType::Group
                     };
 
-                    let channel_msg = ChannelMessage::new_ingress(
-                        format!("slack_{channel_id}_{ts}"),
-                        None,
-                        user.to_string(),
-                        channel_id.clone(),
-                        text.to_string(),
-                        "slack",
-                        None,
+                    let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: format!("slack_{channel_id}_{ts}"),
+                        account_id: None,
+                        sender: user.to_string(),
+                        reply_target: channel_id.clone(),
+                        content: text.to_string(),
+                        channel: "slack".to_string(),
+                        title: None,
                         chat_type,
-                        None,
-                        channel_id.clone(),
+                        raw_chat_type: None,
+                        chat_id: channel_id.clone(),
                         thread_id,
-                        std::time::SystemTime::now()
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    );
+                    });
 
                     if tx.send(channel_msg).await.is_err() {
                         return Ok(());

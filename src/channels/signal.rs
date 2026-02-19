@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -262,20 +262,20 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
-        Some(ChannelMessage::new_ingress(
-            format!("sig_{timestamp}"),
-            None,
-            sender.clone(),
-            target,
-            text.to_string(),
-            "signal",
-            None,
+        Some(ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: format!("sig_{timestamp}"),
+            account_id: None,
+            sender: sender.clone(),
+            reply_target: target,
+            content: text.to_string(),
+            channel: "signal".to_string(),
+            title: None,
             chat_type,
-            None,
+            raw_chat_type: None,
             chat_id,
-            None,
-            timestamp / 1000, // millis → secs
-        ))
+            thread_id: None,
+            timestamp: timestamp / 1000, // millis → secs
+        }))
     }
 }
 

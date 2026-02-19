@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use crate::config::Config;
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -578,27 +578,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             ChatType::from_raw(&chat_type)
         };
 
-        Some(ChannelMessage::new_ingress(
-            format!("telegram_{chat_id}_{message_id}"),
-            None,
-            sender_identity,
-            chat_id.clone(),
-            text.to_string(),
-            "telegram",
-            message
+        Some(ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: format!("telegram_{chat_id}_{message_id}"),
+            account_id: None,
+            sender: sender_identity,
+            reply_target: chat_id.clone(),
+            content: text.to_string(),
+            channel: "telegram".to_string(),
+            title: message
                 .get("chat")
                 .and_then(|chat| chat.get("title"))
                 .and_then(serde_json::Value::as_str)
                 .map(std::string::ToString::to_string),
-            normalized_chat_type,
-            Some(chat_type),
+            chat_type: normalized_chat_type,
+            raw_chat_type: Some(chat_type),
             chat_id,
             thread_id,
-            std::time::SystemTime::now()
+            timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-        ))
+        }))
     }
 
     async fn send_text_chunks(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {

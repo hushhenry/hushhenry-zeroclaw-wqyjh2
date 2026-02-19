@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -568,23 +568,23 @@ impl Channel for IrcChannel {
                     };
 
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-                    let channel_msg = ChannelMessage::new_ingress(
-                        format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
-                        None,
-                        sender_nick.to_string(),
-                        reply_to.clone(),
+                    let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
+                        account_id: None,
+                        sender: sender_nick.to_string(),
+                        reply_target: reply_to.clone(),
                         content,
-                        "irc",
-                        None,
+                        channel: "irc".to_string(),
+                        title: None,
                         chat_type,
-                        None,
-                        reply_to,
-                        None,
-                        std::time::SystemTime::now()
+                        raw_chat_type: None,
+                        chat_id: reply_to,
+                        thread_id: None,
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    );
+                    });
 
                     if tx.send(channel_msg).await.is_err() {
                         return Ok(());

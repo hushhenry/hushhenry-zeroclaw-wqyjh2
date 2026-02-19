@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -227,23 +227,23 @@ impl Channel for MatrixChannel {
                         continue;
                     }
 
-                    let msg = ChannelMessage::new_ingress(
-                        format!("mx_{}", chrono::Utc::now().timestamp_millis()),
-                        None,
-                        event.sender.clone(),
-                        event.sender.clone(),
-                        body.clone(),
-                        "matrix",
-                        None,
-                        ChatType::Group,
-                        None,
-                        self.room_id.clone(),
-                        None,
-                        std::time::SystemTime::now()
+                    let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: format!("mx_{}", chrono::Utc::now().timestamp_millis()),
+                        account_id: None,
+                        sender: event.sender.clone(),
+                        reply_target: event.sender.clone(),
+                        content: body.clone(),
+                        channel: "matrix".to_string(),
+                        title: None,
+                        chat_type: ChatType::Group,
+                        raw_chat_type: None,
+                        chat_id: self.room_id.clone(),
+                        thread_id: None,
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    );
+                    });
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());

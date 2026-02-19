@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -117,20 +117,20 @@ impl WhatsAppChannel {
                                 .as_secs()
                         });
 
-                    messages.push(ChannelMessage::new_ingress(
-                        Uuid::new_v4().to_string(),
-                        None,
-                        normalized_from.clone(),
-                        normalized_from.clone(),
+                    messages.push(ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: Uuid::new_v4().to_string(),
+                        account_id: None,
+                        sender: normalized_from.clone(),
+                        reply_target: normalized_from.clone(),
                         content,
-                        "whatsapp",
-                        None,
-                        ChatType::Direct,
-                        None,
-                        normalized_from,
-                        None,
+                        channel: "whatsapp".to_string(),
+                        title: None,
+                        chat_type: ChatType::Direct,
+                        raw_chat_type: None,
+                        chat_id: normalized_from,
+                        thread_id: None,
                         timestamp,
-                    ));
+                    }));
                 }
             }
         }

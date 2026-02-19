@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 
@@ -213,25 +213,25 @@ impl MattermostChannel {
             format!("{}:{}", channel_id, root_id)
         };
 
-        Some(ChannelMessage::new_ingress(
-            format!("mattermost_{id}"),
-            None,
-            user_id.to_string(),
+        Some(ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: format!("mattermost_{id}"),
+            account_id: None,
+            sender: user_id.to_string(),
             reply_target,
-            text.to_string(),
-            "mattermost",
-            None,
-            ChatType::Thread,
-            None,
-            channel_id.to_string(),
-            Some(if root_id.is_empty() {
+            content: text.to_string(),
+            channel: "mattermost".to_string(),
+            title: None,
+            chat_type: ChatType::Thread,
+            raw_chat_type: None,
+            chat_id: channel_id.to_string(),
+            thread_id: Some(if root_id.is_empty() {
                 id.to_string()
             } else {
                 root_id.to_string()
             }),
             #[allow(clippy::cast_sign_loss)]
-            (create_at / 1000) as u64,
-        ))
+            timestamp: (create_at / 1000) as u64,
+        }))
     }
 }
 

@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -349,23 +349,23 @@ impl Channel for QQChannel {
 
                             let chat_id = format!("user:{user_openid}");
 
-                            let channel_msg = ChannelMessage::new_ingress(
-                                Uuid::new_v4().to_string(),
-                                None,
-                                user_openid.to_string(),
-                                chat_id,
-                                content.to_string(),
-                                "qq",
-                                None,
-                                ChatType::Direct,
-                                None,
-                                user_openid.to_string(),
-                                None,
-                                std::time::SystemTime::now()
+                            let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                                id: Uuid::new_v4().to_string(),
+                                account_id: None,
+                                sender: user_openid.to_string(),
+                                reply_target: chat_id,
+                                content: content.to_string(),
+                                channel: "qq".to_string(),
+                                title: None,
+                                chat_type: ChatType::Direct,
+                                raw_chat_type: None,
+                                chat_id: user_openid.to_string(),
+                                thread_id: None,
+                                timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                            );
+                            });
 
                             if tx.send(channel_msg).await.is_err() {
                                 tracing::warn!("QQ: message channel closed");
@@ -393,23 +393,23 @@ impl Channel for QQChannel {
                             let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
                             let chat_id = format!("group:{group_openid}");
 
-                            let channel_msg = ChannelMessage::new_ingress(
-                                Uuid::new_v4().to_string(),
-                                None,
-                                author_id.to_string(),
-                                chat_id,
-                                content.to_string(),
-                                "qq",
-                                None,
-                                ChatType::Group,
-                                None,
-                                group_openid.to_string(),
-                                None,
-                                std::time::SystemTime::now()
+                            let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                                id: Uuid::new_v4().to_string(),
+                                account_id: None,
+                                sender: author_id.to_string(),
+                                reply_target: chat_id,
+                                content: content.to_string(),
+                                channel: "qq".to_string(),
+                                title: None,
+                                chat_type: ChatType::Group,
+                                raw_chat_type: None,
+                                chat_id: group_openid.to_string(),
+                                thread_id: None,
+                                timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                            );
+                            });
 
                             if tx.send(channel_msg).await.is_err() {
                                 tracing::warn!("QQ: message channel closed");

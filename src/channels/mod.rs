@@ -2082,20 +2082,20 @@ mod tests {
     }
 
     fn session_test_message(content: &str, id: &str) -> traits::ChannelMessage {
-        traits::ChannelMessage::new_ingress(
-            id.to_string(),
-            None,
-            "zeroclaw_user",
-            "chat-session",
-            content.to_string(),
-            "test-channel",
-            None,
-            ChatType::Direct,
-            None,
-            "chat-session",
-            None,
-            1,
-        )
+        traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: id.to_string(),
+            account_id: None,
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-session".to_string(),
+            content: content.to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-session".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        })
     }
 
     fn session_runtime_ctx(
@@ -2322,20 +2322,20 @@ mod tests {
 
         process_channel_message(
             runtime_ctx,
-            traits::ChannelMessage::new_ingress(
-                "msg-1",
-                None,
-                "alice",
-                "chat-42",
-                "What is the BTC price now?",
-                "test-channel",
-                None,
-                ChatType::Group,
-                None,
-                "chat-42",
-                None,
-                1,
-            ),
+            traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+                id: "msg-1".to_string(),
+                account_id: None,
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                title: None,
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-42".to_string(),
+                thread_id: None,
+                timestamp: 1,
+            }),
         )
         .await;
 
@@ -2373,20 +2373,20 @@ mod tests {
 
         process_channel_message(
             runtime_ctx,
-            traits::ChannelMessage::new_ingress(
-                "msg-2",
-                None,
-                "bob",
-                "chat-84",
-                "What is the BTC price now?",
-                "test-channel",
-                None,
-                ChatType::Group,
-                None,
-                "chat-84",
-                None,
-                2,
-            ),
+            traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+                id: "msg-2".to_string(),
+                account_id: None,
+                sender: "bob".to_string(),
+                reply_target: "chat-84".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                title: None,
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-84".to_string(),
+                thread_id: None,
+                timestamp: 2,
+            }),
         )
         .await;
 
@@ -2555,20 +2555,20 @@ mod tests {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
-        let msg = traits::ChannelMessage::new_ingress(
-            "msg-3",
-            None,
-            "zeroclaw_user",
-            "chat-168",
-            "current question",
-            "test-channel",
-            None,
-            ChatType::Direct,
-            None,
-            "chat-168",
-            None,
-            3,
-        );
+        let msg = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg-3".to_string(),
+            account_id: None,
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-168".to_string(),
+            content: "current question".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-168".to_string(),
+            thread_id: None,
+            timestamp: 3,
+        });
 
         let session_resolver = SessionResolver::new();
         let session_key = session_resolver.resolve(&normalize_session_context(&msg));
@@ -2629,20 +2629,20 @@ mod tests {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
-        let msg = traits::ChannelMessage::new_ingress(
-            "msg-4",
-            None,
-            "zeroclaw_user",
-            "chat-200",
-            "latest question",
-            "test-channel",
-            None,
-            ChatType::Direct,
-            None,
-            "chat-200",
-            None,
-            4,
-        );
+        let msg = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg-4".to_string(),
+            account_id: None,
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-200".to_string(),
+            content: "latest question".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-200".to_string(),
+            thread_id: None,
+            timestamp: 4,
+        });
 
         let session_resolver = SessionResolver::new();
         let session_key = session_resolver.resolve(&normalize_session_context(&msg));
@@ -2749,20 +2749,20 @@ mod tests {
 
         process_channel_message(
             runtime_ctx,
-            traits::ChannelMessage::new_ingress(
-                "msg-meta",
-                Some("account-main".to_string()),
-                "zeroclaw_user",
-                "chat-meta",
-                "metadata ping",
-                "test-channel",
-                Some("Project Alpha Group".to_string()),
-                ChatType::Group,
-                None,
-                "chat-meta",
-                Some("thread-77".to_string()),
-                5,
-            ),
+            traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+                id: "msg-meta".to_string(),
+                account_id: Some("account-main".to_string()),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-meta".to_string(),
+                content: "metadata ping".to_string(),
+                channel: "test-channel".to_string(),
+                title: Some("Project Alpha Group".to_string()),
+                chat_type: ChatType::Group,
+                raw_chat_type: None,
+                chat_id: "chat-meta".to_string(),
+                thread_id: Some("thread-77".to_string()),
+                timestamp: 5,
+            }),
         )
         .await;
 
@@ -2803,36 +2803,36 @@ mod tests {
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
-        tx.send(traits::ChannelMessage::new_ingress(
-            "1",
-            None,
-            "alice",
-            "alice",
-            "hello",
-            "test-channel",
-            None,
-            ChatType::Direct,
-            None,
-            "alice",
-            None,
-            1,
-        ))
+        tx.send(traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "1".to_string(),
+            account_id: None,
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "alice".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        }))
         .await
         .unwrap();
-        tx.send(traits::ChannelMessage::new_ingress(
-            "2",
-            None,
-            "bob",
-            "bob",
-            "world",
-            "test-channel",
-            None,
-            ChatType::Direct,
-            None,
-            "bob",
-            None,
-            2,
-        ))
+        tx.send(traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "2".to_string(),
+            account_id: None,
+            sender: "bob".to_string(),
+            reply_target: "bob".to_string(),
+            content: "world".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "bob".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        }))
         .await
         .unwrap();
         drop(tx);
@@ -3088,54 +3088,54 @@ mod tests {
 
     #[test]
     fn conversation_memory_key_uses_message_id() {
-        let msg = traits::ChannelMessage::new_ingress(
-            "msg_abc123",
-            None,
-            "U123",
-            "C456",
-            "hello",
-            "slack",
-            None,
-            ChatType::Group,
-            None,
-            "C456",
-            None,
-            1,
-        );
+        let msg = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg_abc123".to_string(),
+            account_id: None,
+            sender: "U123".to_string(),
+            reply_target: "C456".to_string(),
+            content: "hello".to_string(),
+            channel: "slack".to_string(),
+            title: None,
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        });
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
     }
 
     #[test]
     fn conversation_memory_key_is_unique_per_message() {
-        let msg1 = traits::ChannelMessage::new_ingress(
-            "msg_1",
-            None,
-            "U123",
-            "C456",
-            "first",
-            "slack",
-            None,
-            ChatType::Group,
-            None,
-            "C456",
-            None,
-            1,
-        );
-        let msg2 = traits::ChannelMessage::new_ingress(
-            "msg_2",
-            None,
-            "U123",
-            "C456",
-            "second",
-            "slack",
-            None,
-            ChatType::Group,
-            None,
-            "C456",
-            None,
-            2,
-        );
+        let msg1 = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg_1".to_string(),
+            account_id: None,
+            sender: "U123".to_string(),
+            reply_target: "C456".to_string(),
+            content: "first".to_string(),
+            channel: "slack".to_string(),
+            title: None,
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        });
+        let msg2 = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg_2".to_string(),
+            account_id: None,
+            sender: "U123".to_string(),
+            reply_target: "C456".to_string(),
+            content: "second".to_string(),
+            channel: "slack".to_string(),
+            title: None,
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        });
 
         assert_ne!(
             conversation_memory_key(&msg1),
@@ -3148,34 +3148,34 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
 
-        let msg1 = traits::ChannelMessage::new_ingress(
-            "msg_1",
-            None,
-            "U123",
-            "C456",
-            "I'm Paul",
-            "slack",
-            None,
-            ChatType::Group,
-            None,
-            "C456",
-            None,
-            1,
-        );
-        let msg2 = traits::ChannelMessage::new_ingress(
-            "msg_2",
-            None,
-            "U123",
-            "C456",
-            "I'm 45",
-            "slack",
-            None,
-            ChatType::Group,
-            None,
-            "C456",
-            None,
-            2,
-        );
+        let msg1 = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg_1".to_string(),
+            account_id: None,
+            sender: "U123".to_string(),
+            reply_target: "C456".to_string(),
+            content: "I'm Paul".to_string(),
+            channel: "slack".to_string(),
+            title: None,
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        });
+        let msg2 = traits::ChannelMessage::new_ingress(traits::ChannelMessageIngress {
+            id: "msg_2".to_string(),
+            account_id: None,
+            sender: "U123".to_string(),
+            reply_target: "C456".to_string(),
+            content: "I'm 45".to_string(),
+            channel: "slack".to_string(),
+            title: None,
+            chat_type: ChatType::Group,
+            raw_chat_type: None,
+            chat_id: "C456".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        });
 
         mem.store(
             &conversation_memory_key(&msg1),

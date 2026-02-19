@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -37,23 +37,23 @@ impl Channel for CliChannel {
                 break;
             }
 
-            let msg = ChannelMessage::new_ingress(
-                Uuid::new_v4().to_string(),
-                None,
-                "user",
-                "user",
-                line,
-                "cli",
-                None,
-                ChatType::Direct,
-                None,
-                "user",
-                None,
-                std::time::SystemTime::now()
+            let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                id: Uuid::new_v4().to_string(),
+                account_id: None,
+                sender: "user".to_string(),
+                reply_target: "user".to_string(),
+                content: line,
+                channel: "cli".to_string(),
+                title: None,
+                chat_type: ChatType::Direct,
+                raw_chat_type: None,
+                chat_id: "user".to_string(),
+                thread_id: None,
+                timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-            );
+            });
 
             if tx.send(msg).await.is_err() {
                 break;
@@ -106,20 +106,20 @@ mod tests {
 
     #[test]
     fn channel_message_struct() {
-        let msg = ChannelMessage::new_ingress(
-            "test-id",
-            None,
-            "user",
-            "user",
-            "hello",
-            "cli",
-            None,
-            ChatType::Direct,
-            None,
-            "user",
-            None,
-            1_234_567_890,
-        );
+        let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: "test-id".to_string(),
+            account_id: None,
+            sender: "user".to_string(),
+            reply_target: "user".to_string(),
+            content: "hello".to_string(),
+            channel: "cli".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "user".to_string(),
+            thread_id: None,
+            timestamp: 1_234_567_890,
+        });
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
         assert_eq!(msg.reply_target, "user");
@@ -130,20 +130,20 @@ mod tests {
 
     #[test]
     fn channel_message_clone() {
-        let msg = ChannelMessage::new_ingress(
-            "id",
-            None,
-            "s",
-            "s",
-            "c",
-            "ch",
-            None,
-            ChatType::Direct,
-            None,
-            "s",
-            None,
-            0,
-        );
+        let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: "id".to_string(),
+            account_id: None,
+            sender: "s".to_string(),
+            reply_target: "s".to_string(),
+            content: "c".to_string(),
+            channel: "ch".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "s".to_string(),
+            thread_id: None,
+            timestamp: 0,
+        });
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);
         assert_eq!(cloned.content, msg.content);

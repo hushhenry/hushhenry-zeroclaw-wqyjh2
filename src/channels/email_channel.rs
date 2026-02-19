@@ -25,7 +25,7 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,20 +426,20 @@ impl Channel for EmailChannel {
                             }
                             seen.insert(id.clone());
                         } // MutexGuard dropped before await
-                        let msg = ChannelMessage::new_ingress(
+                        let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
                             id,
-                            None,
-                            sender.clone(),
-                            sender.clone(),
+                            account_id: None,
+                            sender: sender.clone(),
+                            reply_target: sender.clone(),
                             content,
-                            "email",
-                            None,
-                            ChatType::Direct,
-                            None,
-                            sender,
-                            None,
-                            ts,
-                        );
+                            channel: "email".to_string(),
+                            title: None,
+                            chat_type: ChatType::Direct,
+                            raw_chat_type: None,
+                            chat_id: sender,
+                            thread_id: None,
+                            timestamp: ts,
+                        });
                         if tx.send(msg).await.is_err() {
                             return Ok(());
                         }

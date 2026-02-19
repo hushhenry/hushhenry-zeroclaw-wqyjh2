@@ -708,7 +708,7 @@ async fn handle_whatsapp_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::traits::{ChannelMessage, ChatType};
+    use crate::channels::traits::{ChannelMessage, ChannelMessageIngress, ChatType};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use async_trait::async_trait;
@@ -826,20 +826,20 @@ mod tests {
 
     #[test]
     fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage::new_ingress(
-            "wamid-123",
-            None,
-            "+1234567890",
-            "+1234567890",
-            "hello",
-            "whatsapp",
-            None,
-            ChatType::Direct,
-            None,
-            "+1234567890",
-            None,
-            1,
-        );
+        let msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: "wamid-123".to_string(),
+            account_id: None,
+            sender: "+1234567890".to_string(),
+            reply_target: "+1234567890".to_string(),
+            content: "hello".to_string(),
+            channel: "whatsapp".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "+1234567890".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        });
 
         let key = whatsapp_memory_key(&msg);
         assert_eq!(key, "whatsapp_+1234567890_wamid-123");

@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChannelMessageIngress, ChatType, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -403,31 +403,31 @@ impl Channel for DiscordChannel {
                         ChatType::Direct
                     };
 
-                    let channel_msg = ChannelMessage::new_ingress(
-                        if message_id.is_empty() {
+                    let channel_msg = ChannelMessage::new_ingress(ChannelMessageIngress {
+                        id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
                         } else {
                             format!("discord_{message_id}")
                         },
-                        None,
-                        author_id.to_string(),
-                        if channel_id.is_empty() {
+                        account_id: None,
+                        sender: author_id.to_string(),
+                        reply_target: if channel_id.is_empty() {
                             author_id.to_string()
                         } else {
                             channel_id.clone()
                         },
-                        clean_content,
-                        channel_id,
-                        None,
+                        content: clean_content,
+                        channel: channel_id,
+                        title: None,
                         chat_type,
-                        None,
+                        raw_chat_type: None,
                         chat_id,
-                        None,
-                        std::time::SystemTime::now()
+                        thread_id: None,
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    );
+                    });
 
                     if tx.send(channel_msg).await.is_err() {
                         break;

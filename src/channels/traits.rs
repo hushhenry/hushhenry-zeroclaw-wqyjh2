@@ -37,39 +37,43 @@ pub struct ChannelMessage {
     pub timestamp: u64,
 }
 
+/// Metadata for creating a new ingress message.
+/// Used to decouple the transport layer from logical routing (agent_id).
+#[derive(Debug, Clone)]
+pub struct ChannelMessageIngress {
+    pub id: String,
+    pub account_id: Option<String>,
+    pub sender: String,
+    pub reply_target: String,
+    pub content: String,
+    pub channel: String,
+    pub title: Option<String>,
+    pub chat_type: ChatType,
+    pub raw_chat_type: Option<String>,
+    pub chat_id: String,
+    pub thread_id: Option<String>,
+    pub timestamp: u64,
+}
+
 impl ChannelMessage {
-    /// Builds a message for channel ingress. Agent routing is not set here;
-    /// the session/router layer assigns `agent_id` when resolving the route.
-    /// `account_id` can be provided if the adapter knows which account received the message.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_ingress(
-        id: impl Into<String>,
-        account_id: Option<String>,
-        sender: impl Into<String>,
-        reply_target: impl Into<String>,
-        content: impl Into<String>,
-        channel: impl Into<String>,
-        title: Option<String>,
-        chat_type: ChatType,
-        raw_chat_type: Option<String>,
-        chat_id: impl Into<String>,
-        thread_id: Option<String>,
-        timestamp: u64,
-    ) -> Self {
+    /// Builds a message for channel ingress from explicit ingress metadata.
+    /// Agent routing is not set here; the session/router layer assigns `agent_id`
+    /// when resolving the route.
+    pub fn new_ingress(ingress: ChannelMessageIngress) -> Self {
         Self {
-            id: id.into(),
+            id: ingress.id,
             agent_id: None,
-            account_id,
-            sender: sender.into(),
-            reply_target: reply_target.into(),
-            content: content.into(),
-            channel: channel.into(),
-            title,
-            chat_type,
-            raw_chat_type,
-            chat_id: chat_id.into(),
-            thread_id,
-            timestamp,
+            account_id: ingress.account_id,
+            sender: ingress.sender,
+            reply_target: ingress.reply_target,
+            content: ingress.content,
+            channel: ingress.channel,
+            title: ingress.title,
+            chat_type: ingress.chat_type,
+            raw_chat_type: ingress.raw_chat_type,
+            chat_id: ingress.chat_id,
+            thread_id: ingress.thread_id,
+            timestamp: ingress.timestamp,
         }
     }
 
@@ -160,20 +164,20 @@ mod tests {
             &self,
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         ) -> anyhow::Result<()> {
-            tx.send(ChannelMessage::new_ingress(
-                "1",
-                None,
-                "tester",
-                "tester",
-                "hello",
-                "dummy",
-                None,
-                ChatType::Direct,
-                None,
-                "tester",
-                None,
-                123,
-            ))
+            tx.send(ChannelMessage::new_ingress(ChannelMessageIngress {
+                id: "1".into(),
+                account_id: None,
+                sender: "tester".into(),
+                reply_target: "tester".into(),
+                content: "hello".into(),
+                channel: "dummy".into(),
+                title: None,
+                chat_type: ChatType::Direct,
+                raw_chat_type: None,
+                chat_id: "tester".into(),
+                thread_id: None,
+                timestamp: 123,
+            }))
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
@@ -181,20 +185,20 @@ mod tests {
 
     #[test]
     fn channel_message_clone_preserves_fields() {
-        let message = ChannelMessage::new_ingress(
-            "42",
-            None,
-            "alice",
-            "alice",
-            "ping",
-            "dummy",
-            Some("Example Chat".into()),
-            ChatType::Direct,
-            None,
-            "alice",
-            None,
-            999,
-        );
+        let message = ChannelMessage::new_ingress(ChannelMessageIngress {
+            id: "42".into(),
+            account_id: None,
+            sender: "alice".into(),
+            reply_target: "alice".into(),
+            content: "ping".into(),
+            channel: "dummy".into(),
+            title: Some("Example Chat".into()),
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "alice".into(),
+            thread_id: None,
+            timestamp: 999,
+        });
 
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
