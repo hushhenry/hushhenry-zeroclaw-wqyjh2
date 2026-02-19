@@ -155,45 +155,92 @@ This is intentionally not “raw forward of child reply”.
 
 ---
 
-## 6. Announce Message Format (Best Practice)
+## 6. Announce Format (Best Practice: **B = semantic payload in meta**, session stays clean)
 
-We need a format that is:
+We intentionally **do not** persist large “memory/recall-like” context blocks inside session history.
+In a multi-agent system, child→parent handoff must avoid transcript bloat and keep turns stable.
 
-- LLM-readable
-- Human-auditable
-- Robust against role/protocol confusion
-- Rich enough for orchestration
+Therefore we choose best practice **B**:
 
-Recommended message template:
+- The **persisted** message in the parent session may be short (even `finish`),
+- while the **semantic payload** (task + result summary + identifiers) lives in `meta_json`.
+- During the *next* parent agent turn, the runtime may render a compact, ephemeral context block
+  from this meta (for the model), but **must not** write that rendered block back into session history.
+
+### 6.1 Persisted parent-session message (minimal)
+
+Recommended persisted content (user-role injection):
+
+- `[@agent:<name>#<agent_id>] finish`
+
+Keep it short. The point is to record **that** a child completed, not to store the whole report inline.
+
+### 6.2 Semantic payload (meta_json)
+
+Attach a structured payload to the injected message:
+
+```json
+{
+  "internal": true,
+  "kind": "subagent_announce",
+  "trace_id": "...",
+  "hop": 0,
+  "idempotency_key": "announce:...",
+
+  "source_agent_id": "agt_...",
+  "source_agent_name": "coder",
+  "source_session_key": "session:child...",
+  "source_run_id": "run_...",
+
+  "task": {
+    "label": "<label>",
+    "prompt": "<original task prompt or compact summary>",
+    "tags": ["project:x", "topic:y"]
+  },
+  "result": {
+    "status": "ok|error|timeout|unknown",
+    "summary": "<200-800 chars>",
+    "artifacts": [
+      {"kind": "file", "path": "docs/out.md"},
+      {"kind": "commit", "sha": "..."}
+    ]
+  },
+  "stats": {
+    "duration_ms": 1234,
+    "tokens": null,
+    "cost_usd": null
+  }
+}
+```
+
+Notes:
+- `result.summary` is the **semantic anchor** for recall/query building; never rely on the persisted text
+  (e.g. `finish`) for retrieval.
+- `artifacts[]` are stable anchors (paths/commit shas) and should be preferred when available.
+
+### 6.3 Ephemeral rendering (for the *next* turn only)
+
+When building the next parent prompt, the runtime may render a compact block:
 
 ```
-[@agent:<name>#<agent_id>] Child task "<label>" completed: <status>
-
-Result:
-<child_findings>
-
-Stats:
-- child_session: <child_session_key>
-- run_id: <run_id>
-- duration_ms: <n>
-- tokens/cost: <optional>
-
-Next step instruction:
-- Summarize for the user
-- Ask a follow-up question if needed
+[Context: subagent_announce]
+From: <name>#<id>
+Task: <label>
+Result: <summary>
+Artifacts: <paths/shas>
+[/Context]
 ```
 
-### Provenance metadata
+Hard rule: **Never persist this rendered context block into session history.**
 
-In addition to the visible prefix, attach meta fields:
+### 6.4 Provenance / delivery semantics
 
-- `internal: true`
-- `kind: "subagent_announce"`
-- `source_agent_id`
-- `source_session_key`
-- `trace_id`
-- `hop`
-- `idempotency_key`
+The injected message must set:
+
+- `channel = INTERNAL_MESSAGE_CHANNEL`
+- `deliver = false` (default)
+
+External delivery is only allowed if explicitly requested and must obey deliver gating.
 
 ---
 
