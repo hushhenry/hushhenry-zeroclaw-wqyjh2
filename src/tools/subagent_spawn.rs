@@ -59,6 +59,24 @@ impl Tool for SubagentSpawnTool {
 
         let store = SessionStore::new(&self.config.workspace_dir)?;
         
+        let (parent_hop, parent_trace_id) = if let Some(psid) = parent_session_id {
+            if let Ok(Some(meta)) = store.load_route_metadata(&crate::session::SessionId::from_string(psid)) {
+                (meta.hop, meta.trace_id)
+            } else {
+                (0, None)
+            }
+        } else {
+            (0, None)
+        };
+
+        if parent_hop >= 10 {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Subagent hop limit reached (max 10)".to_string()),
+            });
+        }
+
         // Create a unique session key for the child. 
         // For simplicity, we use a random key prefixed with 'subagent:'
         let child_key = SessionKey::new(format!("subagent:{}", uuid::Uuid::new_v4()));
@@ -75,6 +93,8 @@ impl Tool for SubagentSpawnTool {
             sender_id: parent_session_id.unwrap_or("parent").to_string(),
             title: Some(label.to_string()),
             deliver: false,
+            hop: parent_hop + 1,
+            trace_id: parent_trace_id,
         };
         store.upsert_route_metadata(&child_session_id, &metadata)?;
 

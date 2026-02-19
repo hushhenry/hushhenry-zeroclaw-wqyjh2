@@ -753,6 +753,8 @@ fn build_route_metadata(msg: &traits::ChannelMessage) -> SessionRouteMetadata {
         sender_id: msg.sender.clone(),
         title: msg.title.clone(),
         deliver: msg.channel != INTERNAL_MESSAGE_CHANNEL,
+        hop: 0,
+        trace_id: Some(msg.id.clone()),
     }
 }
 
@@ -1303,6 +1305,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                                     if let Some(parent_session_id) = parent_info.get("parent_session_id").and_then(|v| v.as_str()) {
                                         let agent_name = meta.agent_id.as_deref().unwrap_or("subagent");
                                         let announce_msg = format!("[@agent:{agent_name}] finish");
+                                        let idempotency_key = format!("announce:{}:{}", session_id.as_str(), parent_session_id);
                                         let announce_meta = json!({
                                             "task": meta.title,
                                             "result": {
@@ -1312,11 +1315,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                                             "source": {
                                                 "agent_id": meta.agent_id,
                                                 "child_session_id": session_id.as_str()
-                                            }
+                                            },
+                                            "trace_id": meta.trace_id,
+                                            "hop": meta.hop,
+                                            "idempotency_key": idempotency_key
                                         });
                                         
+                                        let parent_sid = SessionId::from_string(parent_session_id.to_string());
+                                        
+                                        // Check if this message was already announced (basic idempotency)
+                                        // This is a naive check by scanning recent messages or using a separate table.
+                                        // For Milestone 5, we'll just append it. In a real system, we'd check idempotency_key.
+                                        
                                         if let Err(e) = session_store.append_message(
-                                            &SessionId::from_string(parent_session_id.to_string()),
+                                            &parent_sid,
                                             "user",
                                             &announce_msg,
                                             Some(&announce_meta.to_string())

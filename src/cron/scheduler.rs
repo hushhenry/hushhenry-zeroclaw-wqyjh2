@@ -801,6 +801,8 @@ mod tests {
                     sender_id: "user-x".into(),
                     title: None,
                     deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
@@ -858,6 +860,8 @@ mod tests {
                     sender_id: "ou_test".into(),
                     title: None,
                     deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();

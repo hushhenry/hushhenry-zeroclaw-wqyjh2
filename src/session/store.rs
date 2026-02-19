@@ -90,6 +90,8 @@ pub struct SessionRouteMetadata {
     pub sender_id: String,
     pub title: Option<String>,
     pub deliver: bool,
+    pub hop: u32,
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -481,7 +483,9 @@ impl SessionStore {
 
         if version < 6 {
             conn.execute_batch(
-                "ALTER TABLE session_meta ADD COLUMN deliver INTEGER NOT NULL DEFAULT 1;",
+                "ALTER TABLE session_meta ADD COLUMN deliver INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE session_meta ADD COLUMN hop INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session_meta ADD COLUMN trace_id TEXT;",
             )
             .context("Failed to apply sessions schema migration v6")?;
             conn.pragma_update(None, "user_version", 6_i64)
@@ -600,9 +604,9 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO session_meta (
                 session_id, agent_id, channel, account_id, chat_type, chat_id, route_id,
-                sender_id, title, deliver, created_at, updated_at, last_seen_at
+                sender_id, title, deliver, hop, trace_id, created_at, updated_at, last_seen_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13)
              ON CONFLICT(session_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 channel = excluded.channel,
@@ -613,6 +617,8 @@ impl SessionStore {
                 sender_id = excluded.sender_id,
                 title = excluded.title,
                 deliver = excluded.deliver,
+                hop = excluded.hop,
+                trace_id = excluded.trace_id,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at",
             params![
@@ -626,6 +632,8 @@ impl SessionStore {
                 metadata.sender_id.as_str(),
                 metadata.title.as_deref(),
                 if metadata.deliver { 1_i64 } else { 0_i64 },
+                i64::from(metadata.hop),
+                metadata.trace_id.as_deref(),
                 now,
             ],
         )
@@ -639,7 +647,7 @@ impl SessionStore {
     ) -> Result<Option<SessionRouteMetadata>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver
+            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver, hop, trace_id
              FROM session_meta
              WHERE session_id = ?1",
             params![session_id.as_str()],
@@ -654,6 +662,9 @@ impl SessionStore {
                     sender_id: row.get(6)?,
                     title: row.get(7)?,
                     deliver: row.get::<_, i64>(8)? != 0,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    hop: row.get::<_, i64>(9)? as u32,
+                    trace_id: row.get(10)?,
                 })
             },
         )
@@ -2203,6 +2214,8 @@ mod tests {
                     sender_id: "user-a".into(),
                     title: Some("Engineering Group".into()),
                     deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
@@ -2223,6 +2236,8 @@ mod tests {
                     sender_id: "user-b".into(),
                     title: Some("operations group".into()),
                     deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
@@ -2257,6 +2272,8 @@ mod tests {
                     sender_id: "user-1".into(),
                     title: Some("Ops".into()),
                     deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
