@@ -544,12 +544,14 @@ impl Default for BrowserConfig {
 
 // ── HTTP request tool ───────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
     pub enabled: bool,
-    /// Allowed domains for HTTP requests (exact or subdomain match)
+    /// Allowed domains for HTTP requests (exact or subdomain match).
+    ///
+    /// Special value: "*" allows any **public** host (private/local hosts are still blocked).
     #[serde(default)]
     pub allowed_domains: Vec<String>,
     /// Maximum response size in bytes (default: 1MB)
@@ -566,6 +568,19 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        // User preference: allow network requests by default.
+        // Note: private/local hosts remain blocked in the http_request tool.
+        Self {
+            enabled: true,
+            allowed_domains: vec!["*".to_string()],
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
+        }
+    }
 }
 
 // ── Memory ───────────────────────────────────────────────────

@@ -368,6 +368,11 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    // Wildcard: allow any public host.
+    if allowed_domains.iter().any(|d| d.trim() == "*") {
+        return true;
+    }
+
     allowed_domains.iter().any(|domain| {
         host == domain
             || host
