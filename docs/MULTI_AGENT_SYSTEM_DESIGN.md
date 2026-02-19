@@ -224,6 +224,16 @@ This is the review checklist: each item should have tests and clear diffs.
 
 ## 7. Detailed Implementation Plan
 
+### 7.1 Consistency checklist (use this to prevent stale sections)
+
+Before shipping any milestone, scan the RFC for:
+
+- **SQLite-only memory**: no markdown backend references or behavior dependencies.
+- **Announce = meta_json payload (B)**: parent transcript stays minimal; semantics are in `meta_json`.
+- **Ephemeral context**: any context blocks rendered from recall/announce meta are runtime-only (not persisted as messages).
+- **Queue semantics = steer-backlog only**: no extra queue modes described.
+- **Milestones match decisions**: acceptance criteria do not contradict the above.
+
 Each milestone should be shippable and reviewable.
 
 ### Milestone 0 — sqlite‑only memory (complexity reduction)
@@ -234,10 +244,11 @@ Tasks:
 2) remove/deprecate markdown memory code paths
 3) optional: `memory export` tooling
 
-Acceptance:
+Acceptance tests (behavior-level):
 
-- all tests pass with sqlite‑only
-- no runtime references to markdown backend
+- Program starts with sqlite backend as the only memory backend.
+- All tests pass with sqlite-only.
+- No runtime flags/config paths reference markdown memory.
 
 ### Milestone 1 — AgentSpec registry + session switching
 
@@ -248,10 +259,12 @@ Tasks:
 3) commands: `/agents`, `/agent`, `/models`, `/model`
 4) turn resolution: session → AgentSpec → effective model/tools/skills/context
 
-Acceptance:
+Acceptance tests (behavior-level):
 
-- can switch active agent per session
-- switching changes model/tools exposure for subsequent turns
+- `/agents` lists AgentSpecs and shows current session active agent.
+- `/agent <id|name>` switches `active_agent_id` for the session (exact match).
+- After switching, subsequent turns use the new AgentSpec's model/tool surface.
+- `/models` lists models; `/model <provider>/<model>` overrides session default for subsequent turns.
 
 ### Milestone 2 — Skills & tools filtering (make agents real)
 
@@ -260,10 +273,11 @@ Tasks:
 1) system prompt: inject only allowed skills
 2) tool registry: register only allowed tools
 
-Acceptance:
+Acceptance tests (behavior-level):
 
-- disallowed tools cannot be called
-- switching agent changes the exposed skill/tool surface
+- Switching agents changes the visible skill list and the callable tool set.
+- A disallowed tool call is rejected (or the tool is absent) even if the model attempts it.
+- Skill injection and tool registration are consistent (no "listed but unusable" or "hidden but callable").
 
 ### Milestone 3 — steer‑backlog correctness
 
@@ -274,10 +288,13 @@ Tasks:
 3) backlog resume token: interrupted task continues after steered turn
 4) backlog drain: merged into a single `[Backlog]...` user message
 
-Acceptance:
+Acceptance tests (behavior-level):
 
-- long tool loop can be interrupted
-- old task resumes after responding
+- Start a long-running request that requires many tool calls.
+- While the tool loop is active, send a new user message:
+  - the runtime steers to handle the new message at the next safe boundary.
+  - the interrupted work is preserved via a backlog resume token.
+- After responding to the new message, the original task resumes from backlog and completes.
 
 ### Milestone 4 — Subagents as child sessions + announce meta payload (B)
 
@@ -290,10 +307,12 @@ Tasks:
    - attach semantic payload in meta_json
 4) parent consumes announce meta as ephemeral context next turn
 
-Acceptance:
+Acceptance tests (behavior-level):
 
-- parent can spawn N subagents in parallel
-- results return without external delivery
+- Parent can spawn N subagent sessions in parallel.
+- Child sessions do not deliver externally by default.
+- Each child completion produces a minimal parent-session message plus `meta_json` payload (task/result/artifacts).
+- Parent can synthesize a user-visible response using those announce payloads without persisting any rendered context blocks into the transcript.
 
 ### Milestone 5 — Hardening (idempotency/TTL/observability)
 
