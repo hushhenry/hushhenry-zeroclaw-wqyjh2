@@ -586,7 +586,7 @@ mod tests {
         });
 
         let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
+            backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
@@ -628,7 +628,7 @@ mod tests {
         });
 
         let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
+            backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(

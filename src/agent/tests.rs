@@ -252,7 +252,7 @@ impl Tool for CountingTool {
 
 fn make_memory() -> Arc<dyn Memory> {
     let cfg = MemoryConfig {
-        backend: "none".into(),
+        backend: "sqlite".into(),
         ..MemoryConfig::default()
     };
     Arc::from(memory::create_memory(&cfg, std::path::Path::new("/tmp"), None).unwrap())

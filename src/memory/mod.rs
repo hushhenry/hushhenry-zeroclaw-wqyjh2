@@ -2,9 +2,6 @@ pub mod backend;
 pub mod chunker;
 pub mod embeddings;
 pub mod hygiene;
-pub mod lucid;
-pub mod markdown;
-pub mod none;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -16,9 +13,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
-pub use lucid::LucidMemory;
-pub use markdown::MarkdownMemory;
-pub use none::NoneMemory;
+
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
@@ -29,33 +24,12 @@ use crate::config::MemoryConfig;
 use std::path::Path;
 use std::sync::Arc;
 
-fn create_memory_with_sqlite_builder<F>(
-    backend_name: &str,
-    workspace_dir: &Path,
-    mut sqlite_builder: F,
-    unknown_context: &str,
-) -> anyhow::Result<Box<dyn Memory>>
-where
-    F: FnMut() -> anyhow::Result<SqliteMemory>,
-{
-    match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
-        MemoryBackendKind::Lucid => {
-            let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new(workspace_dir, local)))
-        }
-        MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
-        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
-        MemoryBackendKind::Unknown => {
-            tracing::warn!(
-                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
-            );
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
-        }
-    }
-}
-
-/// Factory: create the right memory backend from config
+/// Factory: create memory backend from config.
+///
+/// Milestone 0 decision: **sqlite-only**.
+///
+/// The `backend` field in config is treated as a compatibility input; the
+/// runtime always constructs SQLite-backed memory.
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
@@ -75,13 +49,7 @@ pub fn create_memory(
 
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
-    if config.auto_hydrate
-        && matches!(
-            classify_memory_backend(&config.backend),
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
-        && snapshot::should_hydrate(workspace_dir)
-    {
+    if config.auto_hydrate && snapshot::should_hydrate(workspace_dir) {
         tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
         match snapshot::hydrate_from_snapshot(workspace_dir) {
             Ok(count) => {
@@ -95,54 +63,44 @@ pub fn create_memory(
         }
     }
 
-    fn build_sqlite_memory(
-        config: &MemoryConfig,
-        workspace_dir: &Path,
-        api_key: Option<&str>,
-    ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &config.embedding_provider,
-                api_key,
-                &config.embedding_model,
-                config.embedding_dimensions,
-            ));
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
-            workspace_dir,
-            embedder,
-            config.vector_weight as f32,
-            config.keyword_weight as f32,
-            config.embedding_cache_size,
-        )?;
-        Ok(mem)
+    // Warn (once per call) if user configured a non-sqlite backend.
+    let configured = config.backend.trim();
+    if !configured.is_empty() && configured != "sqlite" {
+        tracing::warn!(
+            "memory.backend is '{configured}', but Zeroclaw is sqlite-only; using sqlite"
+        );
     }
 
-    create_memory_with_sqlite_builder(
-        &config.backend,
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+        Arc::from(embeddings::create_embedding_provider(
+            &config.embedding_provider,
+            api_key,
+            &config.embedding_model,
+            config.embedding_dimensions,
+        ));
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mem = SqliteMemory::with_embedder(
         workspace_dir,
-        || build_sqlite_memory(config, workspace_dir, api_key),
-        "",
-    )
+        embedder,
+        config.vector_weight as f32,
+        config.keyword_weight as f32,
+        config.embedding_cache_size,
+    )?;
+
+    Ok(Box::new(mem))
 }
 
 pub fn create_memory_for_migration(
     backend: &str,
     workspace_dir: &Path,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
-        anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
+    if backend.trim() != "sqlite" {
+        tracing::warn!(
+            "memory backend '{backend}' requested for migration, but Zeroclaw is sqlite-only; using sqlite"
         );
     }
-
-    create_memory_with_sqlite_builder(
-        backend,
-        workspace_dir,
-        || SqliteMemory::new(workspace_dir),
-        " during migration",
-    )
+    Ok(Box::new(SqliteMemory::new(workspace_dir)?))
 }
 
 /// Factory: create an optional response cache from config.
@@ -177,7 +135,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn factory_sqlite() {
+    fn factory_sqlite_only() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "sqlite".into(),
@@ -185,65 +143,12 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
-    }
 
-    #[test]
-    fn factory_markdown() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
+        let cfg2 = MemoryConfig {
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "markdown");
-    }
-
-    #[test]
-    fn factory_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "lucid".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
-    fn factory_none_uses_noop_memory() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "none".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "none");
-    }
-
-    #[test]
-    fn factory_unknown_falls_back_to_markdown() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "redis".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "markdown");
-    }
-
-    #[test]
-    fn migration_factory_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
-    fn migration_factory_none_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let error = create_memory_for_migration("none", tmp.path())
-            .err()
-            .expect("backend=none should be rejected for migration");
-        assert!(error.to_string().contains("disables persistence"));
+        let mem2 = create_memory(&cfg2, tmp.path(), None).unwrap();
+        assert_eq!(mem2.name(), "sqlite");
     }
 }

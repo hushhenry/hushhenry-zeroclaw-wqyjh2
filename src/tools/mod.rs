@@ -309,7 +309,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
@@ -355,7 +355,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
@@ -494,7 +494,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
@@ -550,7 +550,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =

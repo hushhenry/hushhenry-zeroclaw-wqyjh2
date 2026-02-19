@@ -573,7 +573,7 @@ fn default_http_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// Memory backend key (sqlite-only; other values are accepted for compatibility but ignored).
     pub backend: String,
     /// Auto-save conversation context to memory
     pub auto_save: bool,
