@@ -127,7 +127,6 @@ pub fn run_wizard() -> Result<Config> {
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        agents: std::collections::HashMap::new(),
     };
 
     println!(
@@ -343,7 +342,6 @@ pub fn run_quick_setup(
         http_request: crate::config::HttpRequestConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
-        agents: std::collections::HashMap::new(),
     };
 
     config.save()?;

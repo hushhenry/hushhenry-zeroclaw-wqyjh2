@@ -1,4 +1,2 @@
-pub mod runtime;
-
-#[allow(unused_imports)]
-pub use runtime::{EnqueueSubagentRunRequest, SubagentRuntime};
+// Placeholder for subagent logic.
+// In the new architecture, subagents are simply child sessions.

@@ -92,6 +92,7 @@ pub struct SessionRouteMetadata {
     pub deliver: bool,
     pub hop: u32,
     pub trace_id: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,21 +108,12 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 6;
+const SESSION_SCHEMA_VERSION: i64 = 7;
 
 /// Session state key for the active AgentSpec id (or name) driving this session's turns.
 pub const SESSION_STATE_ACTIVE_AGENT_ID: &str = "active_agent_id";
 /// Session state key for model override: "provider/model" (e.g. "openai/gpt-4o").
 pub const SESSION_STATE_MODEL_OVERRIDE: &str = "model_override";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SubagentRunStatus {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-    Canceled,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExecRunStatus {
@@ -159,49 +151,6 @@ impl ExecRunStatus {
     }
 }
 
-impl SubagentRunStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-        }
-    }
-
-#[allow(clippy::should_implement_trait)]
-    pub fn from_str_opt(status: &str) -> Option<Self> {
-        match status {
-            "queued" => Some(Self::Queued),
-            "running" => Some(Self::Running),
-            "succeeded" => Some(Self::Succeeded),
-            "failed" => Some(Self::Failed),
-            "canceled" => Some(Self::Canceled),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentSession {
-    pub subagent_session_id: String,
-    pub spec_id: Option<String>,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub meta_json: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentSpec {
-    pub spec_id: String,
-    pub name: String,
-    pub config_json: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// AgentSpec registry row (multi-agent session switching).
 #[derive(Debug, Clone)]
 pub struct AgentSpec {
@@ -209,21 +158,6 @@ pub struct AgentSpec {
     pub name: String,
     pub config_json: String,
     pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentRun {
-    pub run_id: String,
-    pub subagent_session_id: String,
-    pub status: String,
-    pub prompt: String,
-    pub input_json: Option<String>,
-    pub output_json: Option<String>,
-    pub error_message: Option<String>,
-    pub queued_at: String,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -493,6 +427,19 @@ impl SessionStore {
             version = 6;
         }
 
+        if version < 7 {
+            conn.execute_batch(
+                "ALTER TABLE session_meta ADD COLUMN parent_session_id TEXT;
+                 DROP TABLE IF EXISTS subagent_runs;
+                 DROP TABLE IF EXISTS subagent_sessions;
+                 DROP TABLE IF EXISTS subagent_specs;",
+            )
+            .context("Failed to apply sessions schema migration v7")?;
+            conn.pragma_update(None, "user_version", 7_i64)
+                .context("Failed to set sessions schema version to 7")?;
+            version = 7;
+        }
+
         if version != SESSION_SCHEMA_VERSION {
             bail!(
                 "Unsupported sessions schema version {}, expected {}",
@@ -604,9 +551,9 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO session_meta (
                 session_id, agent_id, channel, account_id, chat_type, chat_id, route_id,
-                sender_id, title, deliver, hop, trace_id, created_at, updated_at, last_seen_at
+                sender_id, title, deliver, hop, trace_id, parent_session_id, created_at, updated_at, last_seen_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?14)
              ON CONFLICT(session_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 channel = excluded.channel,
@@ -619,6 +566,7 @@ impl SessionStore {
                 deliver = excluded.deliver,
                 hop = excluded.hop,
                 trace_id = excluded.trace_id,
+                parent_session_id = excluded.parent_session_id,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at",
             params![
@@ -634,6 +582,7 @@ impl SessionStore {
                 if metadata.deliver { 1_i64 } else { 0_i64 },
                 i64::from(metadata.hop),
                 metadata.trace_id.as_deref(),
+                metadata.parent_session_id.as_deref(),
                 now,
             ],
         )
@@ -647,7 +596,7 @@ impl SessionStore {
     ) -> Result<Option<SessionRouteMetadata>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver, hop, trace_id
+            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver, hop, trace_id, parent_session_id
              FROM session_meta
              WHERE session_id = ?1",
             params![session_id.as_str()],
@@ -665,6 +614,7 @@ impl SessionStore {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     hop: row.get::<_, i64>(9)? as u32,
                     trace_id: row.get(10)?,
+                    parent_session_id: row.get(11)?,
                 })
             },
         )

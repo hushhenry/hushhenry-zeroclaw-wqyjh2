@@ -85,39 +85,6 @@ pub struct Config {
 
     #[serde(default)]
     pub cost: CostConfig,
-
-    /// Legacy delegate agent configurations.
-    /// Deprecated: entries are mapped into subagent specs for compatibility.
-    #[serde(default)]
-    pub agents: HashMap<String, DelegateAgentConfig>,
-}
-
-// ── Delegate Agents ──────────────────────────────────────────────
-
-/// Configuration for a legacy delegate agent entry in config.
-/// Deprecated: parsed for compatibility and mapped to subagent specs at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
-    pub provider: String,
-    /// Model name
-    pub model: String,
-    /// Optional system prompt for the sub-agent
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    /// Optional API key override
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Temperature override
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    /// Max recursion depth for nested delegation
-    #[serde(default = "default_max_depth")]
-    pub max_depth: u32,
-}
-
-fn default_max_depth() -> u32 {
-    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2229,7 +2196,6 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
             queue: QueueConfig::default(),
         };
 
@@ -2337,7 +2303,6 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
             queue: QueueConfig::default(),
         };
 

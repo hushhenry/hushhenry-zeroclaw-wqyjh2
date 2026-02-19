@@ -124,7 +124,6 @@ enum SlashCommand {
     New,
     Compact,
     Queue { mode: Option<String> },
-    Subagents,
     Sessions,
     Agents,
     Agent { id_or_name: Option<String> },
@@ -147,7 +146,6 @@ fn parse_slash_command(content: &str) -> Option<SlashCommand> {
         "/queue" => Some(SlashCommand::Queue {
             mode: parts.next().map(str::to_string),
         }),
-        "/subagents" => Some(SlashCommand::Subagents),
         "/sessions" => Some(SlashCommand::Sessions),
         "/agents" => Some(SlashCommand::Agents),
         "/agent" => Some(SlashCommand::Agent {
@@ -444,42 +442,6 @@ async fn handle_slash_command(
                 .await;
             }
         },
-        SlashCommand::Subagents => {
-            let specs = session_store
-                .list_subagent_specs(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
-            let sessions = session_store
-                .list_subagent_sessions(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
-            let runs = session_store
-                .list_subagent_runs(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
-
-            let mut text = String::new();
-            let _ = writeln!(text, "Subagents");
-            let _ = writeln!(text, "specs: {}", specs.len());
-            for spec in specs.iter().take(5) {
-                let _ = writeln!(text, "- {} ({})", spec.name, spec.spec_id);
-            }
-            let _ = writeln!(text, "sessions: {}", sessions.len());
-            for session in sessions.iter().take(5) {
-                let _ = writeln!(
-                    text,
-                    "- {} [{}]",
-                    session.subagent_session_id, session.status
-                );
-            }
-            let _ = writeln!(text, "runs: {}", runs.len());
-            for run in runs.iter().take(5) {
-                let _ = writeln!(
-                    text,
-                    "- {} [{}] session={}",
-                    run.run_id, run.status, run.subagent_session_id
-                );
-            }
-
-            send_command_response(target_channel, &msg.reply_target, text.trim().to_string()).await;
-        }
         SlashCommand::Sessions => match session_store.get_or_create_active(session_key) {
             Ok(current_session_id) => {
                 let sessions = session_store
@@ -2130,7 +2092,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.browser,
         &config.http_request,
         &workspace,
-        &config.agents,
         config.api_key.as_deref(),
         &config,
         None,
@@ -2621,10 +2582,6 @@ mod tests {
             Some(SlashCommand::Queue { mode: None })
         );
         assert_eq!(
-            parse_slash_command("/subagents"),
-            Some(SlashCommand::Subagents)
-        );
-        assert_eq!(
             parse_slash_command("/sessions"),
             Some(SlashCommand::Sessions)
         );
@@ -2752,41 +2709,6 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains(session_id.as_str()));
         assert!(sent[0].contains("Sessions for key"));
-    }
-
-    #[tokio::test]
-    async fn command_subagents_lists_specs_sessions_and_runs() {
-        let temp = TempDir::new().unwrap();
-        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let spec = session_store
-            .upsert_subagent_spec("reviewer", r#"{"model":"test"}"#)
-            .unwrap();
-        let subagent_session = session_store
-            .create_subagent_session(Some(spec.spec_id.as_str()), None)
-            .unwrap();
-        let _run = session_store
-            .enqueue_subagent_run(
-                subagent_session.subagent_session_id.as_str(),
-                "check code",
-                None,
-            )
-            .unwrap();
-
-        process_channel_message(
-            session_runtime_ctx(session_store, channel),
-            session_test_message("/subagents", "cmd-subagents"),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Subagents"));
-        assert!(sent[0].contains("specs: 1"));
-        assert!(sent[0].contains("sessions: 1"));
-        assert!(sent[0].contains("runs: 1"));
     }
 
     #[tokio::test]
