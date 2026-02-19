@@ -265,15 +265,33 @@ Even with lane concurrency, enforce:
 
 - **At most 1 active agent turn per session**
 
-### 7.3 Busy parent: steer/backlog/followup/collect
+### 7.3 Busy parent: **backlog + collect window** (default), steer optional
 
-When the parent session is running:
+When the parent session is running, the default behavior for internal announce traffic should be:
 
-- **steer**: try to append the announce injection into the in-flight run’s queue.
-- **followup**: enqueue injection to run immediately after the current turn finishes.
-- **collect**: merge multiple subagent announces into a single summary injection.
+- **backlog**: do not interrupt the in-flight turn; enqueue internal announce events to be handled after the current turn completes.
+- **collect window**: buffer/merge multiple internal announce events that arrive within a short time window into a single followup injection.
 
-This avoids breaking tool iteration state.
+Rationale:
+
+- Prevents tool-loop reentrancy and state corruption.
+- Avoids "announce storms" when many subagents complete around the same time.
+- Keeps the parent transcript clean (best practice B stores semantic payload in meta_json; the merged followup can reference multiple payloads).
+
+Suggested defaults:
+
+- `collect_window_ms`: 500–2000ms (start with **1000ms**)
+- `max_items_per_batch`: 10 (beyond this, emit multiple batches)
+- `max_total_chars_rendered`: keep low; prefer references to meta payloads
+- `flush_triggers`:
+  - window elapsed, or
+  - parent turn finished, or
+  - reached max_items_per_batch
+
+Optional (advanced):
+
+- **steer**: append announce events into an in-flight run’s queue only when the run declares a safe checkpoint.
+  Default should be **off** for internal announces; reserve for interactive user messages or explicit interrupt modes.
 
 ---
 
