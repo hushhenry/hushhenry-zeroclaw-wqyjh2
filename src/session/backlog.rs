@@ -61,27 +61,39 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::{clear, drain, enqueue, enqueue_with_cap};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_session_key(prefix: &str) -> String {
+        let n = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{n}")
+    }
 
     #[test]
     fn backlog_enqueue_drain_preserves_order() {
         clear();
-        enqueue("session-a", "first");
-        enqueue("session-a", "second");
-        enqueue("session-a", "third");
+        let session_key = unique_session_key("session-a");
 
-        let drained = drain("session-a");
+        enqueue(&session_key, "first");
+        enqueue(&session_key, "second");
+        enqueue(&session_key, "third");
+
+        let drained = drain(&session_key);
         assert_eq!(drained, vec!["first", "second", "third"]);
-        assert!(drain("session-a").is_empty());
+        assert!(drain(&session_key).is_empty());
     }
 
     #[test]
     fn backlog_enqueue_drops_oldest_when_cap_reached() {
         clear();
-        enqueue_with_cap("session-b", "m1".to_string(), 2);
-        enqueue_with_cap("session-b", "m2".to_string(), 2);
-        enqueue_with_cap("session-b", "m3".to_string(), 2);
+        let session_key = unique_session_key("session-b");
 
-        let drained = drain("session-b");
+        enqueue_with_cap(&session_key, "m1".to_string(), 2);
+        enqueue_with_cap(&session_key, "m2".to_string(), 2);
+        enqueue_with_cap(&session_key, "m3".to_string(), 2);
+
+        let drained = drain(&session_key);
         assert_eq!(drained, vec!["m2", "m3"]);
     }
 }

@@ -98,9 +98,7 @@ pub fn create_memory_for_migration(
     // Migration target must be persistent. Even in sqlite-only mode, we keep
     // rejecting explicit `none` for compatibility with existing expectations.
     if backend.trim() == "none" {
-        anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite before migration"
-        );
+        anyhow::bail!("memory backend 'none' disables persistence; choose sqlite before migration");
     }
     if backend.trim() != "sqlite" {
         tracing::warn!(

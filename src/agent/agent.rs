@@ -590,9 +590,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap(),
-        );
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap());
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -633,9 +632,8 @@ mod tests {
             ..crate::config::MemoryConfig::default()
         };
         let tmp = tempfile::TempDir::new().unwrap();
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap(),
-        );
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap());
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()

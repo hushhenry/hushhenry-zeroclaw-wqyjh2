@@ -5,7 +5,7 @@
 //! reduce complexity and avoid maintaining multiple backends.
 
 use tempfile::TempDir;
-use zeroclaw::memory::{SqliteMemory, Memory, MemoryCategory};
+use zeroclaw::memory::{Memory, MemoryCategory, SqliteMemory};
 
 #[tokio::test]
 async fn sqlite_memory_smoke_test() {

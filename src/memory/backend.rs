@@ -57,7 +57,10 @@ mod tests {
     #[test]
     fn sqlite_only() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
-        assert_eq!(classify_memory_backend("markdown"), MemoryBackendKind::Sqlite);
+        assert_eq!(
+            classify_memory_backend("markdown"),
+            MemoryBackendKind::Sqlite
+        );
         assert_eq!(selectable_memory_backends().len(), 1);
         assert_eq!(selectable_memory_backends()[0].key, "sqlite");
         assert_eq!(memory_backend_profile("anything").key, "sqlite");
