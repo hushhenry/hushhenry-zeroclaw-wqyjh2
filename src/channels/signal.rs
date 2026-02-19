@@ -262,21 +262,20 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
-        Some(ChannelMessage {
-            id: format!("sig_{timestamp}"),
-            agent_id: None,
-            account_id: None,
-            sender: sender.clone(),
-            reply_target: target,
-            content: text.to_string(),
-            channel: "signal".to_string(),
-            title: None,
+        Some(ChannelMessage::new_ingress(
+            format!("sig_{timestamp}"),
+            None,
+            sender.clone(),
+            target,
+            text.to_string(),
+            "signal",
+            None,
             chat_type,
-            raw_chat_type: None,
+            None,
             chat_id,
-            thread_id: None,
-            timestamp: timestamp / 1000, // millis → secs
-        })
+            None,
+            timestamp / 1000, // millis → secs
+        ))
     }
 }
 

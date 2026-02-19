@@ -826,21 +826,20 @@ mod tests {
 
     #[test]
     fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage {
-            id: "wamid-123".into(),
-            agent_id: None,
-            account_id: None,
-            sender: "+1234567890".into(),
-            reply_target: "+1234567890".into(),
-            content: "hello".into(),
-            channel: "whatsapp".into(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "+1234567890".into(),
-            thread_id: None,
-            timestamp: 1,
-        };
+        let msg = ChannelMessage::new_ingress(
+            "wamid-123",
+            None,
+            "+1234567890",
+            "+1234567890",
+            "hello",
+            "whatsapp",
+            None,
+            ChatType::Direct,
+            None,
+            "+1234567890",
+            None,
+            1,
+        );
 
         let key = whatsapp_memory_key(&msg);
         assert_eq!(key, "whatsapp_+1234567890_wamid-123");

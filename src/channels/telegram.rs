@@ -578,28 +578,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             ChatType::from_raw(&chat_type)
         };
 
-        Some(ChannelMessage {
-            id: format!("telegram_{chat_id}_{message_id}"),
-            agent_id: None,
-            account_id: None,
-            sender: sender_identity,
-            reply_target: chat_id.clone(),
-            content: text.to_string(),
-            channel: "telegram".to_string(),
-            title: message
+        Some(ChannelMessage::new_ingress(
+            format!("telegram_{chat_id}_{message_id}"),
+            None,
+            sender_identity,
+            chat_id.clone(),
+            text.to_string(),
+            "telegram",
+            message
                 .get("chat")
                 .and_then(|chat| chat.get("title"))
                 .and_then(serde_json::Value::as_str)
                 .map(std::string::ToString::to_string),
-            chat_type: normalized_chat_type,
-            raw_chat_type: Some(chat_type),
+            normalized_chat_type,
+            Some(chat_type),
             chat_id,
             thread_id,
-            timestamp: std::time::SystemTime::now()
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-        })
+        ))
     }
 
     async fn send_text_chunks(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {

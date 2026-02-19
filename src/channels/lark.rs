@@ -447,24 +447,23 @@ impl LarkChannel {
                         continue;
                     }
 
-                    let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        agent_id: None,
-                        account_id: None,
-                        sender: lark_msg.chat_id.clone(),
-                        reply_target: lark_msg.chat_id.clone(),
-                        content: text,
-                        channel: "lark".to_string(),
-                        title: None,
-                        chat_type: ChatType::from_raw(&lark_msg.chat_type),
-                        raw_chat_type: Some(lark_msg.chat_type.clone()),
-                        chat_id: lark_msg.chat_id.clone(),
-                        thread_id: None,
-                        timestamp: std::time::SystemTime::now()
+                    let channel_msg = ChannelMessage::new_ingress(
+                        Uuid::new_v4().to_string(),
+                        None,
+                        lark_msg.chat_id.clone(),
+                        lark_msg.chat_id.clone(),
+                        text,
+                        "lark",
+                        None,
+                        ChatType::from_raw(&lark_msg.chat_type),
+                        Some(lark_msg.chat_type.clone()),
+                        lark_msg.chat_id.clone(),
+                        None,
+                        std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    };
+                    );
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
                     if tx.send(channel_msg).await.is_err() { break; }
@@ -622,21 +621,20 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or("p2p");
 
-        messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
-            agent_id: None,
-            account_id: None,
-            sender: chat_id.to_string(),
-            reply_target: chat_id.to_string(),
-            content: text,
-            channel: "lark".to_string(),
-            title: None,
-            chat_type: ChatType::from_raw(chat_type),
-            raw_chat_type: Some(chat_type.to_string()),
-            chat_id: chat_id.to_string(),
-            thread_id: None,
+        messages.push(ChannelMessage::new_ingress(
+            Uuid::new_v4().to_string(),
+            None,
+            chat_id.to_string(),
+            chat_id.to_string(),
+            text,
+            "lark",
+            None,
+            ChatType::from_raw(chat_type),
+            Some(chat_type.to_string()),
+            chat_id.to_string(),
+            None,
             timestamp,
-        });
+        ));
 
         messages
     }

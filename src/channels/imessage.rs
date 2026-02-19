@@ -169,24 +169,23 @@ end tell"#
                             continue;
                         }
 
-                        let msg = ChannelMessage {
-                            id: rowid.to_string(),
-                            agent_id: None,
-                            account_id: None,
-                            sender: sender.clone(),
-                            reply_target: sender.clone(),
-                            content: text,
-                            channel: "imessage".to_string(),
-                            title: None,
-                            chat_type: ChatType::Direct,
-                            raw_chat_type: None,
-                            chat_id: sender,
-                            thread_id: None,
-                            timestamp: std::time::SystemTime::now()
+                        let msg = ChannelMessage::new_ingress(
+                            rowid.to_string(),
+                            None,
+                            sender.clone(),
+                            sender.clone(),
+                            text,
+                            "imessage",
+                            None,
+                            ChatType::Direct,
+                            None,
+                            sender,
+                            None,
+                            std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                        };
+                        );
 
                         if tx.send(msg).await.is_err() {
                             return Ok(());

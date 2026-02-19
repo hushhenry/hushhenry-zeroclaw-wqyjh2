@@ -403,32 +403,31 @@ impl Channel for DiscordChannel {
                         ChatType::Direct
                     };
 
-                    let channel_msg = ChannelMessage {
-                        id: if message_id.is_empty() {
+                    let channel_msg = ChannelMessage::new_ingress(
+                        if message_id.is_empty() {
                             Uuid::new_v4().to_string()
                         } else {
                             format!("discord_{message_id}")
                         },
-                        agent_id: None,
-                        account_id: None,
-                        sender: author_id.to_string(),
-                        reply_target: if channel_id.is_empty() {
+                        None,
+                        author_id.to_string(),
+                        if channel_id.is_empty() {
                             author_id.to_string()
                         } else {
                             channel_id.clone()
                         },
-                        content: clean_content,
-                        channel: channel_id,
-                        title: None,
+                        clean_content,
+                        channel_id,
+                        None,
                         chat_type,
-                        raw_chat_type: None,
+                        None,
                         chat_id,
-                        thread_id: None,
-                        timestamp: std::time::SystemTime::now()
+                        None,
+                        std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    };
+                    );
 
                     if tx.send(channel_msg).await.is_err() {
                         break;

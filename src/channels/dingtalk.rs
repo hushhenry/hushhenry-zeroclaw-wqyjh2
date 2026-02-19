@@ -265,24 +265,23 @@ impl Channel for DingTalkChannel {
                     });
                     let _ = write.send(Message::Text(ack.to_string())).await;
 
-                    let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        agent_id: None,
-                        account_id: None,
-                        sender: sender_id.to_string(),
-                        reply_target: chat_id.clone(),
-                        content: content.to_string(),
-                        channel: "dingtalk".to_string(),
-                        title: None,
+                    let channel_msg = ChannelMessage::new_ingress(
+                        Uuid::new_v4().to_string(),
+                        None,
+                        sender_id.to_string(),
+                        chat_id.clone(),
+                        content.to_string(),
+                        "dingtalk",
+                        None,
                         chat_type,
-                        raw_chat_type: None,
-                        chat_id: chat_id,
-                        thread_id: None,
-                        timestamp: std::time::SystemTime::now()
+                        None,
+                        chat_id,
+                        None,
+                        std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                    };
+                    );
 
                     if tx.send(channel_msg).await.is_err() {
                         tracing::warn!("DingTalk: message channel closed");

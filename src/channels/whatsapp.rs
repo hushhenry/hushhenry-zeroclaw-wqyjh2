@@ -117,21 +117,20 @@ impl WhatsAppChannel {
                                 .as_secs()
                         });
 
-                    messages.push(ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        agent_id: None,
-                        account_id: None,
-                        reply_target: normalized_from.clone(),
-                        sender: normalized_from.clone(),
+                    messages.push(ChannelMessage::new_ingress(
+                        Uuid::new_v4().to_string(),
+                        None,
+                        normalized_from.clone(),
+                        normalized_from.clone(),
                         content,
-                        channel: "whatsapp".to_string(),
-                        title: None,
-                        chat_type: ChatType::Direct,
-                        raw_chat_type: None,
-                        chat_id: normalized_from,
-                        thread_id: None,
+                        "whatsapp",
+                        None,
+                        ChatType::Direct,
+                        None,
+                        normalized_from,
+                        None,
                         timestamp,
-                    });
+                    ));
                 }
             }
         }

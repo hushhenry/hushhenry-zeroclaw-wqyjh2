@@ -426,21 +426,20 @@ impl Channel for EmailChannel {
                             }
                             seen.insert(id.clone());
                         } // MutexGuard dropped before await
-                        let msg = ChannelMessage {
+                        let msg = ChannelMessage::new_ingress(
                             id,
-                            agent_id: None,
-                            account_id: None,
-                            reply_target: sender.clone(),
-                            sender: sender.clone(),
+                            None,
+                            sender.clone(),
+                            sender.clone(),
                             content,
-                            channel: "email".to_string(),
-                            title: None,
-                            chat_type: ChatType::Direct,
-                            raw_chat_type: None,
-                            chat_id: sender,
-                            thread_id: None,
-                            timestamp: ts,
-                        };
+                            "email",
+                            None,
+                            ChatType::Direct,
+                            None,
+                            sender,
+                            None,
+                            ts,
+                        );
                         if tx.send(msg).await.is_err() {
                             return Ok(());
                         }
