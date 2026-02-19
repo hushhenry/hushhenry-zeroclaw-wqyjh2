@@ -95,6 +95,13 @@ pub fn create_memory_for_migration(
     backend: &str,
     workspace_dir: &Path,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    // Migration target must be persistent. Even in sqlite-only mode, we keep
+    // rejecting explicit `none` for compatibility with existing expectations.
+    if backend.trim() == "none" {
+        anyhow::bail!(
+            "memory backend 'none' disables persistence; choose sqlite before migration"
+        );
+    }
     if backend.trim() != "sqlite" {
         tracing::warn!(
             "memory backend '{backend}' requested for migration, but Zeroclaw is sqlite-only; using sqlite"
@@ -145,7 +152,7 @@ mod tests {
         assert_eq!(mem.name(), "sqlite");
 
         let cfg2 = MemoryConfig {
-            backend: "markdown".into(),
+            backend: "ignored-non-sqlite".into(),
             ..MemoryConfig::default()
         };
         let mem2 = create_memory(&cfg2, tmp.path(), None).unwrap();

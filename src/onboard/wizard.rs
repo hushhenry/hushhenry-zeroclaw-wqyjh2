@@ -252,26 +252,25 @@ fn backend_key_from_choice(choice: usize) -> &'static str {
         .map_or(default_memory_backend_key(), |backend| backend.key)
 }
 
-fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
-    let profile = memory_backend_profile(backend);
+fn memory_config_defaults_for_backend(_backend: &str) -> MemoryConfig {
+    // Milestone 0: sqlite-only memory.
+    // The wizard still accepts a backend choice for compatibility, but always
+    // generates a sqlite-backed config.
+    let profile = memory_backend_profile("sqlite");
 
     MemoryConfig {
-        backend: backend.to_string(),
+        backend: "sqlite".to_string(),
         auto_save: profile.auto_save_default,
         hygiene_enabled: profile.uses_sqlite_hygiene,
-        archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
-        purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
+        archive_after_days: 7,
+        purge_after_days: 30,
         conversation_retention_days: 30,
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
-        embedding_cache_size: if profile.uses_sqlite_hygiene {
-            10000
-        } else {
-            0
-        },
+        embedding_cache_size: 10000,
         chunk_max_tokens: 512,
         response_cache_enabled: false,
         response_cache_ttl_minutes: 60,
@@ -4393,53 +4392,36 @@ mod tests {
 
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
+        // sqlite-only: only one selectable backend.
         assert_eq!(backend_key_from_choice(0), "sqlite");
-        assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "markdown");
-        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(1), "sqlite");
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 
     #[test]
-    fn memory_backend_profile_marks_lucid_as_optional_sqlite_backed() {
-        let lucid = memory_backend_profile("lucid");
-        assert!(lucid.auto_save_default);
-        assert!(lucid.uses_sqlite_hygiene);
-        assert!(lucid.sqlite_based);
-        assert!(lucid.optional_dependency);
+    fn memory_backend_profile_is_sqlite_only() {
+        let profile = memory_backend_profile("sqlite");
+        assert!(profile.auto_save_default);
+        assert!(profile.uses_sqlite_hygiene);
+        assert!(profile.sqlite_based);
+        assert!(!profile.optional_dependency);
 
-        let markdown = memory_backend_profile("markdown");
-        assert!(markdown.auto_save_default);
-        assert!(!markdown.uses_sqlite_hygiene);
-
-        let none = memory_backend_profile("none");
-        assert!(!none.auto_save_default);
-        assert!(!none.uses_sqlite_hygiene);
-
-        let custom = memory_backend_profile("custom-memory");
-        assert!(custom.auto_save_default);
-        assert!(!custom.uses_sqlite_hygiene);
+        // Non-sqlite values map to sqlite profile.
+        let profile2 = memory_backend_profile("markdown");
+        assert_eq!(profile2.key, "sqlite");
     }
 
     #[test]
-    fn memory_config_defaults_for_lucid_enable_sqlite_hygiene() {
-        let config = memory_config_defaults_for_backend("lucid");
-        assert_eq!(config.backend, "lucid");
+    fn memory_config_defaults_always_sqlite() {
+        let config = memory_config_defaults_for_backend("sqlite");
+        assert_eq!(config.backend, "sqlite");
         assert!(config.auto_save);
         assert!(config.hygiene_enabled);
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
-    }
 
-    #[test]
-    fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
-        let config = memory_config_defaults_for_backend("none");
-        assert_eq!(config.backend, "none");
-        assert!(!config.auto_save);
-        assert!(!config.hygiene_enabled);
-        assert_eq!(config.archive_after_days, 0);
-        assert_eq!(config.purge_after_days, 0);
-        assert_eq!(config.embedding_cache_size, 0);
+        let config2 = memory_config_defaults_for_backend("none");
+        assert_eq!(config2.backend, "sqlite");
     }
 }

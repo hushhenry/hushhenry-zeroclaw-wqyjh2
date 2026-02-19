@@ -589,8 +589,9 @@ mod tests {
             backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
+        let tmp = tempfile::TempDir::new().unwrap();
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap(),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -600,7 +601,7 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(tmp.path().to_path_buf())
             .build()
             .unwrap();
 
@@ -631,8 +632,9 @@ mod tests {
             backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
+        let tmp = tempfile::TempDir::new().unwrap();
         let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
+            crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap(),
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -642,7 +644,7 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(tmp.path().to_path_buf())
             .build()
             .unwrap();
 
