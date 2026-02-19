@@ -3762,6 +3762,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-test",
  "tokio-tungstenite 0.24.0",
+ "tokio-util",
  "toml",
  "tower",
  "tower-http",

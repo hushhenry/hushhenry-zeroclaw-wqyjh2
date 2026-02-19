@@ -351,12 +351,15 @@ impl Channel for QQChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
+                                agent_id: None,
+                                account_id: None,
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 chat_type: ChatType::Direct,
-                        raw_chat_type: None,
+                                title: None,
+                                raw_chat_type: None,
                                 chat_id: user_openid.to_string(),
                                 thread_id: None,
                                 timestamp: std::time::SystemTime::now()
@@ -393,12 +396,15 @@ impl Channel for QQChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
+                                agent_id: None,
+                                account_id: None,
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
                                 chat_type: ChatType::Group,
-                        raw_chat_type: None,
+                                title: None,
+                                raw_chat_type: None,
                                 chat_id: group_openid.to_string(),
                                 thread_id: None,
                                 timestamp: std::time::SystemTime::now()

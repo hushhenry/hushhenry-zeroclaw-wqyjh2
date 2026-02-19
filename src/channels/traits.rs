@@ -23,10 +23,13 @@ impl ChatType {
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
     pub id: String,
+    pub agent_id: Option<String>,
+    pub account_id: Option<String>,
     pub sender: String,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
+    pub title: Option<String>,
     pub chat_type: ChatType,
     pub raw_chat_type: Option<String>,
     pub chat_id: String,
@@ -124,10 +127,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             tx.send(ChannelMessage {
                 id: "1".into(),
+                agent_id: None,
+                account_id: None,
                 sender: "tester".into(),
                 reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
+                title: None,
                 chat_type: ChatType::Direct,
                 raw_chat_type: None,
                 chat_id: "tester".into(),
@@ -143,10 +149,13 @@ mod tests {
     fn channel_message_clone_preserves_fields() {
         let message = ChannelMessage {
             id: "42".into(),
+            agent_id: None,
+            account_id: None,
             sender: "alice".into(),
             reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
+            title: Some("Example Chat".into()),
             chat_type: ChatType::Direct,
             raw_chat_type: None,
             chat_id: "alice".into(),
@@ -156,10 +165,13 @@ mod tests {
 
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
+        assert!(cloned.agent_id.is_none());
+        assert!(cloned.account_id.is_none());
         assert_eq!(cloned.sender, "alice");
         assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
+        assert_eq!(cloned.title.as_deref(), Some("Example Chat"));
         assert_eq!(cloned.chat_type, ChatType::Direct);
         assert!(cloned.raw_chat_type.is_none());
         assert_eq!(cloned.chat_id, "alice");

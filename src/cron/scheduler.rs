@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, LarkChannel, MattermostChannel, SendMessage, SlackChannel,
+    TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -7,6 +8,7 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
+use crate::session::{SessionId, SessionStore};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
@@ -65,9 +67,22 @@ async fn execute_job_with_retry(
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+        let execution_timeout = Duration::from_secs(config.cron.execution_timeout_secs.max(1));
+        let run_future = async {
+            match job.job_type {
+                JobType::Shell => run_job_command(config, security, job).await,
+                JobType::Agent => run_agent_job(config, job).await,
+            }
+        };
+        let (success, output) = match time::timeout(execution_timeout, run_future).await {
+            Ok(run_result) => run_result,
+            Err(_) => (
+                false,
+                format!(
+                    "job execution timed out after {}s",
+                    config.cron.execution_timeout_secs.max(1)
+                ),
+            ),
         };
         last_output = output;
 
@@ -216,6 +231,63 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    let route = resolve_delivery_route(config, job, delivery)?;
+    let delivery_timeout = Duration::from_secs(config.cron.delivery_timeout_secs.max(1));
+    match time::timeout(
+        delivery_timeout,
+        send_via_channel(
+            config,
+            route.channel.as_str(),
+            route.target.as_str(),
+            output,
+        ),
+    )
+    .await
+    {
+        Ok(send_result) => send_result,
+        Err(_) => anyhow::bail!(
+            "delivery timed out after {}s",
+            config.cron.delivery_timeout_secs.max(1)
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryRoute {
+    channel: String,
+    target: String,
+}
+
+fn resolve_delivery_route(
+    config: &Config,
+    job: &CronJob,
+    delivery: &DeliveryConfig,
+) -> Result<DeliveryRoute> {
+    if let Some(source_session_id) = job.source_session_id.as_deref() {
+        let store = SessionStore::new(&config.workspace_dir)?;
+        match store.load_route_metadata(&SessionId::from_string(source_session_id)) {
+            Ok(Some(metadata)) => {
+                let target = metadata.route_id.unwrap_or(metadata.chat_id);
+                return Ok(DeliveryRoute {
+                    channel: metadata.channel,
+                    target,
+                });
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Cron source_session_id route lookup returned no metadata: {}",
+                    source_session_id
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Cron source_session_id route lookup failed for {}: {error}",
+                    source_session_id
+                );
+            }
+        }
+    }
+
     let channel = delivery
         .channel
         .as_deref()
@@ -224,7 +296,18 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    Ok(DeliveryRoute {
+        channel: channel.to_string(),
+        target: target.to_string(),
+    })
+}
 
+async fn send_via_channel(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -275,6 +358,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.channel_id.clone(),
                 mm.allowed_users.clone(),
             );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "lark" | "feishu" => {
+            let lark = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            let channel = LarkChannel::from_config(lark);
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
@@ -413,6 +505,7 @@ mod tests {
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
+    use crate::session::{SessionKey, SessionRouteMetadata, SessionStore};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
 
@@ -442,6 +535,7 @@ mod tests {
             model: None,
             enabled: true,
             delivery: DeliveryConfig::default(),
+            source_session_id: None,
             delete_after_run: false,
             created_at: Utc::now(),
             next_run: Utc::now(),
@@ -667,5 +761,126 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[test]
+    fn resolve_delivery_route_legacy_uses_delivery_fields() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("slack".into()),
+            to: Some("chan-1".into()),
+            best_effort: true,
+        };
+
+        let route = resolve_delivery_route(&config, &job, &job.delivery).unwrap();
+        assert_eq!(route.channel, "slack");
+        assert_eq!(route.target, "chan-1");
+    }
+
+    #[test]
+    fn resolve_delivery_route_prefers_source_session_route() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let store = SessionStore::new(&config.workspace_dir).unwrap();
+        let session_id = store
+            .get_or_create_active(&SessionKey::new("group:telegram:chat-42"))
+            .unwrap();
+        store
+            .upsert_route_metadata(
+                &session_id,
+                &SessionRouteMetadata {
+                    agent_id: None,
+                    channel: "discord".into(),
+                    account_id: None,
+                    chat_type: "thread".into(),
+                    chat_id: "chan-root".into(),
+                    route_id: Some("thread-99".into()),
+                    sender_id: "user-x".into(),
+                    title: None,
+                },
+            )
+            .unwrap();
+
+        let mut job = test_job("echo ok");
+        job.source_session_id = Some(session_id.as_str().to_string());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("slack".into()),
+            to: Some("fallback".into()),
+            best_effort: true,
+        };
+
+        let route = resolve_delivery_route(&config, &job, &job.delivery).unwrap();
+        assert_eq!(route.channel, "discord");
+        assert_eq!(route.target, "thread-99");
+    }
+
+    #[test]
+    fn resolve_delivery_route_falls_back_when_session_lookup_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut job = test_job("echo ok");
+        job.source_session_id = Some("missing-session-id".into());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mattermost".into()),
+            to: Some("team-chan".into()),
+            best_effort: true,
+        };
+
+        let route = resolve_delivery_route(&config, &job, &job.delivery).unwrap();
+        assert_eq!(route.channel, "mattermost");
+        assert_eq!(route.target, "team-chan");
+    }
+
+    #[test]
+    fn resolve_delivery_route_keeps_lark_channel_from_session_meta() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let store = SessionStore::new(&config.workspace_dir).unwrap();
+        let session_id = store
+            .get_or_create_active(&SessionKey::new("group:lark:chat-88"))
+            .unwrap();
+        store
+            .upsert_route_metadata(
+                &session_id,
+                &SessionRouteMetadata {
+                    agent_id: None,
+                    channel: "lark".into(),
+                    account_id: None,
+                    chat_type: "group".into(),
+                    chat_id: "lark-chat".into(),
+                    route_id: None,
+                    sender_id: "ou_test".into(),
+                    title: None,
+                },
+            )
+            .unwrap();
+
+        let mut job = test_job("echo ok");
+        job.source_session_id = Some(session_id.as_str().to_string());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("slack".into()),
+            to: Some("fallback".into()),
+            best_effort: true,
+        };
+
+        let route = resolve_delivery_route(&config, &job, &job.delivery).unwrap();
+        assert_eq!(route.channel, "lark");
+        assert_eq!(route.target, "lark-chat");
+    }
+
+    #[tokio::test]
+    async fn send_via_channel_feishu_alias_is_wired() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let err = send_via_channel(&config, "feishu", "chat-1", "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark channel not configured"));
     }
 }

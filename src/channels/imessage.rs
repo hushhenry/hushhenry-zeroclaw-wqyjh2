@@ -171,10 +171,13 @@ end tell"#
 
                         let msg = ChannelMessage {
                             id: rowid.to_string(),
+                            agent_id: None,
+                            account_id: None,
                             sender: sender.clone(),
                             reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
+                            title: None,
                             chat_type: ChatType::Direct,
                             raw_chat_type: None,
                             chat_id: sender,

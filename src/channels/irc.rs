@@ -570,10 +570,13 @@ impl Channel for IrcChannel {
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
+                        agent_id: None,
+                        account_id: None,
                         sender: sender_nick.to_string(),
                         reply_target: reply_to.clone(),
                         content,
                         channel: "irc".to_string(),
+                        title: None,
                         chat_type,
                         raw_chat_type: None,
                         chat_id: reply_to,

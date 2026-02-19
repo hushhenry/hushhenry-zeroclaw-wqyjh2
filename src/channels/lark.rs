@@ -449,10 +449,13 @@ impl LarkChannel {
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
+                        agent_id: None,
+                        account_id: None,
                         sender: lark_msg.chat_id.clone(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
+                        title: None,
                         chat_type: ChatType::from_raw(&lark_msg.chat_type),
                         raw_chat_type: Some(lark_msg.chat_type.clone()),
                         chat_id: lark_msg.chat_id.clone(),
@@ -621,10 +624,13 @@ impl LarkChannel {
 
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
+            agent_id: None,
+            account_id: None,
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
+            title: None,
             chat_type: ChatType::from_raw(chat_type),
             raw_chat_type: Some(chat_type.to_string()),
             chat_id: chat_id.to_string(),

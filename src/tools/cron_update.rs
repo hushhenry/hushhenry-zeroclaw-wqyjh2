@@ -69,7 +69,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
+        let mut patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
             Ok(patch) => patch,
             Err(e) => {
                 return Ok(ToolResult {
@@ -79,6 +79,13 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+
+        if patch.source_session_id.is_none() {
+            patch.source_session_id = args
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
 
         if let Some(command) = &patch.command {
             if !self.security.is_command_allowed(command) {

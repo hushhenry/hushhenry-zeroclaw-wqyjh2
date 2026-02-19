@@ -83,14 +83,16 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
-    /// Delegate agent configurations for multi-agent workflows.
+    /// Legacy delegate agent configurations.
+    /// Deprecated: entries are mapped into subagent specs for compatibility.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
 
-/// Configuration for a delegate sub-agent used by the `delegate` tool.
+/// Configuration for a legacy delegate agent entry in config.
+/// Deprecated: parsed for compatibility and mapped to subagent specs at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
@@ -1088,10 +1090,22 @@ pub struct CronConfig {
     pub enabled: bool,
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    #[serde(default = "default_cron_execution_timeout_secs")]
+    pub execution_timeout_secs: u64,
+    #[serde(default = "default_cron_delivery_timeout_secs")]
+    pub delivery_timeout_secs: u64,
 }
 
 fn default_max_run_history() -> u32 {
     50
+}
+
+fn default_cron_execution_timeout_secs() -> u64 {
+    120
+}
+
+fn default_cron_delivery_timeout_secs() -> u64 {
+    20
 }
 
 impl Default for CronConfig {
@@ -1099,6 +1113,8 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+            execution_timeout_secs: default_cron_execution_timeout_secs(),
+            delivery_timeout_secs: default_cron_delivery_timeout_secs(),
         }
     }
 }
@@ -1715,6 +1731,14 @@ fn encrypt_optional_secret(
 }
 
 impl Config {
+    fn warn_legacy_agents_usage(&self) {
+        if !self.agents.is_empty() {
+            tracing::warn!(
+                "config.agents is deprecated and delegate tool is removed; legacy agents will be mapped to subagent specs for compatibility"
+            );
+        }
+    }
+
     pub fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -1779,6 +1803,7 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
             config.apply_env_overrides();
+            config.warn_legacy_agents_usage();
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -1794,6 +1819,7 @@ impl Config {
             }
 
             config.apply_env_overrides();
+            config.warn_legacy_agents_usage();
             Ok(config)
         }
     }
@@ -2049,6 +2075,8 @@ mod tests {
         let c = CronConfig::default();
         assert!(c.enabled);
         assert_eq!(c.max_run_history, 50);
+        assert_eq!(c.execution_timeout_secs, 120);
+        assert_eq!(c.delivery_timeout_secs, 20);
     }
 
     #[test]
@@ -2056,11 +2084,15 @@ mod tests {
         let c = CronConfig {
             enabled: false,
             max_run_history: 100,
+            execution_timeout_secs: 60,
+            delivery_timeout_secs: 10,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
+        assert_eq!(parsed.execution_timeout_secs, 60);
+        assert_eq!(parsed.delivery_timeout_secs, 10);
     }
 
     #[test]
@@ -2074,6 +2106,8 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(parsed.cron.enabled);
         assert_eq!(parsed.cron.max_run_history, 50);
+        assert_eq!(parsed.cron.execution_timeout_secs, 120);
+        assert_eq!(parsed.cron.delivery_timeout_secs, 20);
     }
 
     #[test]

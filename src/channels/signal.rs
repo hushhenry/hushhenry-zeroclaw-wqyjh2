@@ -264,10 +264,13 @@ impl SignalChannel {
 
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
+            agent_id: None,
+            account_id: None,
             sender: sender.clone(),
             reply_target: target,
             content: text.to_string(),
             channel: "signal".to_string(),
+            title: None,
             chat_type,
             raw_chat_type: None,
             chat_id,

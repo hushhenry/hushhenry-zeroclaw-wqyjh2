@@ -2,7 +2,7 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider, ToolCall};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -84,21 +84,9 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
-/// Convert a tool registry to OpenAI function-calling format for native tool support.
-fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
-    tools_registry
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name(),
-                    "description": tool.description(),
-                    "parameters": tool.parameters_schema()
-                }
-            })
-        })
-        .collect()
+/// Convert a tool registry to provider-agnostic tool specifications.
+fn tools_to_specs(tools_registry: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSpec> {
+    tools_registry.iter().map(|tool| tool.spec()).collect()
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
@@ -183,9 +171,21 @@ async fn auto_compact_history(
         transcript
     );
 
+    let summary_messages = vec![
+        ChatMessage::system(summarizer_system),
+        ChatMessage::user(summarizer_user),
+    ];
     let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+        .chat(
+            ChatRequest {
+                messages: &summary_messages,
+                tools: None,
+            },
+            model,
+            0.2,
+        )
         .await
+        .map(|response| response.text_or_empty().to_string())
         .unwrap_or_else(|_| {
             // Fallback to deterministic local truncation when summarization fails.
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
@@ -218,6 +218,29 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+fn maybe_bind_source_session_id(
+    tool_name: &str,
+    arguments: serde_json::Value,
+    source_session_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(source_session_id) = source_session_id else {
+        return arguments;
+    };
+
+    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule") {
+        return arguments;
+    }
+
+    match arguments {
+        serde_json::Value::Object(mut obj) => {
+            obj.entry("source_session_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(source_session_id.to_string()));
+            serde_json::Value::Object(obj)
+        }
+        _ => arguments,
+    }
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -469,6 +492,22 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&str>) -> usize {
+    let Some(session_key) = backlog_key else {
+        return 0;
+    };
+
+    let backlog_messages = crate::session::backlog::drain(session_key);
+    if !backlog_messages.is_empty() {
+        history.push(ChatMessage::user(format!(
+            "[Backlog]\n{}",
+            backlog_messages.join("\n")
+        )));
+    }
+
+    backlog_messages.len()
+}
+
 #[derive(Debug)]
 struct ParsedToolCall {
     name: String,
@@ -500,6 +539,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None,
     )
     .await
 }
@@ -518,13 +558,13 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    backlog_key: Option<&str>,
 ) -> Result<String> {
-    // Build native tool definitions once if the provider supports them.
-    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
-    let tool_definitions = if use_native_tools {
-        tools_to_openai_format(tools_registry)
+    let tool_specs = tools_to_specs(tools_registry);
+    let tool_slice = if tool_specs.is_empty() {
+        None
     } else {
-        Vec::new()
+        Some(tool_specs.as_slice())
     };
 
     for _iteration in 0..MAX_TOOL_ITERATIONS {
@@ -536,89 +576,56 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Choose between native tool-call API and prompt-based tool use.
-        let (response_text, parsed_text, tool_calls, assistant_history_content) =
-            if use_native_tools {
-                match provider
-                    .chat_with_tools(history, &tool_definitions, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp.text_or_empty().to_string();
-                        let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                        let mut parsed_text = String::new();
+        let (response_text, parsed_text, tool_calls, assistant_history_content) = match provider
+            .chat(
+                ChatRequest {
+                    messages: history,
+                    tools: tool_slice,
+                },
+                model,
+                temperature,
+            )
+            .await
+        {
+            Ok(resp) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
+                let response_text = resp.text_or_empty().to_string();
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
 
-                        if calls.is_empty() {
-                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                            if !fallback_text.is_empty() {
-                                parsed_text = fallback_text;
-                            }
-                            calls = fallback_calls;
-                        }
-
-                        let assistant_history_content = if resp.tool_calls.is_empty() {
-                            response_text.clone()
-                        } else {
-                            build_assistant_history_with_tool_calls(
-                                &response_text,
-                                &resp.tool_calls,
-                            )
-                        };
-
-                        (response_text, parsed_text, calls, assistant_history_content)
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
                     }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
+                    calls = fallback_calls;
                 }
-            } else {
-                match provider
-                    .chat_with_history(history, model, temperature)
-                    .await
-                {
-                    Ok(resp) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: true,
-                            error_message: None,
-                        });
-                        let response_text = resp;
-                        let assistant_history_content = response_text.clone();
-                        let (parsed_text, calls) = parse_tool_calls(&response_text);
-                        (response_text, parsed_text, calls, assistant_history_content)
-                    }
-                    Err(e) => {
-                        observer.record_event(&ObserverEvent::LlmResponse {
-                            provider: provider_name.to_string(),
-                            model: model.to_string(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(crate::providers::sanitize_api_error(
-                                &e.to_string(),
-                            )),
-                        });
-                        return Err(e);
-                    }
-                }
-            };
+
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    response_text.clone()
+                } else {
+                    build_assistant_history_with_tool_calls(&response_text, &resp.tool_calls)
+                };
+
+                (response_text, parsed_text, calls, assistant_history_content)
+            }
+            Err(e) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                });
+                return Err(e);
+            }
+        };
 
         let display_text = if parsed_text.is_empty() {
             response_text.clone()
@@ -673,8 +680,10 @@ pub(crate) async fn run_tool_call_loop(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
+            let tool_args =
+                maybe_bind_source_session_id(&call.name, call.arguments.clone(), backlog_key);
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                match tool.execute(tool_args).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
@@ -710,6 +719,7 @@ pub(crate) async fn run_tool_call_loop(
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        let _ = inject_backlog_messages(history, backlog_key);
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -885,6 +895,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -959,6 +970,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
             )
             .await
             {
@@ -1131,6 +1143,41 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn inject_backlog_messages_drains_and_merges_into_single_user_message() {
+        let session_key = "session-checkpoint-merge";
+        let _ = crate::session::backlog::drain(session_key);
+        crate::session::backlog::enqueue(session_key, "steer one");
+        crate::session::backlog::enqueue(session_key, "steer two");
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("task start"),
+        ];
+        let injected = inject_backlog_messages(&mut history, Some(session_key));
+
+        assert_eq!(injected, 2);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, "[Backlog]\nsteer one\nsteer two");
+        assert!(crate::session::backlog::drain(session_key).is_empty());
+    }
+
+    #[test]
+    fn inject_backlog_messages_noop_without_key() {
+        let session_key = "session-noop-without-key";
+        let _ = crate::session::backlog::drain(session_key);
+        crate::session::backlog::enqueue(session_key, "ignored");
+
+        let mut history = vec![ChatMessage::system("system")];
+        let injected = inject_backlog_messages(&mut history, None);
+
+        assert_eq!(injected, 0);
+        assert_eq!(history.len(), 1);
+        let pending = crate::session::backlog::drain(session_key);
+        assert_eq!(pending, vec!["ignored"]);
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
@@ -1351,27 +1398,23 @@ I will now call the tool with this payload:
     }
 
     #[test]
-    fn tools_to_openai_format_produces_valid_schema() {
+    fn tools_to_specs_produces_valid_schema() {
         use crate::security::SecurityPolicy;
         let security = Arc::new(SecurityPolicy::from_config(
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let formatted = tools_to_openai_format(&tools);
+        let formatted = tools_to_specs(&tools);
 
         assert!(!formatted.is_empty());
-        for tool_json in &formatted {
-            assert_eq!(tool_json["type"], "function");
-            assert!(tool_json["function"]["name"].is_string());
-            assert!(tool_json["function"]["description"].is_string());
-            assert!(!tool_json["function"]["name"].as_str().unwrap().is_empty());
+        for tool in &formatted {
+            assert!(!tool.name.is_empty());
+            assert!(!tool.description.is_empty());
+            assert!(tool.parameters.is_object());
         }
         // Verify known tools are present
-        let names: Vec<&str> = formatted
-            .iter()
-            .filter_map(|t| t["function"]["name"].as_str())
-            .collect();
+        let names: Vec<&str> = formatted.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
     }

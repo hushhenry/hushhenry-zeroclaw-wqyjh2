@@ -488,6 +488,7 @@ impl Provider for OpenRouterProvider {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::providers::traits::{ChatMessage, Provider};
