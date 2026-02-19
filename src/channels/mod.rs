@@ -44,7 +44,7 @@ use crate::session::{
         load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
         SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
-    AgentSpec, SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
+    SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
 };
 use crate::tools::{self, Tool};
@@ -957,7 +957,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             if let Some(guard) = SessionTurnGuard::acquire(session_key.clone()) {
                 session_turn_guard = Some(guard);
             } else {
-                crate::session::backlog::enqueue(&session_key, msg.content.clone());
+                crate::session::backlog::enqueue_user_message(&session_key, msg.content.clone());
                 tracing::info!(
                     session_id = %session_id.as_str(),
                     "Session busy; queued message in backlog"
@@ -997,7 +997,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     }
 
-    let enriched_message = if ctx.session_enabled {
+    let mut enriched_message = if ctx.session_enabled {
         msg.content.clone()
     } else {
         let memory_context = build_memory_context(
@@ -1026,6 +1026,24 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             format!("{memory_context}{}", msg.content)
         }
     };
+
+    if let (true, Some(session_id)) = (ctx.session_enabled, active_session.as_ref()) {
+        if session_turn_guard.is_some() {
+            let drained_items = crate::session::backlog::drain(session_id.as_str());
+            let user_messages: Vec<String> = drained_items
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::session::backlog::BacklogItem::UserMessage(content) => Some(content),
+                    crate::session::backlog::BacklogItem::Resume { .. } => None,
+                })
+                .collect();
+
+            if !user_messages.is_empty() {
+                let backlog_content = format!("[Backlog]\n{}", user_messages.join("\n"));
+                enriched_message = format!("{}\n\n{}", backlog_content, enriched_message);
+            }
+        }
+    }
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.reply_target).await {
@@ -1085,7 +1103,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         "Failed to load compaction state for session {}: {error}",
                         session_id.as_str()
                     );
-                    Default::default()
+                    crate::session::compaction::CompactionState::default()
                 }
             };
 
@@ -1106,15 +1124,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 history.push(build_compaction_summary_message(summary));
             }
             for message in tail_messages.iter().cloned() {
-                match SessionMessageRole::from_str(message.role.as_str()) {
+                match SessionMessageRole::from_str_opt(message.role.as_str()) {
                     Some(SessionMessageRole::User) => {
-                        history.push(ChatMessage::user(message.content))
+                        history.push(ChatMessage::user(message.content));
                     }
                     Some(SessionMessageRole::Assistant) => {
-                        history.push(ChatMessage::assistant(message.content))
+                        history.push(ChatMessage::assistant(message.content));
                     }
                     Some(SessionMessageRole::Tool) => {
-                        history.push(ChatMessage::tool(message.content))
+                        history.push(ChatMessage::tool(message.content));
                     }
                     None => {
                         tracing::warn!(
@@ -1122,6 +1140,24 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                             session_id = %session_id.as_str(),
                             "Skipping unsupported role from stored session history"
                         );
+                    }
+                }
+            }
+
+            if session_turn_guard.is_some() {
+                let drained_items = crate::session::backlog::drain(session_id.as_str());
+                if !drained_items.is_empty() {
+                    let user_messages: Vec<String> = drained_items
+                        .into_iter()
+                        .filter_map(|item| match item {
+                    crate::session::backlog::BacklogItem::UserMessage(content) => Some(content),
+                    crate::session::backlog::BacklogItem::Resume { .. } => None,
+                })
+                        .collect();
+
+                    if !user_messages.is_empty() {
+                        let backlog_content = format!("[Backlog]\n{}", user_messages.join("\n"));
+                        history.push(ChatMessage::user(backlog_content));
                     }
                 }
             }
@@ -1154,15 +1190,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                             history.push(build_compaction_summary_message(summary));
                         }
                         for message in tail_messages {
-                            match SessionMessageRole::from_str(message.role.as_str()) {
+                            match SessionMessageRole::from_str_opt(message.role.as_str()) {
                                 Some(SessionMessageRole::User) => {
-                                    history.push(ChatMessage::user(message.content))
+                                    history.push(ChatMessage::user(message.content));
                                 }
                                 Some(SessionMessageRole::Assistant) => {
-                                    history.push(ChatMessage::assistant(message.content))
+                                    history.push(ChatMessage::assistant(message.content));
                                 }
                                 Some(SessionMessageRole::Tool) => {
-                                    history.push(ChatMessage::tool(message.content))
+                                    history.push(ChatMessage::tool(message.content));
                                 }
                                 None => {}
                             }

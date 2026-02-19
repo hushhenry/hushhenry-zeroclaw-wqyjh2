@@ -104,7 +104,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let tool = SubagentPollTool::new(workspace.path().to_path_buf());

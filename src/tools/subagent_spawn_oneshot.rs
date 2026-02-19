@@ -202,8 +202,7 @@ impl Tool for SubagentSpawnOneshotTool {
                 prompt: full_prompt,
                 input_json,
                 session_meta_json,
-            })
-            .await?;
+            })?;
 
         let run = runtime
             .wait_for_run_completion(run.run_id.as_str(), Duration::from_secs(timeout_secs))
@@ -223,7 +222,7 @@ impl Tool for SubagentSpawnOneshotTool {
             "updated_at": run.updated_at
         }))?;
 
-        let status = SubagentRunStatus::from_str(run.status.as_str());
+        let status = SubagentRunStatus::from_str_opt(run.status.as_str());
         match status {
             Some(SubagentRunStatus::Succeeded) => Ok(ToolResult {
                 success: true,

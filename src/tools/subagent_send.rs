@@ -129,8 +129,7 @@ impl Tool for SubagentSendTool {
                 prompt,
                 input_json,
                 session_meta_json,
-            })
-            .await?;
+            })?;
 
         Ok(ToolResult {
             success: true,

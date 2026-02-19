@@ -276,7 +276,7 @@ impl Channel for DingTalkChannel {
                         title: None,
                         chat_type,
                         raw_chat_type: None,
-                        chat_id: chat_id,
+                        chat_id,
                         thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

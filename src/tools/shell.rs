@@ -143,7 +143,7 @@ impl ShellTool {
         }
     }
 
-    async fn execute_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execute_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -194,8 +194,7 @@ impl ShellTool {
                 timeout_secs,
                 max_output_bytes,
                 watch_json,
-            })
-            .await?;
+            })?;
 
         Ok(ToolResult {
             success: true,
@@ -216,7 +215,7 @@ impl ShellTool {
         })
     }
 
-    async fn execute_poll(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execute_poll(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let run_id = args
             .get("run_id")
             .and_then(|v| v.as_str())
@@ -231,7 +230,7 @@ impl ShellTool {
             items,
             next_seq,
             snippet,
-        }) = exec_runtime.poll_run(run_id, since_seq).await?
+        }) = exec_runtime.poll_run(run_id, since_seq)?
         else {
             return Ok(ToolResult {
                 success: false,
@@ -270,7 +269,7 @@ impl ShellTool {
         })
     }
 
-    async fn execute_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execute_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let run_id = args
             .get("run_id")
             .and_then(|v| v.as_str())
@@ -278,6 +277,7 @@ impl ShellTool {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
         let since_seq = args.get("since_seq").and_then(|v| v.as_i64());
+        #[allow(clippy::cast_possible_truncation)]
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -300,8 +300,7 @@ impl ShellTool {
 
         let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
         let Some(LogExecRunResult { items, next_seq }) = exec_runtime
-            .log_run(run_id, since_seq, limit, stream)
-            .await?
+            .log_run(run_id, since_seq, limit, stream)?
         else {
             return Ok(ToolResult {
                 success: false,
@@ -485,9 +484,9 @@ impl Tool for ShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args.get("action").and_then(|v| v.as_str());
         match action {
-            Some("spawn") => self.execute_spawn(&args).await,
-            Some("poll") => self.execute_poll(&args).await,
-            Some("log") => self.execute_log(&args).await,
+            Some("spawn") => self.execute_spawn(&args),
+            Some("poll") => self.execute_poll(&args),
+            Some("log") => self.execute_log(&args),
             Some("kill") => self.execute_kill(&args).await,
             Some("send_keys") => Ok(ToolResult {
                 success: false,
@@ -698,7 +697,10 @@ mod tests {
 
         let _ = wait_for_terminal(&tool, run_id).await;
         let backlog_items = backlog::drain("session-watch");
-        assert!(backlog_items.iter().any(|item| item.contains("ready")));
+        assert!(backlog_items.iter().any(|item| matches!(
+            item,
+            backlog::BacklogItem::UserMessage(msg) if msg.contains("ready")
+        )));
     }
 
     #[tokio::test]

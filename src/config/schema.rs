@@ -63,6 +63,9 @@ pub struct Config {
     pub session: SessionConfig,
 
     #[serde(default)]
+    pub queue: QueueConfig,
+
+    #[serde(default)]
     pub gateway: GatewayConfig,
 
     #[serde(default)]
@@ -721,6 +724,32 @@ impl Default for SessionConfig {
         Self {
             enabled: false,
             history_limit: default_session_history_limit(),
+        }
+    }
+}
+
+// ── Queueing ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueMode {
+    SteerBacklog,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueConfig {
+    #[serde(default = "default_queue_mode")]
+    pub mode: QueueMode,
+}
+
+fn default_queue_mode() -> QueueMode {
+    QueueMode::SteerBacklog
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_queue_mode(),
         }
     }
 }
@@ -1538,6 +1567,7 @@ impl Default for Config {
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             session: SessionConfig::default(),
+            queue: QueueConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
@@ -2200,6 +2230,7 @@ default_temperature = 0.7
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             agents: HashMap::new(),
+            queue: QueueConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2307,6 +2338,7 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             agents: HashMap::new(),
+            queue: QueueConfig::default(),
         };
 
         config.save().unwrap();

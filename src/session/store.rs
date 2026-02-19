@@ -16,6 +16,7 @@ impl SessionId {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
+#[allow(clippy::should_implement_trait)]
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -47,7 +48,8 @@ impl SessionMessageRole {
         }
     }
 
-    pub fn from_str(role: &str) -> Option<Self> {
+#[allow(clippy::should_implement_trait)]
+    pub fn from_str_opt(role: &str) -> Option<Self> {
         match role {
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
@@ -140,7 +142,8 @@ impl ExecRunStatus {
         }
     }
 
-    pub fn from_str(status: &str) -> Option<Self> {
+#[allow(clippy::should_implement_trait)]
+    pub fn from_str_opt(status: &str) -> Option<Self> {
         match status {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
@@ -164,7 +167,8 @@ impl SubagentRunStatus {
         }
     }
 
-    pub fn from_str(status: &str) -> Option<Self> {
+#[allow(clippy::should_implement_trait)]
+    pub fn from_str_opt(status: &str) -> Option<Self> {
         match status {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
@@ -650,7 +654,7 @@ impl SessionStore {
         content: &str,
         meta_json: Option<&str>,
     ) -> Result<()> {
-        let Some(role) = SessionMessageRole::from_str(role) else {
+        let Some(role) = SessionMessageRole::from_str_opt(role) else {
             tracing::warn!(
                 session_id = %session_id.as_str(),
                 role,
@@ -1258,6 +1262,7 @@ impl SessionStore {
         let changes = conn
             .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
             .context("Failed to query recovered subagent run changes")?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(changes.max(0) as usize)
     }
 
@@ -1566,6 +1571,7 @@ impl SessionStore {
         let changes = conn
             .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
             .context("Failed to query recovered exec run changes")?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(changes.max(0) as usize)
     }
 
@@ -1727,6 +1733,7 @@ impl SessionStore {
         .context("Failed to query exec run")
     }
 
+#[allow(clippy::too_many_arguments)]
     fn mark_exec_run_final(
         &self,
         run_id: &str,

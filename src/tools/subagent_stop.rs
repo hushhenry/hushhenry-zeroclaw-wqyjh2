@@ -116,7 +116,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let tool = SubagentStopTool::new(config);

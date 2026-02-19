@@ -503,15 +503,27 @@ fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&
         return 0;
     };
 
-    let backlog_messages = crate::session::backlog::drain(session_key);
-    if !backlog_messages.is_empty() {
+    let backlog_items = crate::session::backlog::drain(session_key);
+    if backlog_items.is_empty() {
+        return 0;
+    }
+
+    let user_messages: Vec<String> = backlog_items
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::session::backlog::BacklogItem::UserMessage(content) => Some(content),
+            crate::session::backlog::BacklogItem::Resume { .. } => None,
+        })
+        .collect();
+
+    if !user_messages.is_empty() {
         history.push(ChatMessage::user(format!(
             "[Backlog]\n{}",
-            backlog_messages.join("\n")
+            user_messages.join("\n")
         )));
     }
 
-    backlog_messages.len()
+    user_messages.len()
 }
 
 #[derive(Debug)]
@@ -725,7 +737,17 @@ pub(crate) async fn run_tool_call_loop(
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-        let _ = inject_backlog_messages(history, backlog_key);
+
+        if let Some(key) = backlog_key {
+            if crate::session::backlog::has_messages(key) {
+                let history_json = serde_json::to_string(history).unwrap_or_default();
+                crate::session::backlog::enqueue(
+                    key,
+                    crate::session::backlog::BacklogItem::Resume { history_json },
+                );
+                return Ok("[Task preempted by new message; will resume from backlog]".to_string());
+            }
+        }
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -1185,8 +1207,8 @@ mod tests {
     fn inject_backlog_messages_drains_and_merges_into_single_user_message() {
         let session_key = "session-checkpoint-merge";
         let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "steer one");
-        crate::session::backlog::enqueue(session_key, "steer two");
+        crate::session::backlog::enqueue_user_message(session_key, "steer one");
+        crate::session::backlog::enqueue_user_message(session_key, "steer two");
 
         let mut history = vec![
             ChatMessage::system("system"),
@@ -1205,7 +1227,7 @@ mod tests {
     fn inject_backlog_messages_noop_without_key() {
         let session_key = "session-noop-without-key";
         let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "ignored");
+        crate::session::backlog::enqueue_user_message(session_key, "ignored");
 
         let mut history = vec![ChatMessage::system("system")];
         let injected = inject_backlog_messages(&mut history, None);
@@ -1213,7 +1235,12 @@ mod tests {
         assert_eq!(injected, 0);
         assert_eq!(history.len(), 1);
         let pending = crate::session::backlog::drain(session_key);
-        assert_eq!(pending, vec!["ignored"]);
+        assert_eq!(
+            pending,
+            vec![crate::session::backlog::BacklogItem::UserMessage(
+                "ignored".into()
+            )]
+        );
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;

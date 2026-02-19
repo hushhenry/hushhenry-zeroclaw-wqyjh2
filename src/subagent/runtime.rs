@@ -70,7 +70,7 @@ impl SubagentRunExecutor for AgentLoopExecutor {
             resolve_execution_inputs(base_config.as_ref(), store.as_ref(), &run)?;
 
         tokio::select! {
-            _ = cancellation.cancelled() => Err(anyhow!("subagent run canceled")),
+            () = cancellation.cancelled() => Err(anyhow!("subagent run canceled")),
             result = crate::agent::loop_::process_message(run_config, &run_prompt) => {
                 let response = result?;
                 Ok(json!({"text": response}).to_string())
@@ -222,7 +222,7 @@ impl SubagentRuntime {
         });
     }
 
-    pub async fn enqueue_run(&self, request: EnqueueSubagentRunRequest) -> Result<SubagentRun> {
+    pub fn enqueue_run(&self, request: EnqueueSubagentRunRequest) -> Result<SubagentRun> {
         let subagent_session_id = if let Some(existing) = request.subagent_session_id {
             existing
         } else {
@@ -249,7 +249,7 @@ impl SubagentRuntime {
         };
 
         if matches!(
-            SubagentRunStatus::from_str(existing.status.as_str()),
+            SubagentRunStatus::from_str_opt(existing.status.as_str()),
             Some(SubagentRunStatus::Queued | SubagentRunStatus::Running)
         ) {
             if let Some(control) = self.running.lock().await.remove(run_id) {
@@ -258,20 +258,19 @@ impl SubagentRuntime {
             }
             self.store.mark_subagent_run_canceled(run_id)?;
             self.worker_notify.notify_waiters();
-            return self.poll_run(run_id).await;
+            return self.poll_run(run_id);
         }
 
         Ok(Some(existing))
     }
 
-    pub async fn process_next_run(&self) -> Result<Option<SubagentRun>> {
+    pub fn process_next_run(&self) -> Result<Option<SubagentRun>> {
         self.process_next_run_with(|_run| {
             Ok(json!({ "text": "subagent run completed" }).to_string())
         })
-        .await
     }
 
-    pub async fn process_next_run_with<F>(&self, execute: F) -> Result<Option<SubagentRun>>
+    pub fn process_next_run_with<F>(&self, execute: F) -> Result<Option<SubagentRun>>
     where
         F: Fn(&SubagentRun) -> Result<String>,
     {
@@ -290,14 +289,14 @@ impl SubagentRuntime {
             }
         }
 
-        self.poll_run(run.run_id.as_str()).await
+        self.poll_run(run.run_id.as_str())
     }
 
-    pub async fn recover_incomplete_runs(&self) -> Result<usize> {
+    pub fn recover_incomplete_runs(&self) -> Result<usize> {
         self.store.recover_running_subagent_runs_to_queued()
     }
 
-    pub async fn poll_run(&self, run_id: &str) -> Result<Option<SubagentRun>> {
+    pub fn poll_run(&self, run_id: &str) -> Result<Option<SubagentRun>> {
         self.store.get_subagent_run(run_id)
     }
 
@@ -315,7 +314,7 @@ impl SubagentRuntime {
                 .ok_or_else(|| anyhow!("subagent run not found: {run_id}"))?;
 
             if matches!(
-                SubagentRunStatus::from_str(run.status.as_str()),
+                SubagentRunStatus::from_str_opt(run.status.as_str()),
                 Some(
                     SubagentRunStatus::Succeeded
                         | SubagentRunStatus::Failed
@@ -342,12 +341,12 @@ impl SubagentRuntime {
         let mut interval = time::interval(poll_interval);
         loop {
             interval.tick().await;
-            let _ = self.process_next_run().await?;
+            let _ = self.process_next_run()?;
         }
     }
 
     async fn worker_loop(self: Arc<Self>) -> Result<()> {
-        let recovered = self.recover_incomplete_runs().await?;
+        let recovered = self.recover_incomplete_runs()?;
         if recovered > 0 {
             tracing::info!(recovered, "Recovered running subagent runs to queued state");
         }
@@ -355,8 +354,8 @@ impl SubagentRuntime {
         loop {
             self.claim_and_spawn_available_runs().await?;
             tokio::select! {
-                _ = self.worker_notify.notified() => {}
-                _ = time::sleep(self.poll_interval) => {}
+                () = self.worker_notify.notified() => {}
+                () = time::sleep(self.poll_interval) => {}
             }
         }
     }
@@ -406,7 +405,7 @@ impl SubagentRuntime {
             )
             .await;
 
-        let canceled = cancellation.is_cancelled() || self.run_is_canceled(run_id.as_str()).await;
+        let canceled = cancellation.is_cancelled() || self.run_is_canceled(run_id.as_str());
         if !canceled {
             match result {
                 Ok(output_json) => {
@@ -414,7 +413,7 @@ impl SubagentRuntime {
                         .store
                         .mark_subagent_run_succeeded(run_id.as_str(), output_json.as_str())
                     {
-                        if !self.run_is_canceled(run_id.as_str()).await {
+                        if !self.run_is_canceled(run_id.as_str()) {
                             tracing::warn!(run_id = %run_id, error = %err, "failed to mark subagent run succeeded");
                         }
                     }
@@ -424,7 +423,7 @@ impl SubagentRuntime {
                         .store
                         .mark_subagent_run_failed(run_id.as_str(), err.to_string().as_str())
                     {
-                        if !self.run_is_canceled(run_id.as_str()).await {
+                        if !self.run_is_canceled(run_id.as_str()) {
                             tracing::warn!(run_id = %run_id, error = %mark_err, "failed to mark subagent run failed");
                         }
                     }
@@ -436,7 +435,7 @@ impl SubagentRuntime {
         self.worker_notify.notify_waiters();
     }
 
-    async fn run_is_canceled(&self, run_id: &str) -> bool {
+    fn run_is_canceled(&self, run_id: &str) -> bool {
         self.store
             .get_subagent_run(run_id)
             .ok()
@@ -579,7 +578,6 @@ mod tests {
         loop {
             let run = runtime
                 .poll_run(run_id)
-                .await
                 .unwrap()
                 .expect("run should exist");
             if run.status == target_status {
@@ -607,14 +605,12 @@ mod tests {
                 input_json: Some(r#"{"task":"unit-test"}"#.to_string()),
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         assert_eq!(queued.status, SubagentRunStatus::Queued.as_str());
 
         let completed = runtime
             .process_next_run_with(|_run| Ok(r#"{"text":"ok"}"#.to_string()))
-            .await
             .unwrap()
             .unwrap();
 
@@ -661,7 +657,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
         let second = runtime
             .enqueue_run(EnqueueSubagentRunRequest {
@@ -671,7 +666,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         timeout(Duration::from_secs(2), started_rx)
@@ -706,7 +700,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
         let claimed = store.claim_next_queued_subagent_run().unwrap().unwrap();
         assert_eq!(claimed.run_id, queued.run_id);
@@ -750,7 +743,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
         let second = runtime
             .enqueue_run(EnqueueSubagentRunRequest {
@@ -760,7 +752,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let _ = wait_for_status(
@@ -810,7 +801,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
         let second = runtime
             .enqueue_run(EnqueueSubagentRunRequest {
@@ -820,7 +810,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let _ = wait_for_status(
@@ -862,7 +851,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let completed = runtime
@@ -886,7 +874,6 @@ mod tests {
                 input_json: None,
                 session_meta_json: None,
             })
-            .await
             .unwrap();
 
         let err = runtime

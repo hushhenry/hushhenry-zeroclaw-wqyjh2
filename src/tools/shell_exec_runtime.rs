@@ -12,7 +12,7 @@
 
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
-use crate::session::{backlog, ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
+use crate::session::{ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as SyncMutex;
 use regex::Regex;
@@ -119,9 +119,11 @@ struct BacklogSink;
 
 impl ExecEventSink for BacklogSink {
     fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, _snippet: &str) {
-        backlog::enqueue(
+        crate::session::backlog::enqueue(
             session_id,
-            format!("Shell watcher `{event}` matched for run `{run_id}`."),
+            crate::session::backlog::BacklogItem::UserMessage(format!(
+                "Shell watcher `{event}` matched for run `{run_id}`."
+            )),
         );
     }
 }
@@ -170,7 +172,7 @@ impl ShellExecRuntime {
         Ok(runtime_instance)
     }
 
-    pub async fn enqueue_run(&self, request: SpawnExecRunRequest) -> Result<ExecRun> {
+    pub fn enqueue_run(&self, request: SpawnExecRunRequest) -> Result<ExecRun> {
         let run = self.store.enqueue_exec_run(
             request.session_id.as_str(),
             request.command.as_str(),
@@ -183,7 +185,7 @@ impl ShellExecRuntime {
         Ok(run)
     }
 
-    pub async fn poll_run(
+    pub fn poll_run(
         &self,
         run_id: &str,
         since_seq: Option<i64>,
@@ -207,7 +209,7 @@ impl ShellExecRuntime {
 
     /// Returns incremental exec_run_items for action=log. Optional stream filter: "stdout" or "stderr".
     /// Returns None if run_id is not found.
-    pub async fn log_run(
+    pub fn log_run(
         &self,
         run_id: &str,
         since_seq: Option<i64>,
@@ -238,8 +240,7 @@ impl ShellExecRuntime {
         };
 
         if matches!(
-            ExecRunStatus::from_str(existing.status.as_str()),
-            Some(ExecRunStatus::Queued | ExecRunStatus::Running)
+                                    ExecRunStatus::from_str_opt(existing.status.as_str()),            Some(ExecRunStatus::Queued | ExecRunStatus::Running)
         ) {
             if let Some(control) = self.running.lock().await.remove(run_id) {
                 control.cancellation.cancel();
@@ -276,8 +277,8 @@ impl ShellExecRuntime {
         loop {
             self.claim_and_spawn_available_runs().await?;
             tokio::select! {
-                _ = self.worker_notify.notified() => {}
-                _ = time::sleep(self.poll_interval) => {}
+                () = self.worker_notify.notified() => {}
+                () = time::sleep(self.poll_interval) => {}
             }
         }
     }
@@ -320,7 +321,7 @@ impl ShellExecRuntime {
         let result = self.execute_one_run(&run, cancellation.clone()).await;
 
         if let Err(err) = result {
-            if !self.run_is_canceled(run_id.as_str()).await {
+            if !self.run_is_canceled(run_id.as_str()) {
                 let _ = self.store.mark_exec_run_failed(
                     run_id.as_str(),
                     None,
@@ -378,6 +379,7 @@ impl ShellExecRuntime {
         let mut timed_out = false;
         let mut recent_snippet = String::new();
         let sink = Arc::clone(&self.event_sink);
+        #[allow(clippy::cast_sign_loss)]
         let timeout = Duration::from_secs(run.timeout_secs.max(1) as u64);
         let timeout_sleep = time::sleep(timeout);
         tokio::pin!(timeout_sleep);
@@ -385,15 +387,15 @@ impl ShellExecRuntime {
 
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    if !self.run_is_canceled(run.run_id.as_str()).await {
+                    if !self.run_is_canceled(run.run_id.as_str()) {
                         let _ = self.store.mark_exec_run_canceled(run.run_id.as_str());
                     }
                     break;
                 }
-                _ = &mut timeout_sleep => {
+                () = &mut timeout_sleep => {
                     timed_out = true;
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -422,7 +424,7 @@ impl ShellExecRuntime {
                         }
                     }
                 }
-                _ = time::sleep(Duration::from_millis(20)) => {
+                () = time::sleep(Duration::from_millis(20)) => {
                     if let Some(status) = child.try_wait()? {
                         exit_code = status.code().map(i64::from);
                         while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(30), rx.recv()).await {
@@ -453,7 +455,7 @@ impl ShellExecRuntime {
             return Ok(());
         }
 
-        if self.run_is_canceled(run.run_id.as_str()).await {
+        if self.run_is_canceled(run.run_id.as_str()) {
             return Ok(());
         }
 
@@ -477,6 +479,7 @@ impl ShellExecRuntime {
         Ok(())
     }
 
+#[allow(clippy::too_many_arguments)]
     fn process_output_chunk(
         &self,
         run: &ExecRun,
@@ -536,6 +539,7 @@ impl ShellExecRuntime {
             return Ok(());
         }
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let remaining = (run.max_output_bytes - *output_bytes).max(0) as usize;
         if text.len() > remaining {
             text.truncate(text.floor_char_boundary(remaining));
@@ -598,7 +602,7 @@ impl ShellExecRuntime {
         Ok(())
     }
 
-    async fn run_is_canceled(&self, run_id: &str) -> bool {
+    fn run_is_canceled(&self, run_id: &str) -> bool {
         self.store
             .get_exec_run(run_id)
             .ok()
