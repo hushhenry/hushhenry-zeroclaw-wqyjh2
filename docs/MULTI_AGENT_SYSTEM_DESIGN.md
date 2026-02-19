@@ -45,7 +45,7 @@ Everything else ("subagents", "announce", "lanes") is an implementation detail b
 
 - **Per-session serialization:** at most 1 active TurnJob per session.
 - **Internal execution ≠ external delivery:** internal events default to `deliver=false`.
-- **Ephemeral context:** recall/context blocks are built per turn and **must not** be persisted into chat history.
+- **Ephemeral context:** recall/context blocks are built per turn and are **not** written into chat history. (Rationale: prevents transcript bloat, avoids turning recall into permanent “facts”, and keeps retrieval + debugging sane.)
 - **Loop prevention:** idempotency + TTL/hop + no self-send.
 
 ### 2.2 Subagents are just sessions
@@ -53,7 +53,7 @@ Everything else ("subagents", "announce", "lanes") is an implementation detail b
 A “subagent” is not a special runtime. It is simply:
 
 - a **child session** (with its own transcript) whose input events come from a parent session,
-- and whose output is converted into a parent-session followup event (typically via announce meta payload).
+- and whose output is converted into a parent-session **backlog injection** (typically via announce meta payload + a minimal injected message).
 
 ---
 
@@ -72,7 +72,7 @@ Minimum fields:
 - `defaults.system_prompt?`
 - `policy.tools`: allow/deny list (tool registry filter)
 - `policy.skills`: allow/deny list (skill injection filter)
-- `policy.memory`: scope + autosave settings
+- `context_policy`: whether to use memory recall, budgets/filters (memory is global; no agent isolation)
 - `workspace.overlay?`: whether to use `workspace/agents/<agent_id>/...` bootstrap overlays
 
 **Storage options:**
@@ -142,13 +142,13 @@ Child session defaults:
 - `channel = INTERNAL_MESSAGE_CHANNEL`
 - `deliver_policy = false`
 - `owner_session_key = parent_session_key`
-- `lane = subagent` (for concurrency)
+- `lane = subagent` (optional; only if we keep lane-based concurrency)
 
 ### 5.2 Agent-to-agent injection
 
 API concept:
 
-- `inject_message(session_key, message, {channel, deliver, lane, idempotency_key, provenance})`
+- `inject_message(session_key, message, {channel, deliver, idempotency_key, provenance, meta_json})`
 
 This *persists* a new message in the target session and schedules an agent turn.
 
@@ -294,7 +294,7 @@ Implementation notes:
 
 - No time-based collect/debounce window in core.
 - Backlog items are drained and merged into a single `[Backlog]` user message at the start of the next turn.
-- If steering is not possible (no safe boundary), fall back to followup-by-backlog (i.e. enqueue the new message).
+- If steering is not possible (no safe boundary), fall back to **backlog-only** for the new message (i.e. enqueue it and run after the current turn).
 
 Defaults:
 
@@ -322,7 +322,7 @@ Hard rules:
 - internal channel injections never deliver externally.
 
 5) **Reentrancy protection**
-- if a session already has an active turn, injections become followups (or steer/backlog).
+- if a session already has an active turn, inbound messages are handled via **steer-backlog** (steer at safe boundary + backlog resume token).
 
 ---
 
