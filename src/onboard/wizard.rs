@@ -427,11 +427,11 @@ pub fn run_quick_setup(
     if credential_override.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
         println!("    2. Or edit:           ~/.zeroclaw/config.toml");
-        println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
-        println!("    4. Gateway:           zeroclaw gateway");
+        println!("    3. Gateway:           zeroclaw gateway");
+        println!("    4. Chat:             zeroclaw channel start, then use a channel (e.g. Telegram)");
     } else {
-        println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
-        println!("    2. Gateway:  zeroclaw gateway");
+        println!("    1. Gateway:  zeroclaw gateway");
+        println!("    2. Chat:    zeroclaw channel start, then use a channel");
         println!("    3. Status:   zeroclaw status");
     }
     println!();
@@ -3663,21 +3663,13 @@ fn print_summary(config: &Config) {
     }
 
     println!(
-        "    {} Send a quick message:",
+        "    {} Start gateway and chat via a channel:",
         style(format!("{step}.")).cyan().bold()
     );
     println!(
         "       {}",
-        style("zeroclaw agent -m \"Hello, ZeroClaw!\"").yellow()
+        style("zeroclaw gateway  # then zeroclaw channel start").yellow()
     );
-    println!();
-    step += 1;
-
-    println!(
-        "    {} Start interactive CLI mode:",
-        style(format!("{step}.")).cyan().bold()
-    );
-    println!("       {}", style("zeroclaw agent").yellow());
     println!();
     step += 1;
 

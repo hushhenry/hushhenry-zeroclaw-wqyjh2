@@ -115,25 +115,6 @@ enum Commands {
         memory: Option<String>,
     },
 
-    /// Start the AI agent (single message)
-    Agent {
-        /// Message to send (required)
-        #[arg(short, long)]
-        message: Option<String>,
-
-        /// Provider to use (openrouter, anthropic, openai)
-        #[arg(short, long)]
-        provider: Option<String>,
-
-        /// Model to use
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7")]
-        temperature: f64,
-    },
-
     /// Start the gateway server (webhooks, websockets)
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
@@ -409,15 +390,6 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
-
-        Commands::Agent {
-            message,
-            provider,
-            model,
-            temperature,
-        } => agent::run(config, message, provider, model, temperature)
-            .await
-            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

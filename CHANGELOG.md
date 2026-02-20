@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Core Architecture**: Trait-based pluggable system for Provider, Channel, Observer, RuntimeAdapter, Tool
 - **Provider**: OpenRouter implementation (access Claude, GPT-4, Llama, Gemini via single API)
-- **Channels**: CLI channel; agent command is single-message only (-m/--message)
+- **Channels**: CLI channel; chat via gateway or channels (no CLI agent command)
 - **Observability**: NoopObserver (zero overhead), LogObserver (tracing), MultiObserver (fan-out)
 - **Security**: Workspace sandboxing, command allowlisting, path traversal blocking, autonomy levels (ReadOnly/Supervised/Full), rate limiting
 - **Tools**: Shell (sandboxed), FileRead (path-checked), FileWrite (path-checked)
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Runtime**: Native adapter for Mac/Linux/Raspberry Pi
 - **Config**: TOML-based configuration with sensible defaults
 - **Onboarding**: Interactive CLI wizard with workspace scaffolding
-- **CLI Commands**: agent, gateway, status, cron, channel, tools, onboard
+- **CLI Commands**: gateway, status, cron, channel, tools, onboard
 - **CI/CD**: GitHub Actions with cross-platform builds (Linux, macOS Intel/ARM, Windows)
 - **Tests**: 159 inline tests covering all modules and edge cases
 - **Binary**: 3.1MB optimized release build (includes bundled SQLite)

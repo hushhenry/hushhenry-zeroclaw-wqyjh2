@@ -144,12 +144,6 @@ zeroclaw onboard --interactive
 # Or quickly repair channels/allowlists only
 zeroclaw onboard --channels-only
 
-# Chat
-zeroclaw agent -m "Hello, ZeroClaw!"
-
-# Interactive mode
-zeroclaw agent
-
 # Start the gateway (webhook server)
 zeroclaw gateway                # default: 127.0.0.1:8080
 zeroclaw gateway --port 0       # random port (security hardened)
@@ -592,8 +586,6 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `onboard` | Quick setup (default) |
 | `onboard --interactive` | Full interactive 7-step wizard |
 | `onboard --channels-only` | Reconfigure channels/allowlists only (fast repair flow) |
-| `agent -m "..."` | Single message mode |
-| `agent` | Interactive chat mode |
 | `gateway` | Start webhook server (default: `127.0.0.1:8080`) |
 | `gateway --port 0` | Random port mode |
 | `daemon` | Start long-running autonomous runtime |

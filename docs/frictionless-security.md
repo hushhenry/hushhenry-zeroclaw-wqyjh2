@@ -119,7 +119,7 @@ impl SandboxConfig {
 ### 3. First Run: Silent Logging
 
 ```bash
-$ zeroclaw agent -m "hello"
+$ zeroclaw gateway
 
 # First time: silent detection
 [INFO] Detecting security features...
@@ -128,8 +128,8 @@ $ zeroclaw agent -m "hello"
 [INFO] ✓ Audit logging enabled (~/.config/zeroclaw/audit.log)
 
 # Subsequent runs: quiet
-$ zeroclaw agent -m "hello"
-[agent] Thinking...
+$ zeroclaw gateway
+[INFO] Starting ZeroClaw Gateway on ...
 ```
 
 ### 4. Config File: All Defaults Hidden
