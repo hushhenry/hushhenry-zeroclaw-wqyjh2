@@ -318,49 +318,6 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
-            temperature,
-        };
-
-        let mut request = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request);
-
-        request = self.apply_auth(request, credential);
-
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
-        }
-
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
-    }
-
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -405,7 +362,6 @@ impl Provider for AnthropicProvider {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -462,8 +418,16 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = AnthropicProvider::new(None);
+        let messages = [crate::providers::ChatMessage::user("hello")];
         let result = p
-            .chat_with_system(None, "hello", "claude-3-opus", 0.7)
+            .chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-3-opus",
+                0.7,
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -530,10 +494,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_fails_without_key() {
+    async fn chat_with_system_message_fails_without_key() {
         let p = AnthropicProvider::new(None);
+        let messages = [
+            crate::providers::ChatMessage::system("You are ZeroClaw"),
+            crate::providers::ChatMessage::user("hello"),
+        ];
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "hello", "claude-3-opus", 0.7)
+            .chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-3-opus",
+                0.7,
+            )
             .await;
         assert!(result.is_err());
     }

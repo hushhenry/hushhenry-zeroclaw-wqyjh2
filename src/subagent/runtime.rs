@@ -1,9 +1,9 @@
 use crate::config::Config;
 use crate::session::SessionStore;
 use anyhow::Result;
-use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex as SyncMutex;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, Weak};
 
 pub struct SubagentRuntime {
     pub(crate) store: Arc<SessionStore>,
@@ -61,10 +61,7 @@ mod tests {
         let store = Arc::new(SessionStore::new(workspace.path()).unwrap());
         let runtime = SubagentRuntime::new(store);
 
-        let session = runtime
-            .store
-            .create_subagent_session(None, None)
-            .unwrap();
+        let session = runtime.store.create_subagent_session(None, None).unwrap();
         assert!(!session.subagent_session_id.is_empty());
         assert_eq!(session.status, "active");
     }

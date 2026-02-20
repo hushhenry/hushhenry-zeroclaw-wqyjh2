@@ -68,16 +68,6 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<String> {
-        Ok("fallback".into())
-    }
-
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -105,16 +95,6 @@ struct FailingProvider;
 
 #[async_trait]
 impl Provider for FailingProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<String> {
-        anyhow::bail!("provider error")
-    }
-
     async fn chat(
         &self,
         _request: ChatRequest<'_>,
@@ -344,7 +324,9 @@ async fn turn_executes_single_tool_then_returns() {
         text_response("I ran the tool"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(provider.as_ref(), "run echo", &tools).await.unwrap();
+    let (response, _) = run_turn(provider.as_ref(), "run echo", &tools)
+        .await
+        .unwrap();
     assert_eq!(response, "I ran the tool");
 }
 
@@ -509,7 +491,9 @@ async fn xml_dispatcher_parses_and_loops() {
         text_response("XML tool completed"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(provider.as_ref(), "test xml", &tools).await.unwrap();
+    let (response, _) = run_turn(provider.as_ref(), "test xml", &tools)
+        .await
+        .unwrap();
     assert_eq!(response, "XML tool completed");
 }
 
@@ -675,7 +659,10 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     let tool_results_msg = history
         .iter()
         .find(|m| m.role == "user" && m.content.contains("[Tool results]"));
-    assert!(tool_results_msg.is_some(), "Should have [Tool results] user message");
+    assert!(
+        tool_results_msg.is_some(),
+        "Should have [Tool results] user message"
+    );
     let last_assistant = history.iter().rev().find(|m| m.role == "assistant");
     assert_eq!(last_assistant.unwrap().content, "final answer");
 }
@@ -708,7 +695,10 @@ async fn multi_turn_maintains_growing_history() {
     let tools: Vec<Box<dyn Tool>> = vec![];
     let (r1, history) = run_turn(provider.as_ref(), "msg 1", &tools).await.unwrap();
     assert_eq!(r1, "response 1");
-    assert!(history.len() >= 2, "History should have system + user + assistant");
+    assert!(
+        history.len() >= 2,
+        "History should have system + user + assistant"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

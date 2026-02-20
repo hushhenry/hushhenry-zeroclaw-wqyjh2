@@ -277,57 +277,7 @@ pub trait Provider: Send + Sync {
         request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
-        let messages = with_prompt_guided_tools(self, request)?;
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
-        let last_user = messages
-            .iter()
-            .rfind(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-
-        #[allow(deprecated)]
-        let text = self
-            .chat_with_system(system, last_user, model, temperature)
-            .await?;
-
-        Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: Vec::new(),
-        })
-    }
-
-    /// One-shot chat with optional system prompt.
-    ///
-    /// Kept for compatibility and advanced one-shot prompting.
-    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
-        if let Some(system_prompt) = system_prompt {
-            messages.push(ChatMessage::system(system_prompt));
-        }
-        messages.push(ChatMessage::user(message));
-        let response = self
-            .chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                },
-                model,
-                temperature,
-            )
-            .await?;
-        Ok(response.text_or_empty().to_string())
-    }
+    ) -> anyhow::Result<ChatResponse>;
 
     /// Multi-turn conversation compatibility wrapper.
     #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
@@ -388,23 +338,8 @@ pub trait Provider: Send + Sync {
         false
     }
 
-    /// Streaming chat with optional system prompt.
-    /// Returns an async stream of text chunks.
-    /// Default implementation falls back to non-streaming chat.
-    fn stream_chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-        _options: StreamOptions,
-    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // Default: return an empty stream (not supported)
-        stream::empty().boxed()
-    }
-
     /// Streaming chat with history.
-    /// Default implementation falls back to stream_chat_with_system with last user message.
+    /// Default implementation returns an error chunk (streaming not supported).
     fn stream_chat_with_history(
         &self,
         _messages: &[ChatMessage],
@@ -504,14 +439,16 @@ mod tests {
             }
         }
 
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
+            _request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("ok".into())
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -698,14 +635,16 @@ mod tests {
             self.supports_native
         }
 
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system: Option<&str>,
-            _message: &str,
+            _request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("response".to_string())
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("response".to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -751,7 +690,6 @@ mod tests {
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
 
-        // Should return a response (default impl calls chat_with_history).
         assert!(response.text.is_some());
     }
 
@@ -783,14 +721,23 @@ mod tests {
             self.supports_native
         }
 
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            system: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok(system.unwrap_or_default().to_string())
+        ) -> anyhow::Result<ChatResponse> {
+            let messages = with_prompt_guided_tools(self, request)?;
+            let text = messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -809,14 +756,23 @@ mod tests {
             }
         }
 
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            system: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok(system.unwrap_or_default().to_string())
+        ) -> anyhow::Result<ChatResponse> {
+            let messages = with_prompt_guided_tools(self, request)?;
+            let text = messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -835,14 +791,18 @@ mod tests {
             }
         }
 
-        async fn chat_with_system(
+        async fn chat(
             &self,
-            _system: Option<&str>,
-            _message: &str,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("should_not_reach".to_string())
+        ) -> anyhow::Result<ChatResponse> {
+            // Test expects Err when with_prompt_guided_tools rejects non-prompt-guided payload
+            let _ = with_prompt_guided_tools(self, request)?;
+            Ok(ChatResponse {
+                text: Some("should_not_reach".to_string()),
+                tool_calls: vec![],
+            })
         }
     }
 

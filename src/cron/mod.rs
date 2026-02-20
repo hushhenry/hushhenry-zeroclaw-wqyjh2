@@ -14,8 +14,8 @@ pub use schedule::{
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, add_agent_job_with_delivery, add_agent_job_with_source, add_job, add_shell_job,
-    add_shell_job_with_delivery, add_shell_job_with_source, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_shell_job_with_delivery, add_shell_job_with_source, due_jobs, get_job, list_jobs,
+    list_runs, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
@@ -161,7 +161,14 @@ pub fn add_once_at_with_delivery(
     delivery_session_id: Option<String>,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_delivery(config, None, schedule, command, source_session_id, delivery_session_id)
+    add_shell_job_with_delivery(
+        config,
+        None,
+        schedule,
+        command,
+        source_session_id,
+        delivery_session_id,
+    )
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

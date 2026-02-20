@@ -584,35 +584,6 @@ async fn write_file_secure(path: &Path, content: &str) {
 
 #[async_trait]
 impl Provider for CopilotProvider {
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
-        if let Some(system) = system_prompt {
-            messages.push(ApiMessage {
-                role: "system".to_string(),
-                content: Some(system.to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-        messages.push(ApiMessage {
-            role: "user".to_string(),
-            content: Some(message.to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        });
-
-        let response = self
-            .send_chat_request(messages, None, model, temperature)
-            .await?;
-        Ok(response.text.unwrap_or_default())
-    }
-
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],

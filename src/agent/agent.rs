@@ -1,12 +1,10 @@
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher,
-};
+use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::SystemPromptBuilder;
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use crate::providers::{self, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
@@ -277,7 +275,6 @@ impl Agent {
             .auto_save(config.memory.auto_save)
             .build()
     }
-
 }
 
 #[cfg(test)]
@@ -292,16 +289,6 @@ mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> Result<String> {
-            Ok("ok".into())
-        }
-
         async fn chat(
             &self,
             _request: ChatRequest<'_>,

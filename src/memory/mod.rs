@@ -34,10 +34,7 @@ pub fn create_memory(
     match classify_memory_backend(&config.backend) {
         backend::MemoryBackendKind::None => return Ok(Box::new(NoneMemory::new())),
         backend::MemoryBackendKind::Unknown => {
-            tracing::warn!(
-                "Unknown memory backend '{}', using sqlite",
-                config.backend
-            );
+            tracing::warn!("Unknown memory backend '{}', using sqlite", config.backend);
         }
         backend::MemoryBackendKind::Sqlite => {}
     }
@@ -95,9 +92,7 @@ pub fn create_memory_for_migration(
     workspace_dir: &Path,
 ) -> anyhow::Result<Box<dyn Memory>> {
     if classify_memory_backend(backend) == backend::MemoryBackendKind::None {
-        anyhow::bail!(
-            "memory backend 'none' disables persistence; use sqlite before migration"
-        );
+        anyhow::bail!("memory backend 'none' disables persistence; use sqlite before migration");
     }
     Ok(Box::new(SqliteMemory::new(workspace_dir)?))
 }

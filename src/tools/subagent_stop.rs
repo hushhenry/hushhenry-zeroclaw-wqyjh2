@@ -76,7 +76,9 @@ impl Tool for SubagentStopTool {
             });
         }
 
-        runtime.store.mark_subagent_session_stopped(subagent_session_id)?;
+        runtime
+            .store
+            .mark_subagent_session_stopped(subagent_session_id)?;
         let updated = runtime
             .store
             .get_subagent_session(subagent_session_id)?

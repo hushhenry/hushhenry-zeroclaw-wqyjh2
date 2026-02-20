@@ -1827,14 +1827,20 @@ mod tests {
             .create_subagent_session(Some(spec.spec_id.as_str()), None)
             .unwrap();
         assert!(!subagent_session.subagent_session_id.is_empty());
-        assert_eq!(subagent_session.spec_id.as_deref(), Some(spec.spec_id.as_str()));
+        assert_eq!(
+            subagent_session.spec_id.as_deref(),
+            Some(spec.spec_id.as_str())
+        );
         assert_eq!(subagent_session.status, "active");
 
         let looked_up = store
             .get_subagent_session(subagent_session.subagent_session_id.as_str())
             .unwrap()
             .unwrap();
-        assert_eq!(looked_up.subagent_session_id, subagent_session.subagent_session_id);
+        assert_eq!(
+            looked_up.subagent_session_id,
+            subagent_session.subagent_session_id
+        );
     }
 
     #[test]

@@ -313,15 +313,12 @@ fn resolve_delivery_route(
     }
 
     // Legacy: fallback to delivery.channel + delivery.to when no session route is available
-    let channel = delivery
-        .channel
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "delivery requires either a session (delivery_session_id or source_session_id with \
+    let channel = delivery.channel.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "delivery requires either a session (delivery_session_id or source_session_id with \
                  route in session store) or delivery.channel + delivery.to"
-            )
-        })?;
+        )
+    })?;
     let target = delivery
         .to
         .as_deref()
@@ -571,6 +568,7 @@ mod tests {
             enabled: true,
             delivery: DeliveryConfig::default(),
             source_session_id: None,
+            delivery_session_id: None,
             delete_after_run: false,
             created_at: Utc::now(),
             next_run: Utc::now(),

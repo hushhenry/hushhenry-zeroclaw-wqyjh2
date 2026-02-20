@@ -2,6 +2,7 @@
 //! Moved from channels so orchestration lives in agent; channels remain transport-only.
 
 use crate::agent::loop_::run_tool_call_loop;
+use crate::channels::traits;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
     build_system_prompt, channel_delivery_instructions, conversation_memory_key,
@@ -9,7 +10,6 @@ use crate::channels::{
     should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
     INTERNAL_MESSAGE_CHANNEL,
 };
-use crate::channels::traits;
 use crate::memory::MemoryCategory;
 use crate::providers::{self, ChatMessage};
 use crate::session::compaction::{

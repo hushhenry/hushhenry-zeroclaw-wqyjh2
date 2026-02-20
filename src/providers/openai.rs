@@ -225,59 +225,6 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-        };
-
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
-        }
-
-        let chat_response: ChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
-    }
-
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -325,7 +272,6 @@ impl Provider for OpenAiProvider {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -350,16 +296,37 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = OpenAiProvider::new(None);
-        let result = p.chat_with_system(None, "hello", "gpt-4o", 0.7).await;
+        let messages = [super::super::traits::ChatMessage::user("hello")];
+        let result = p
+            .chat(
+                super::super::traits::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-4o",
+                0.7,
+            )
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
 
     #[tokio::test]
-    async fn chat_with_system_fails_without_key() {
+    async fn chat_with_system_message_fails_without_key() {
         let p = OpenAiProvider::new(None);
+        let messages = [
+            super::super::traits::ChatMessage::system("You are ZeroClaw"),
+            super::super::traits::ChatMessage::user("test"),
+        ];
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", 0.5)
+            .chat(
+                super::super::traits::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-4o",
+                0.5,
+            )
             .await;
         assert!(result.is_err());
     }

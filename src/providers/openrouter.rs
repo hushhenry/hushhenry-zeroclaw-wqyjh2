@@ -243,63 +243,6 @@ impl Provider for OpenRouterProvider {
         Ok(())
     }
 
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-        };
-
-        let response = self
-            .client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/zeroclaw",
-            )
-            .header("X-Title", "ZeroClaw")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let chat_response: ApiChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
-    }
-
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -516,10 +459,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_fails_without_key() {
+    async fn chat_fails_without_key() {
         let provider = OpenRouterProvider::new(None);
+        let messages = [
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::user("hello"),
+        ];
         let result = provider
-            .chat_with_system(Some("system"), "hello", "openai/gpt-4o", 0.2)
+            .chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "openai/gpt-4o",
+                0.2,
+            )
             .await;
 
         assert!(result.is_err());

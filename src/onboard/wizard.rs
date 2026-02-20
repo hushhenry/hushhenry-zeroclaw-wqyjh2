@@ -424,7 +424,9 @@ pub fn run_quick_setup(
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
         println!("    2. Or edit:           ~/.zeroclaw/config.toml");
         println!("    3. Gateway:           zeroclaw gateway");
-        println!("    4. Chat:             zeroclaw channel start, then use a channel (e.g. Telegram)");
+        println!(
+            "    4. Chat:             zeroclaw channel start, then use a channel (e.g. Telegram)"
+        );
     } else {
         println!("    1. Gateway:  zeroclaw gateway");
         println!("    2. Chat:    zeroclaw channel start, then use a channel");

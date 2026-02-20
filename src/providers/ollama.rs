@@ -317,63 +317,6 @@ impl Provider for OllamaProvider {
         })
     }
 
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let response = self
-            .send_request(messages, &normalized_model, temperature, should_auth)
-            .await?;
-
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
-        if !response.message.tool_calls.is_empty() {
-            tracing::debug!(
-                "Ollama returned {} tool call(s), formatting for loop parser",
-                response.message.tool_calls.len()
-            );
-            return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
-        }
-
-        // Plain text response
-        let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
-        }
-
-        Ok(content)
-    }
-
     async fn chat_with_history(
         &self,
         messages: &[crate::providers::ChatMessage],

@@ -4,7 +4,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamResult, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -451,93 +451,6 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-            stream: Some(false),
-        };
-
-        let url = self.chat_completions_url();
-
-        let response = self
-            .apply_auth_header(self.client.post(&url).json(&request), credential)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, system_prompt, message, model)
-                    .await
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
-        }
-
-        let chat_response: ApiChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .map_or(false, |t| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.content.unwrap_or_default())
-                } else {
-                    // No tool calls, return content as-is
-                    c.message.content.unwrap_or_default()
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
-    }
-
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -575,7 +488,7 @@ impl Provider for OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status();
 
-            // Mirror chat_with_system: 404 may mean this provider uses the Responses API
+            // Mirror chat: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 // Extract system prompt and last user message for responses fallback
                 let system = messages.iter().find(|m| m.role == "system");
@@ -674,112 +587,9 @@ impl Provider for OpenAiCompatibleProvider {
     fn supports_streaming(&self) -> bool {
         true
     }
-
-    fn stream_chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
-    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
-
-        let mut messages = Vec::new();
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: sys.to_string(),
-            });
-        }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-            stream: Some(options.enabled),
-        };
-
-        let url = self.chat_completions_url();
-        let client = self.client.clone();
-        let auth_header = self.auth_header.clone();
-
-        // Use a channel to bridge the async HTTP response to the stream
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-
-        tokio::spawn(async move {
-            // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
-
-            // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
-
-            // Set accept header for streaming
-            req_builder = req_builder.header("Accept", "text/event-stream");
-
-            // Send request
-            let response = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
-                    return;
-                }
-            };
-
-            // Check status
-            if !response.status().is_success() {
-                let status = response.status();
-                let error = match response.text().await {
-                    Ok(e) => e,
-                    Err(_) => format!("HTTP error: {}", status),
-                };
-                let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
-                    .await;
-                return;
-            }
-
-            // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
-            while let Some(chunk) = chunk_stream.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break; // Receiver dropped
-                }
-            }
-        });
-
-        // Convert channel receiver to stream
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|chunk| (chunk, rx))
-        })
-        .boxed()
-    }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -814,8 +624,16 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = make_provider("Venice", "https://api.venice.ai", None);
+        let messages = [crate::providers::ChatMessage::user("hello")];
         let result = p
-            .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
+            .chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "llama-3.3-70b",
+                0.7,
+            )
             .await;
         assert!(result.is_err());
         assert!(result
@@ -900,7 +718,17 @@ mod tests {
         ];
 
         for p in providers {
-            let result = p.chat_with_system(None, "test", "model", 0.7).await;
+            let messages = [crate::providers::ChatMessage::user("test")];
+            let result = p
+                .chat(
+                    crate::providers::ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                    },
+                    "model",
+                    0.7,
+                )
+                .await;
             assert!(result.is_err(), "{} should fail without key", p.name);
             assert!(
                 result.unwrap_err().to_string().contains("API key not set"),

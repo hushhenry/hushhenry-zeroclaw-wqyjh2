@@ -127,9 +127,9 @@ impl Provider for RouterProvider {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::providers::ChatMessage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_passes_system_prompt() {
+    async fn chat_passes_system_and_user_messages() {
         let mock = Arc::new(MockProvider::new("response"));
         let router = RouterProvider::new(
             vec![(
@@ -346,11 +346,19 @@ mod tests {
             "model".into(),
         );
 
-        let result = router
-            .chat_with_system(Some("system"), "hello", "model", 0.5)
+        let messages = [ChatMessage::system("system"), ChatMessage::user("hello")];
+        let response = router
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "model",
+                0.5,
+            )
             .await
             .unwrap();
-        assert_eq!(result, "response");
+        assert_eq!(response.text_or_empty(), "response");
         assert_eq!(mock.call_count(), 1);
     }
 }
