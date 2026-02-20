@@ -30,7 +30,6 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::build_tool_instructions;
 use crate::agent::turn::{run_memory_turn, run_session_turn};
 use crate::config::Config;
 use crate::identity;
@@ -2089,7 +2088,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let mut system_prompt = build_system_prompt(
+    let system_prompt = build_system_prompt(
         &workspace,
         &model,
         &tool_prompt_entries,
@@ -2097,8 +2096,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref(), None));
-
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",

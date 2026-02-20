@@ -1,7 +1,7 @@
 //! Turn execution: build history, run tool loop, deliver response.
 //! Moved from channels so orchestration lives in agent; channels remain transport-only.
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
     build_system_prompt, channel_delivery_instructions, conversation_memory_key,
@@ -122,7 +122,7 @@ pub(crate) async fn run_turn_core(
                 } else {
                     None
                 };
-                let mut base_prompt = build_system_prompt(
+                let base_prompt = build_system_prompt(
                     &ctx.config.workspace_dir,
                     ctx.model.as_str(),
                     &tool_entries,
@@ -130,10 +130,6 @@ pub(crate) async fn run_turn_core(
                     Some(&ctx.config.identity),
                     bootstrap_max_chars,
                 );
-                base_prompt.push_str(&build_tool_instructions(
-                    ctx.tools_registry.as_ref(),
-                    allowed_tools.as_deref(),
-                ));
                 let merged = build_merged_system_prompt(
                     &base_prompt,
                     channel_delivery_instructions(&msg.channel),

@@ -757,44 +757,6 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
-/// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools. When tool_allow_list is Some, only those tools are listed.
-pub(crate) fn build_tool_instructions(
-    tools_registry: &[Box<dyn Tool>],
-    tool_allow_list: Option<&[String]>,
-) -> String {
-    let mut instructions = String::new();
-    instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
-    );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-    instructions.push_str("### Available Tools\n\n");
-
-    for tool in tools_registry {
-        let allowed = tool_allow_list
-            .map(|allow| allow.iter().any(|n| n == tool.name()))
-            .unwrap_or(true);
-        if allowed {
-            let _ = writeln!(
-                instructions,
-                "**{}**: {}\nParameters: `{}`\n",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
-    }
-
-    instructions
-}
-
 /// One-turn agent loop for tests: builds history and runs run_tool_call_loop with injected provider.
 /// Returns (response_text, final_history) so tests can assert on history when needed.
 #[cfg(test)]
@@ -891,7 +853,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         &model_name,
         &tool_prompt_entries,
@@ -899,7 +861,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry, None));
 
     let mem_context = build_context(mem.as_ref(), message).await;
     let context = mem_context;
@@ -1189,24 +1150,7 @@ I will now call the tool with this payload:
     }
 
     #[test]
-    fn build_tool_instructions_includes_all_tools() {
-        use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &crate::config::AutonomyConfig::default(),
-            std::path::Path::new("/tmp"),
-        ));
-        let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
-
-        assert!(instructions.contains("## Tool Use Protocol"));
-        assert!(instructions.contains("<tool_call>"));
-        assert!(instructions.contains("shell"));
-        assert!(instructions.contains("file_read"));
-        assert!(instructions.contains("file_write"));
-    }
-
-    #[test]
-    fn build_tool_instructions_and_tools_to_specs_respect_allow_list() {
+    fn tools_to_specs_respects_allow_list() {
         use crate::security::SecurityPolicy;
         let security = Arc::new(SecurityPolicy::from_config(
             &crate::config::AutonomyConfig::default(),
@@ -1214,11 +1158,6 @@ I will now call the tool with this payload:
         ));
         let tools = tools::default_tools(security);
         let allow = vec!["shell".to_string(), "file_read".to_string()];
-        let instructions = build_tool_instructions(&tools, Some(&allow));
-        assert!(instructions.contains("shell"));
-        assert!(instructions.contains("file_read"));
-        assert!(!instructions.contains("file_write"));
-
         let specs = tools_to_specs(&tools, Some(&allow));
         let names: Vec<&str> = specs.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names.len(), 2);
