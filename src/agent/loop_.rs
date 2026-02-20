@@ -1,6 +1,4 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
-use crate::config::Config;
-use crate::memory::{self, Memory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
@@ -72,21 +70,9 @@ fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-/// Trigger auto-compaction when non-system message count exceeds this threshold.
-const MAX_HISTORY_MESSAGES: usize = 50;
-
-/// Keep this many most-recent non-system messages after compaction.
-const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
-
-/// Safety cap for compaction source transcript passed to the summarizer.
-const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
-
-/// Max characters retained in stored compaction summary.
-const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
-
 /// Convert a tool registry to provider-agnostic tool specifications.
 /// When tool_allow_list is Some, only include tools whose name is in the list.
-fn tools_to_specs(
+pub(crate) fn tools_to_specs(
     tools_registry: &[Box<dyn Tool>],
     tool_allow_list: Option<&[String]>,
 ) -> Vec<crate::tools::ToolSpec> {
@@ -103,128 +89,6 @@ fn tools_to_specs(
 
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
-}
-
-/// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
-    // Nothing to trim if within limit
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= MAX_HISTORY_MESSAGES {
-        return;
-    }
-
-    let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
-    history.drain(start..start + to_remove);
-}
-
-fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
-    let mut transcript = String::new();
-    for msg in messages {
-        let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
-    }
-
-    if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
-        truncate_with_ellipsis(&transcript, COMPACTION_MAX_SOURCE_CHARS)
-    } else {
-        transcript
-    }
-}
-
-fn apply_compaction_summary(
-    history: &mut Vec<ChatMessage>,
-    start: usize,
-    compact_end: usize,
-    summary: &str,
-) {
-    let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
-    history.splice(start..compact_end, std::iter::once(summary_msg));
-}
-
-async fn auto_compact_history(
-    history: &mut Vec<ChatMessage>,
-    provider: &dyn Provider,
-    model: &str,
-) -> Result<bool> {
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len().saturating_sub(1)
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= MAX_HISTORY_MESSAGES {
-        return Ok(false);
-    }
-
-    let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
-    if compact_count == 0 {
-        return Ok(false);
-    }
-
-    let compact_end = start + compact_count;
-    let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
-    let transcript = build_compaction_transcript(&to_compact);
-
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
-
-    let summary_messages = vec![
-        ChatMessage::system(summarizer_system),
-        ChatMessage::user(summarizer_user),
-    ];
-    let summary_raw = provider
-        .chat(
-            ChatRequest {
-                messages: &summary_messages,
-                tools: None,
-            },
-            model,
-            0.2,
-        )
-        .await
-        .map(|response| response.text_or_empty().to_string())
-        .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
-            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
-
-    let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
-    apply_compaction_summary(history, start, compact_end, &summary);
-
-    Ok(true)
-}
-
-/// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
-    let mut context = String::new();
-
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
-        if !entries.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &entries {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-            }
-            context.push('\n');
-        }
-    }
-
-    context
 }
 
 /// Find a tool by name in the registry.
@@ -1092,67 +956,6 @@ I will now call the tool with this payload:
     }
 
     #[test]
-    fn trim_history_preserves_system_prompt() {
-        let mut history = vec![ChatMessage::system("system prompt")];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        let original_len = history.len();
-        assert!(original_len > MAX_HISTORY_MESSAGES + 1);
-
-        trim_history(&mut history);
-
-        // System prompt preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                             // Most recent messages preserved
-        let last = &history[history.len() - 1];
-        assert_eq!(last.content, format!("msg {}", MAX_HISTORY_MESSAGES + 19));
-    }
-
-    #[test]
-    fn trim_history_noop_when_within_limit() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("hello"),
-            ChatMessage::assistant("hi"),
-        ];
-        trim_history(&mut history);
-        assert_eq!(history.len(), 3);
-    }
-
-    #[test]
-    fn build_compaction_transcript_formats_roles() {
-        let messages = vec![
-            ChatMessage::user("I like dark mode"),
-            ChatMessage::assistant("Got it"),
-        ];
-        let transcript = build_compaction_transcript(&messages);
-        assert!(transcript.contains("USER: I like dark mode"));
-        assert!(transcript.contains("ASSISTANT: Got it"));
-    }
-
-    #[test]
-    fn apply_compaction_summary_replaces_old_segment() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old 1"),
-            ChatMessage::assistant("old 2"),
-            ChatMessage::user("recent 1"),
-            ChatMessage::assistant("recent 2"),
-        ];
-
-        apply_compaction_summary(&mut history, 1, 3, "- user prefers concise replies");
-
-        assert_eq!(history.len(), 4);
-        assert!(history[1].content.contains("Compaction summary"));
-        assert!(history[2].content.contains("recent 1"));
-        assert!(history[3].content.contains("recent 2"));
-    }
-
-    #[test]
     fn autosave_memory_key_has_prefix_and_uniqueness() {
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
@@ -1236,42 +1039,6 @@ Done."#;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Recovery Tests - History Management
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn trim_history_with_no_system_prompt() {
-        // Recovery: History without system prompt should trim correctly
-        let mut history = vec![];
-        for i in 0..MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        trim_history(&mut history);
-        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
-    }
-
-    #[test]
-    fn trim_history_preserves_role_ordering() {
-        // Recovery: After trimming, role ordering should remain consistent
-        let mut history = vec![ChatMessage::system("system")];
-        for i in 0..MAX_HISTORY_MESSAGES + 10 {
-            history.push(ChatMessage::user(format!("user {i}")));
-            history.push(ChatMessage::assistant(format!("assistant {i}")));
-        }
-        trim_history(&mut history);
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[history.len() - 1].role, "assistant");
-    }
-
-    #[test]
-    fn trim_history_with_only_system_prompt() {
-        // Recovery: Only system prompt should not be trimmed
-        let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history);
-        assert_eq!(history.len(), 1);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Arguments Parsing
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -1333,8 +1100,6 @@ Done."#;
     const _: () = {
         assert!(MAX_TOOL_ITERATIONS > 0);
         assert!(MAX_TOOL_ITERATIONS <= 100);
-        assert!(MAX_HISTORY_MESSAGES > 0);
-        assert!(MAX_HISTORY_MESSAGES <= 1000);
     };
 
     #[test]

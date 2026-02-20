@@ -1,7 +1,7 @@
 //! Turn execution: build history, run tool loop, deliver response.
 //! Moved from channels so orchestration lives in agent; channels remain transport-only.
 
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{run_tool_call_loop, tools_to_specs};
 use crate::channels::traits;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
@@ -96,16 +96,11 @@ pub(crate) async fn run_turn_core(
             if let Some(policy) = resolve_agent_spec_policy(store, session_id) {
                 let allowed_tools = policy.tools.clone();
                 let allowed_skills = policy.skills.clone();
-                let tool_entries: Vec<(&str, &str)> = ctx
-                    .tools_registry
+                let filtered_specs =
+                    tools_to_specs(ctx.tools_registry.as_ref(), allowed_tools.as_deref());
+                let tool_entries: Vec<(&str, &str)> = filtered_specs
                     .iter()
-                    .filter(|t| {
-                        allowed_tools
-                            .as_ref()
-                            .map(|allow| allow.iter().any(|n| n == t.name()))
-                            .unwrap_or(true)
-                    })
-                    .map(|t| (t.name(), t.description()))
+                    .map(|t| (t.name.as_str(), t.description.as_str()))
                     .collect();
                 let filtered_skills_vec: Vec<crate::skills::Skill> =
                     if let Some(ref allow) = allowed_skills {

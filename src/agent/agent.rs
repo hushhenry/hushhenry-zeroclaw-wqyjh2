@@ -1,5 +1,4 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
-use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::SystemPromptBuilder;
 use crate::config::Config;
 use crate::memory::{self, Memory};
@@ -19,7 +18,6 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
     model_name: String,
     temperature: f64,
@@ -37,7 +35,6 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
@@ -56,7 +53,6 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_loader: None,
             config: None,
             model_name: None,
             temperature: None,
@@ -94,11 +90,6 @@ impl AgentBuilder {
 
     pub fn tool_dispatcher(mut self, tool_dispatcher: Box<dyn ToolDispatcher>) -> Self {
         self.tool_dispatcher = Some(tool_dispatcher);
-        self
-    }
-
-    pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
-        self.memory_loader = Some(memory_loader);
         self
     }
 
@@ -161,9 +152,6 @@ impl AgentBuilder {
             tool_dispatcher: self
                 .tool_dispatcher
                 .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
@@ -264,7 +252,6 @@ impl Agent {
             .memory(memory)
             .observer(observer)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::default()))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
