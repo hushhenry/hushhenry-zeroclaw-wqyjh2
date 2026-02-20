@@ -30,7 +30,8 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::build_tool_instructions;
+use crate::agent::turn::{run_memory_turn, run_session_turn};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -40,9 +41,8 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::{
-        build_compaction_summary_message, build_merged_system_prompt, estimate_tokens,
-        load_compaction_state, maybe_compact, CompactionState,
-        SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS, SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+        build_compaction_summary_message, build_merged_system_prompt, maybe_compact,
+        CompactionState, SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
     SessionContext, SessionId, SessionKey, SessionMessage, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
@@ -70,34 +70,34 @@ const COMMAND_LIST_LIMIT: u32 = 20;
 pub const INTERNAL_MESSAGE_CHANNEL: &str = "internal";
 const INTERNAL_SESSION_ID_PREFIX: &str = "session:";
 
+/// Timeout for a single turn (LLM + tools). Exposed for agent turn execution.
+pub(crate) const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
+
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-/// Timeout for processing a single channel message (LLM + tools).
-/// 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 
 #[derive(Clone)]
-struct ChannelRuntimeContext {
-    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
-    provider: Arc<dyn Provider>,
-    memory: Arc<dyn Memory>,
-    tools_registry: Arc<Vec<Box<dyn Tool>>>,
-    observer: Arc<dyn Observer>,
-    system_prompt: Arc<String>,
-    model: Arc<String>,
-    temperature: f64,
-    auto_save_memory: bool,
-    session_enabled: bool,
-    session_history_limit: u32,
-    session_store: Option<Arc<SessionStore>>,
-    session_resolver: SessionResolver,
+pub(crate) struct ChannelRuntimeContext {
+    pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) memory: Arc<dyn Memory>,
+    pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub(crate) observer: Arc<dyn Observer>,
+    pub(crate) system_prompt: Arc<String>,
+    pub(crate) model: Arc<String>,
+    pub(crate) temperature: f64,
+    pub(crate) auto_save_memory: bool,
+    pub(crate) session_enabled: bool,
+    pub(crate) session_history_limit: u32,
+    pub(crate) session_store: Option<Arc<SessionStore>>,
+    pub(crate) session_resolver: SessionResolver,
     /// Config for per-session agent/model resolution (multi-agent).
-    config: Arc<Config>,
+    pub(crate) config: Arc<Config>,
     /// All skills (for per-agent filtering in Milestone 2).
-    all_skills: Arc<Vec<crate::skills::Skill>>,
+    pub(crate) all_skills: Arc<Vec<crate::skills::Skill>>,
 }
 
 /// One unit of work for an agent's internal queue. External and internal producers both push this.
@@ -228,7 +228,7 @@ pub fn parse_internal_target_session_id(msg: &traits::ChannelMessage) -> Option<
         .map(|raw| SessionId::from_string(raw.to_string()))
 }
 
-async fn send_delivery_message(
+pub(crate) async fn send_delivery_message(
     target_channel: Option<&Arc<dyn Channel>>,
     delivery_channel_name: &str,
     delivery_reply_target: &str,
@@ -254,7 +254,7 @@ async fn send_delivery_message(
         .await
 }
 
-fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
+pub(crate) fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
@@ -322,11 +322,11 @@ struct AgentSpecDefaults {
 
 /// Allow-list policy for tools and skills (Milestone 2).
 #[derive(serde::Deserialize, Default)]
-struct AgentSpecPolicy {
+pub(crate) struct AgentSpecPolicy {
     #[serde(default)]
-    tools: Option<Vec<String>>,
+    pub(crate) tools: Option<Vec<String>>,
     #[serde(default)]
-    skills: Option<Vec<String>>,
+    pub(crate) skills: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -352,7 +352,7 @@ fn parse_agent_spec_policy(config_json: &str) -> AgentSpecPolicy {
 }
 
 /// Resolve effective provider, model, and temperature for a session (multi-agent turn resolution).
-fn resolve_effective_provider_model(
+pub(crate) fn resolve_effective_provider_model(
     session_store: &SessionStore,
     session_id: &SessionId,
     config: &Config,
@@ -405,7 +405,7 @@ fn resolve_effective_provider_model(
 }
 
 /// Resolve AgentSpec policy for a session (tools/skills allow-lists). Returns None if no active agent or no policy.
-fn resolve_agent_spec_policy(
+pub(crate) fn resolve_agent_spec_policy(
     session_store: &SessionStore,
     session_id: &SessionId,
 ) -> Option<AgentSpecPolicy> {
@@ -926,7 +926,7 @@ fn build_route_metadata(msg: &traits::ChannelMessage) -> SessionRouteMetadata {
     }
 }
 
-fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
@@ -994,7 +994,7 @@ async fn run_manual_session_compaction(
     }
 }
 
-async fn build_memory_context(
+pub(crate) async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     session_id: Option<&str>,
@@ -1070,7 +1070,7 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
 }
 
 /// Returns false when the session is bound to INTERNAL_MESSAGE_CHANNEL (no external delivery). Used for M4 child sessions.
-fn should_deliver_to_external_channel(
+pub(crate) fn should_deliver_to_external_channel(
     session_store: Option<&Arc<SessionStore>>,
     active_session: Option<&SessionId>,
 ) -> bool {
@@ -1084,7 +1084,7 @@ fn should_deliver_to_external_channel(
 }
 
 /// M4: Build ephemeral context from recent announce messages (meta_json with source/result). Not persisted.
-fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
+pub(crate) fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
     const MAX_RESULT_PREVIEW: usize = 120;
     let mut lines: Vec<String> = Vec::new();
     for msg in messages {
@@ -1131,447 +1131,38 @@ fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
     }
 }
 
-/// Core turn execution: build history, run tool loop, deliver response.
-/// `use_session_history` controls whether session history compaction/persistence logic is enabled.
-async fn run_turn_core(
-    ctx: Arc<ChannelRuntimeContext>,
-    active_session: Option<&SessionId>,
-    msg: traits::ChannelMessage,
-    #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
-        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
-    >,
-    use_session_history: bool,
-) -> Result<()> {
-    let mut delivery_channel_name = msg.channel.clone();
-    let mut delivery_reply_target = msg.reply_target.clone();
-    if msg.channel == INTERNAL_MESSAGE_CHANNEL {
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            if let Ok(Some(meta)) = store.load_route_metadata(session_id) {
-                if meta.channel != INTERNAL_MESSAGE_CHANNEL {
-                    delivery_reply_target = meta.route_id.unwrap_or(meta.chat_id);
-                    delivery_channel_name = meta.channel;
-                }
+/// Build session turn history: system prompt, optional compaction summary, tail messages as chat, and the given user message.
+pub(crate) fn build_session_turn_history(
+    system_prompt: &str,
+    compaction_state: &CompactionState,
+    tail_messages: &[SessionMessage],
+    user_content: &str,
+) -> Vec<ChatMessage> {
+    let mut history = vec![ChatMessage::system(system_prompt)];
+    if let Some(summary) = compaction_state.summary.as_deref() {
+        history.push(build_compaction_summary_message(summary));
+    }
+    for message in tail_messages {
+        match SessionMessageRole::from_str(message.role.as_str()) {
+            Some(SessionMessageRole::User) => {
+                history.push(ChatMessage::user(message.content.clone()));
             }
-        }
-    }
-
-    let target_channel = ctx.channels_by_name.get(&delivery_channel_name).cloned();
-    let merged_system_prompt = build_merged_system_prompt(
-        ctx.system_prompt.as_str(),
-        channel_delivery_instructions(&delivery_channel_name),
-    );
-    let enriched_message = if use_session_history {
-        msg.content.clone()
-    } else {
-        let memory_context = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            active_session.map(SessionId::as_str),
-        )
-        .await;
-        if ctx.auto_save_memory {
-            let autosave_key = conversation_memory_key(&msg);
-            let _ = ctx
-                .memory
-                .store(
-                    &autosave_key,
-                    &msg.content,
-                    crate::memory::MemoryCategory::Conversation,
-                    active_session.map(SessionId::as_str),
-                )
-                .await;
-        }
-        if memory_context.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("{memory_context}{}", msg.content)
-        }
-    };
-
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&delivery_reply_target).await {
-            tracing::debug!("Failed to start typing on {}: {e}", channel.name());
-        }
-    }
-
-    println!("  ⏳ Processing message...");
-    let started_at = Instant::now();
-
-    let (effective_system_prompt, tool_allow_list) =
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            if let Some(policy) = resolve_agent_spec_policy(store, session_id) {
-                let allowed_tools = policy.tools.clone();
-                let allowed_skills = policy.skills.clone();
-                let tool_entries: Vec<(&str, &str)> = ctx
-                    .tools_registry
-                    .iter()
-                    .filter(|t| {
-                        allowed_tools
-                            .as_ref()
-                            .map(|allow| allow.iter().any(|n| n == t.name()))
-                            .unwrap_or(true)
-                    })
-                    .map(|t| (t.name(), t.description()))
-                    .collect();
-                let filtered_skills_vec: Vec<crate::skills::Skill> =
-                    if let Some(ref allow) = allowed_skills {
-                        ctx.all_skills
-                            .iter()
-                            .filter(|s| allow.iter().any(|n| n == &s.name))
-                            .cloned()
-                            .collect()
-                    } else {
-                        ctx.all_skills.to_vec()
-                    };
-                let bootstrap_max_chars = if ctx.config.agent.compact_context {
-                    Some(6000)
-                } else {
-                    None
-                };
-                let mut base_prompt = build_system_prompt(
-                    &ctx.config.workspace_dir,
-                    ctx.model.as_str(),
-                    &tool_entries,
-                    &filtered_skills_vec,
-                    Some(&ctx.config.identity),
-                    bootstrap_max_chars,
+            Some(SessionMessageRole::Assistant) => {
+                history.push(ChatMessage::assistant(message.content.clone()));
+            }
+            Some(SessionMessageRole::Tool) => {
+                history.push(ChatMessage::tool(message.content.clone()));
+            }
+            None => {
+                tracing::warn!(
+                    role = message.role.as_str(),
+                    "Skipping unsupported role from stored session history"
                 );
-                base_prompt.push_str(&build_tool_instructions(
-                    ctx.tools_registry.as_ref(),
-                    allowed_tools.as_deref(),
-                ));
-                let merged = build_merged_system_prompt(
-                    &base_prompt,
-                    channel_delivery_instructions(&msg.channel),
-                );
-                (merged, allowed_tools)
-            } else {
-                (merged_system_prompt.clone(), None)
-            }
-        } else {
-            (merged_system_prompt.clone(), None)
-        };
-
-    let mut history = vec![ChatMessage::system(effective_system_prompt.as_str())];
-
-    if use_session_history {
-        if let (Some(session_store), Some(session_id)) =
-            (ctx.session_store.as_ref(), active_session)
-        {
-            let mut compaction_state = match load_compaction_state(session_store, session_id) {
-                Ok(state) => state,
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to load compaction state for session {}: {error}",
-                        session_id.as_str()
-                    );
-                    CompactionState::default()
-                }
-            };
-
-            let mut tail_messages = match session_store
-                .load_messages_after_id(session_id, compaction_state.after_message_id)
-            {
-                Ok(messages) => messages,
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to load session tail history {}: {error}",
-                        session_id.as_str()
-                    );
-                    Vec::new()
-                }
-            };
-
-            if let Some(summary) = compaction_state.summary.as_deref() {
-                history.push(build_compaction_summary_message(summary));
-            }
-            for message in tail_messages.iter().cloned() {
-                match SessionMessageRole::from_str(message.role.as_str()) {
-                    Some(SessionMessageRole::User) => {
-                        history.push(ChatMessage::user(message.content));
-                    }
-                    Some(SessionMessageRole::Assistant) => {
-                        history.push(ChatMessage::assistant(message.content));
-                    }
-                    Some(SessionMessageRole::Tool) => {
-                        history.push(ChatMessage::tool(message.content));
-                    }
-                    None => {
-                        tracing::warn!(
-                            role = message.role.as_str(),
-                            session_id = %session_id.as_str(),
-                            "Skipping unsupported role from stored session history"
-                        );
-                    }
-                }
-            }
-
-            let ephemeral = build_ephemeral_announce_context(&tail_messages);
-            let user_content = if ephemeral.is_empty() {
-                enriched_message.clone()
-            } else {
-                format!("{ephemeral}\n\n{enriched_message}")
-            };
-            history.push(ChatMessage::user(&user_content));
-            if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
-                let keep_recent = usize::try_from(ctx.session_history_limit)
-                    .ok()
-                    .map(|limit| limit.clamp(1, SESSION_COMPACTION_KEEP_RECENT_MESSAGES))
-                    .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES);
-
-                match maybe_compact(
-                    session_store.as_ref(),
-                    session_id,
-                    ctx.provider.as_ref(),
-                    ctx.model.as_str(),
-                    &effective_system_prompt,
-                    keep_recent,
-                )
-                .await
-                {
-                    Ok(outcome) if outcome.compacted => {
-                        compaction_state.summary = outcome.summary;
-                        compaction_state.after_message_id = outcome.after_message_id;
-                        tail_messages = session_store
-                            .load_messages_after_id(session_id, compaction_state.after_message_id)
-                            .unwrap_or_default();
-                        history = vec![ChatMessage::system(effective_system_prompt.clone())];
-                        if let Some(summary) = compaction_state.summary.as_deref() {
-                            history.push(build_compaction_summary_message(summary));
-                        }
-                        for message in tail_messages {
-                            match SessionMessageRole::from_str(message.role.as_str()) {
-                                Some(SessionMessageRole::User) => {
-                                    history.push(ChatMessage::user(message.content));
-                                }
-                                Some(SessionMessageRole::Assistant) => {
-                                    history.push(ChatMessage::assistant(message.content));
-                                }
-                                Some(SessionMessageRole::Tool) => {
-                                    history.push(ChatMessage::tool(message.content));
-                                }
-                                None => {}
-                            }
-                        }
-                        history.push(ChatMessage::user(&enriched_message));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            "Auto-compaction failed for session {}: {error}",
-                            session_id.as_str()
-                        );
-                    }
-                }
-            }
-        } else {
-            history.push(ChatMessage::user(&enriched_message));
-        }
-    } else {
-        history.push(ChatMessage::user(&enriched_message));
-    }
-
-    let (provider_override, model_override, temperature_override) =
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            let (eff_provider, eff_model, eff_temp) =
-                resolve_effective_provider_model(store, session_id, &ctx.config);
-            let default_provider = ctx
-                .config
-                .default_provider
-                .as_deref()
-                .unwrap_or("openrouter");
-            let default_model = ctx
-                .config
-                .default_model
-                .as_deref()
-                .unwrap_or("anthropic/claude-sonnet-4");
-            let default_temperature = ctx.config.default_temperature;
-            if eff_provider != default_provider
-                || eff_model != default_model
-                || (eff_temp - default_temperature).abs() > 1e-9
-            {
-                match providers::create_routed_provider(
-                    &eff_provider,
-                    ctx.config.api_key.as_deref(),
-                    ctx.config.api_url.as_deref(),
-                    &ctx.config.reliability,
-                    &ctx.config.model_routes,
-                    &eff_model,
-                ) {
-                    Ok(provider) => (Some(Arc::from(provider)), Some(eff_model), Some(eff_temp)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to create routed provider for session agent: {e}; using default"
-                        );
-                        (None, None, None)
-                    }
-                }
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-    let provider_ref = provider_override
-        .as_deref()
-        .unwrap_or_else(|| ctx.provider.as_ref());
-    let model_str = model_override
-        .as_deref()
-        .unwrap_or_else(|| ctx.model.as_str());
-    let temp = temperature_override.unwrap_or(ctx.temperature);
-
-    let llm_result = tokio::time::timeout(
-        Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-        run_tool_call_loop(
-            provider_ref,
-            &mut history,
-            ctx.tools_registry.as_ref(),
-            tool_allow_list.as_deref(),
-            ctx.observer.as_ref(),
-            "channel-runtime",
-            model_str,
-            temp,
-            true,
-            None,
-            delivery_channel_name.as_str(),
-            active_session.map(SessionId::as_str),
-            steer_at_checkpoint,
-        ),
-    )
-    .await;
-
-    let deliver = should_deliver_to_external_channel(ctx.session_store.as_ref(), active_session);
-    if deliver {
-        if let Some(channel) = target_channel.as_ref() {
-            if let Err(e) = channel.stop_typing(&delivery_reply_target).await {
-                tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
             }
         }
     }
-
-    match llm_result {
-        Ok(Ok(response)) => {
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
-            );
-            if deliver {
-                if let Err(e) = send_delivery_message(
-                    target_channel.as_ref(),
-                    &delivery_channel_name,
-                    &delivery_reply_target,
-                    &response,
-                )
-                .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", delivery_channel_name);
-                }
-            }
-
-            if use_session_history {
-                if let (Some(session_store), Some(session_id)) =
-                    (ctx.session_store.as_ref(), active_session)
-                {
-                    // Persist the user message we actually replied to (may differ from msg.content
-                    // when steer-merge injected merged content).
-                    let user_content = history
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "user" && !m.content.starts_with("[Tool results]"))
-                        .map(|m| m.content.as_str())
-                        .unwrap_or(msg.content.as_str());
-                    if let Err(error) =
-                        session_store.append_message(session_id, "user", user_content, None)
-                    {
-                        tracing::warn!(
-                            "Failed to persist user session message {}: {error}",
-                            session_id.as_str()
-                        );
-                    }
-                    if let Err(error) =
-                        session_store.append_message(session_id, "assistant", &response, None)
-                    {
-                        tracing::warn!(
-                            "Failed to persist assistant session message {}: {error}",
-                            session_id.as_str()
-                        );
-                    }
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
-                started_at.elapsed().as_millis()
-            );
-            if deliver {
-                if let Err(send_err) = send_delivery_message(
-                    target_channel.as_ref(),
-                    &delivery_channel_name,
-                    &delivery_reply_target,
-                    &format!("⚠️ Error: {e}"),
-                )
-                .await
-                {
-                    tracing::debug!(
-                        "Failed to send model error message on {}: {send_err}",
-                        delivery_channel_name
-                    );
-                }
-            }
-        }
-        Err(_) => {
-            let timeout_msg = format!(
-                "LLM response timed out after {}s",
-                CHANNEL_MESSAGE_TIMEOUT_SECS
-            );
-            eprintln!(
-                "  ❌ {} (elapsed: {}ms)",
-                timeout_msg,
-                started_at.elapsed().as_millis()
-            );
-            if deliver {
-                if let Err(send_err) = send_delivery_message(
-                    target_channel.as_ref(),
-                    &delivery_channel_name,
-                    &delivery_reply_target,
-                    "⚠️ Request timed out while waiting for the model. Please try again.",
-                )
-                .await
-                {
-                    tracing::debug!(
-                        "Failed to send timeout message on {}: {send_err}",
-                        delivery_channel_name
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Session turn entrypoint. Used by the per-session agent loop.
-async fn run_session_turn(
-    ctx: Arc<ChannelRuntimeContext>,
-    session_id: &SessionId,
-    msg: traits::ChannelMessage,
-    #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
-        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
-    >,
-) -> Result<()> {
-    run_turn_core(ctx, Some(session_id), msg, steer_at_checkpoint, true).await
-}
-
-/// Non-session turn entrypoint. Used by direct dispatch path when session mode is disabled.
-async fn run_memory_turn(
-    ctx: Arc<ChannelRuntimeContext>,
-    active_session: Option<&SessionId>,
-    msg: traits::ChannelMessage,
-) -> Result<()> {
-    run_turn_core(ctx, active_session, msg, None, false).await
+    history.push(ChatMessage::user(user_content));
+    history
 }
 
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
