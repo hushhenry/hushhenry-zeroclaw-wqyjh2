@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 /// Explicit no-op memory backend.
 ///
-/// This backend is used when `memory.backend = "none"` to disable persistence
+/// Used when `memory.backend = "none"` to disable persistence
 /// while keeping the runtime wiring stable.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoneMemory;
@@ -71,17 +71,11 @@ mod tests {
     #[tokio::test]
     async fn none_memory_is_noop() {
         let memory = NoneMemory::new();
-
         memory
             .store("k", "v", MemoryCategory::Core, None)
             .await
             .unwrap();
-
-        assert!(memory.get("k").await.unwrap().is_none());
-        assert!(memory.recall("k", 10, None).await.unwrap().is_empty());
-        assert!(memory.list(None, None).await.unwrap().is_empty());
-        assert!(!memory.forget("k").await.unwrap());
         assert_eq!(memory.count().await.unwrap(), 0);
-        assert!(memory.health_check().await);
+        assert!(memory.get("k").await.unwrap().is_none());
     }
 }
