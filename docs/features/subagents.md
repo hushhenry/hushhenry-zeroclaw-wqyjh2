@@ -1,25 +1,20 @@
 # Sub-Agents
 
-Sub-Agents allow the primary ZeroClaw agent to delegate complex or long-running tasks to specialized background agents.
+Sub-Agents allow the primary ZeroClaw agent to delegate to specialized background agents via session-based async flow.
 
 ## 1. Sub-Agent Runtime
-The `SubagentRuntime` manages the lifecycle of delegated tasks. It consists of:
-- **Task Queue**: Runs are enqueued and persisted in `sessions.db`.
-- **Background Worker**: A dedicated loop that claims queued runs and executes them.
-- **Persistence**: Runs are restart-safe. If the agent crashes, "running" tasks are recovered to "queued" on restart.
+The `SubagentRuntime` provides shared access to the session store for subagent sessions. It does not run a background worker; subagent sessions are created and consumed by the async channel/session loop.
 
 ## 2. Delegation Model
 When the primary agent spawns a sub-agent:
-1.  **Creation**: A new `SubagentSession` is created.
-2.  **Prompting**: The sub-agent is given a specific task prompt and optional input data.
-3.  **Specs**: Sub-agents can use different "Specs" (predefined model, provider, and system prompt configurations) to match the complexity of the task (e.g., a "Reviewer" spec vs. a "Coder" spec).
+1. **Creation**: A new `SubagentSession` is created (e.g. via `subagent_send` with prompt/context).
+2. **Specs**: Sub-agents can use different "Specs" (predefined model, provider, and system prompt configurations) when creating a session.
+3. **Session-based**: Execution is driven by the async session model (no oneshot "run" queue).
 
 ## 3. Concurrency & Isolation
-- **Serial per Session**: Within a single `SubagentSession`, runs are executed sequentially to maintain logical order.
-- **Parallel across Sessions**: Different sub-agent sessions (or runs from different users) execute in parallel.
-- **Resource Management**: Each sub-agent turn runs in its own isolated `agent_turn` context with its own iteration limits.
+- **Sessions**: Each sub-agent session is isolated; multiple sessions can exist in parallel.
+- **Resource Management**: When subagent sessions are processed (e.g. by a channel or gateway), each turn runs in its own context with iteration limits.
 
 ## 4. Communication & Results
-- **Polling**: The parent agent can use `subagent_poll` to check the status or retrieve the final output.
-- **Steer-Backlog**: Sub-agents can be configured to notify the parent agent via the session backlog upon completion.
-- **Tooling**: A suite of sub-agent tools (`subagent_spawn`, `subagent_send`, `subagent_poll`, `subagent_stop`) allows for fine-grained control over delegation.
+- **Tooling**: The `subagent_send` tool creates or reuses a subagent session and returns session id and status.
+- **Steer-Backlog**: Sub-agent sessions can carry `parent_session_id` in meta for future announce/backlog integration.

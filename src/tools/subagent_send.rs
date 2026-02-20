@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::subagent::{EnqueueSubagentRunRequest, SubagentRuntime};
+use crate::subagent::SubagentRuntime;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ impl Tool for SubagentSendTool {
     }
 
     fn description(&self) -> &str {
-        "Create a subagent run and enqueue it for async execution"
+        "Create or reuse a subagent session for async delegation"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -31,7 +31,7 @@ impl Tool for SubagentSendTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Task prompt for the subagent run"
+                    "description": "Task prompt or context for the subagent session"
                 },
                 "subagent_session_id": {
                     "type": "string",
@@ -47,11 +47,15 @@ impl Tool for SubagentSendTool {
                 },
                 "input_json": {
                     "type": "string",
-                    "description": "Optional JSON payload forwarded to the run"
+                    "description": "Optional JSON payload to attach to the session context"
                 },
                 "session_meta_json": {
                     "type": "string",
                     "description": "Optional JSON metadata stored on a newly created subagent session"
+                },
+                "parent_session_id": {
+                    "type": "string",
+                    "description": "Optional parent session id; stored in meta when creating a new session"
                 }
             },
             "required": ["prompt"]
@@ -59,7 +63,7 @@ impl Tool for SubagentSendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let prompt = match args
+        let _prompt = match args
             .get("prompt")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
@@ -88,13 +92,12 @@ impl Tool for SubagentSendTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let spec_name = args
+        let _spec_name = args
             .get("spec_name")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-
-        let input_json = args
+        let _input_json = args
             .get("input_json")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
@@ -108,7 +111,6 @@ impl Tool for SubagentSendTool {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        // M4: when creating a new session, merge parent_session_id into meta so announce can target parent
         let session_meta_json = if subagent_session_id.is_none() && parent_session_id.is_some() {
             let mut meta: serde_json::Map<String, serde_json::Value> = session_meta_json
                 .as_deref()
@@ -127,9 +129,8 @@ impl Tool for SubagentSendTool {
         let runtime = SubagentRuntime::shared(Arc::clone(&self.config))?;
         let resolved_spec_id = if spec_id.is_some() || subagent_session_id.is_some() {
             spec_id
-        } else if let Some(name) = spec_name {
-            let store = crate::session::SessionStore::new(&self.config.workspace_dir)?;
-            match store.get_subagent_spec_by_name(name)? {
+        } else if let Some(name) = _spec_name {
+            match runtime.store.get_subagent_spec_by_name(name)? {
                 Some(spec) => Some(spec.spec_id),
                 None => {
                     return Ok(ToolResult {
@@ -143,26 +144,26 @@ impl Tool for SubagentSendTool {
             None
         };
 
-        let run = runtime
-            .enqueue_run(EnqueueSubagentRunRequest {
-                subagent_session_id,
-                spec_id: resolved_spec_id,
-                prompt,
-                input_json,
-                session_meta_json,
-            })
-            .await?;
+        let session = if let Some(id) = subagent_session_id {
+            runtime
+                .store
+                .get_subagent_session(&id)?
+                .ok_or_else(|| anyhow::anyhow!("Subagent session not found: {id}"))?
+        } else {
+            runtime.store.create_subagent_session(
+                resolved_spec_id.as_deref(),
+                session_meta_json.as_deref(),
+            )?
+        };
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "run_id": run.run_id,
-                "subagent_session_id": run.subagent_session_id,
-                "status": run.status,
-                "queued_at": run.queued_at,
-                "started_at": run.started_at,
-                "finished_at": run.finished_at,
-                "updated_at": run.updated_at
+                "subagent_session_id": session.subagent_session_id,
+                "status": session.status,
+                "spec_id": session.spec_id,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at
             }))?,
             error: None,
         })
@@ -176,27 +177,28 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn subagent_send_enqueues_run() {
+    async fn subagent_send_creates_session() {
         let workspace = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         let tool = SubagentSendTool::new(Arc::new(config));
 
         let result = tool
-            .execute(json!({"prompt":"execute task"}))
+            .execute(json!({"prompt": "execute task"}))
             .await
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("queued"));
-
-        let store = SessionStore::new(workspace.path()).unwrap();
         let value: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
-        let run_id = value
-            .get("run_id")
+        let session_id = value
+            .get("subagent_session_id")
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        let run = store.get_subagent_run(run_id).unwrap().unwrap();
-        assert_eq!(run.status, "queued");
+        assert!(!session_id.is_empty());
+        assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("active"));
+
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let session = store.get_subagent_session(session_id).unwrap().unwrap();
+        assert_eq!(session.status, "active");
     }
 }

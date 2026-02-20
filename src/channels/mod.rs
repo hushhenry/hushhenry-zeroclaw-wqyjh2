@@ -611,9 +611,6 @@ async fn handle_slash_command(
             let sessions = session_store
                 .list_subagent_sessions(COMMAND_LIST_LIMIT)
                 .unwrap_or_default();
-            let runs = session_store
-                .list_subagent_runs(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
 
             let mut text = String::new();
             let _ = writeln!(text, "Subagents");
@@ -627,14 +624,6 @@ async fn handle_slash_command(
                     text,
                     "- {} [{}]",
                     session.subagent_session_id, session.status
-                );
-            }
-            let _ = writeln!(text, "runs: {}", runs.len());
-            for run in runs.iter().take(5) {
-                let _ = writeln!(
-                    text,
-                    "- {} [{}] session={}",
-                    run.run_id, run.status, run.subagent_session_id
                 );
             }
 
@@ -2936,15 +2925,8 @@ mod tests {
         let spec = session_store
             .upsert_subagent_spec("reviewer", r#"{"model":"test"}"#)
             .unwrap();
-        let subagent_session = session_store
+        let _subagent_session = session_store
             .create_subagent_session(Some(spec.spec_id.as_str()), None)
-            .unwrap();
-        let _run = session_store
-            .enqueue_subagent_run(
-                subagent_session.subagent_session_id.as_str(),
-                "check code",
-                None,
-            )
             .unwrap();
 
         process_channel_message(
@@ -2958,7 +2940,6 @@ mod tests {
         assert!(sent[0].contains("Subagents"));
         assert!(sent[0].contains("specs: 1"));
         assert!(sent[0].contains("sessions: 1"));
-        assert!(sent[0].contains("runs: 1"));
     }
 
     #[tokio::test]

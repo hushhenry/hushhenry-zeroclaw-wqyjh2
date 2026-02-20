@@ -7,5 +7,5 @@ pub use resolver::{SessionContext, SessionKey, SessionResolver};
 pub use store::{
     AgentSpec, ExecRun, ExecRunItem, ExecRunStatus, SessionChatCandidate, SessionId,
     SessionMessage, SessionMessageRole, SessionRouteMetadata, SessionStore, SessionSummary,
-    SubagentRun, SubagentRunStatus, SubagentSession, SubagentSpec,
+    SubagentSession, SubagentSpec,
 };
