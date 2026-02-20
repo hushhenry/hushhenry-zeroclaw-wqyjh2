@@ -1,5 +1,5 @@
 pub mod audit;
-#[cfg(feature = "sandbox-bubblewrap")]
+#[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
 pub mod bubblewrap;
 pub mod detect;
 pub mod docker;
@@ -9,6 +9,8 @@ pub mod firejail;
 pub mod landlock;
 pub mod pairing;
 pub mod policy;
+#[cfg(target_os = "macos")]
+pub mod sandbox_exec;
 pub mod secrets;
 pub mod traits;
 

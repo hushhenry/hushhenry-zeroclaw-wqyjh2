@@ -1354,8 +1354,11 @@ pub enum SandboxBackend {
     Landlock,
     /// Firejail (user-space sandbox)
     Firejail,
-    /// Bubblewrap (user namespaces)
+    /// Bubblewrap (Linux user namespaces)
     Bubblewrap,
+    /// macOS `sandbox-exec` sandboxing
+    #[serde(rename = "sandbox-exec", alias = "sandboxexec")]
+    SandboxExec,
     /// Docker container isolation
     Docker,
     /// No sandboxing (application-layer only)
@@ -2009,6 +2012,14 @@ mod tests {
         assert_eq!(r.docker.cpu_limit, Some(1.0));
         assert!(r.docker.read_only_rootfs);
         assert!(r.docker.mount_workspace);
+    }
+
+    #[test]
+    fn sandbox_backend_supports_sandbox_exec_aliases() {
+        let hyphen: SandboxBackend = serde_json::from_str("\"sandbox-exec\"").unwrap();
+        let alias: SandboxBackend = serde_json::from_str("\"sandboxexec\"").unwrap();
+        assert!(matches!(hyphen, SandboxBackend::SandboxExec));
+        assert!(matches!(alias, SandboxBackend::SandboxExec));
     }
 
     #[test]

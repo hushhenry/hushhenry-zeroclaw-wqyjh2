@@ -1,9 +1,9 @@
-//! Bubblewrap sandbox (user namespaces for Linux/macOS)
+//! Bubblewrap sandbox (Linux user namespaces)
 
 use crate::security::traits::Sandbox;
 use std::process::Command;
 
-/// Bubblewrap sandbox backend
+/// Bubblewrap sandbox backend for Linux
 #[derive(Debug, Clone, Default)]
 pub struct BubblewrapSandbox;
 
@@ -71,7 +71,7 @@ impl Sandbox for BubblewrapSandbox {
     }
 
     fn description(&self) -> &str {
-        "User namespace sandbox (requires bwrap)"
+        "Linux user namespace sandbox (requires bwrap)"
     }
 }
 

@@ -43,17 +43,26 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Bubblewrap => {
-            #[cfg(feature = "sandbox-bubblewrap")]
+            #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
             {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                {
-                    if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::new() {
-                        return Arc::new(sandbox);
-                    }
+                if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::new() {
+                    return Arc::new(sandbox);
                 }
             }
             tracing::warn!(
                 "Bubblewrap requested but not available, falling back to application-layer"
+            );
+            Arc::new(super::traits::NoopSandbox)
+        }
+        SandboxBackend::SandboxExec => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(sandbox) = super::sandbox_exec::SandboxExecSandbox::new() {
+                    return Arc::new(sandbox);
+                }
+            }
+            tracing::warn!(
+                "sandbox-exec requested but not available, falling back to application-layer"
             );
             Arc::new(super::traits::NoopSandbox)
         }
@@ -93,13 +102,9 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
 
     #[cfg(target_os = "macos")]
     {
-        // Try Bubblewrap on macOS
-        #[cfg(feature = "sandbox-bubblewrap")]
-        {
-            if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::probe() {
-                tracing::info!("Bubblewrap sandbox enabled");
-                return Arc::new(sandbox);
-            }
+        if let Ok(sandbox) = super::sandbox_exec::SandboxExecSandbox::probe() {
+            tracing::info!("sandbox-exec sandbox enabled");
+            return Arc::new(sandbox);
         }
     }
 
@@ -153,5 +158,42 @@ mod tests {
         let sandbox = create_sandbox(&config);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
+    }
+
+    #[test]
+    fn explicit_sandbox_exec_backend_selection() {
+        let config = SecurityConfig {
+            sandbox: SandboxConfig {
+                enabled: Some(true),
+                backend: SandboxBackend::SandboxExec,
+                firejail_args: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(&config);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(sandbox.name() == "sandbox-exec" || sandbox.name() == "none");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(sandbox.name(), "none");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn explicit_bubblewrap_backend_non_linux_falls_back_to_noop() {
+        let config = SecurityConfig {
+            sandbox: SandboxConfig {
+                enabled: Some(true),
+                backend: SandboxBackend::Bubblewrap,
+                firejail_args: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(&config);
+        assert_eq!(sandbox.name(), "none");
     }
 }
