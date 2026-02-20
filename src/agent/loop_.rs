@@ -9,7 +9,6 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::collections::VecDeque;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -508,22 +507,6 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&str>) -> usize {
-    let Some(session_key) = backlog_key else {
-        return 0;
-    };
-
-    let backlog_messages = crate::session::backlog::drain(session_key);
-    if !backlog_messages.is_empty() {
-        history.push(ChatMessage::user(format!(
-            "[Backlog]\n{}",
-            backlog_messages.join("\n")
-        )));
-    }
-
-    backlog_messages.len()
-}
-
 #[derive(Debug)]
 struct ParsedToolCall {
     name: String,
@@ -558,24 +541,19 @@ pub(crate) async fn agent_turn(
         "channel",
         None,
         None,
-        None,
     )
     .await
 }
 
 /// Steer callback: at a tool-call checkpoint, called with the current user message content.
-/// If the implementation has new messages (e.g. drained from a queue), it pushes the current
-/// content to its backlog and returns Some(merged_new_content) to steer the loop.
+/// If the implementation has new messages (e.g. drained from a queue), it returns
+/// Some(merged_content) to steer the next LLM call.
 pub type SteerAtCheckpoint = dyn FnMut(&str) -> Option<String> + Send;
-
-/// The agent's single internal queue. Used for steer-backlog: holds (saved_history, user_msg) to resume after a steered response.
-/// Created once when the agent is created; caller passes Some(&mut queue) when using steer_at_checkpoint.
-pub(crate) type AgentQueue = VecDeque<(Vec<ChatMessage>, ChatMessage)>;
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When tool_allow_list is Some, only those tools are exposed to the model and executable.
-/// When steer_at_checkpoint is Some, it is used at safe boundaries; pass agent_resume_queue so we push/pop there (no local stack).
+/// When steer_at_checkpoint is Some, it is used at safe boundaries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
@@ -589,11 +567,10 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
-    backlog_key: Option<&str>,
+    source_session_id: Option<&str>,
     #[allow(clippy::type_complexity)] mut steer_at_checkpoint: Option<
         &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
     >,
-    mut agent_queue: Option<&mut AgentQueue>,
 ) -> Result<String> {
     let tool_specs = tools_to_specs(tools_registry, tool_allow_list);
     let tool_slice = if tool_specs.is_empty() {
@@ -601,10 +578,6 @@ pub(crate) async fn run_tool_call_loop(
     } else {
         Some(tool_specs.as_slice())
     };
-
-    // Steer-backlog: after each tool round we check the agent queue (via steer_at_checkpoint).
-    // If there are new messages we push (saved_history, user_msg) onto the agent's queue and steer to merged.
-    // When that AI call returns (final response), we pop from the agent's queue and call AI again in this same run.
 
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -675,22 +648,6 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
-
-            // Steer-backlog: if we were steered, resume the original task immediately in this same run:
-            // pop from agent internal queue and call AI again for the message we had pushed.
-            if let Some(q) = agent_queue.as_deref_mut() {
-                if let Some((saved_history, backlog_user_msg)) = q.pop_front() {
-                    tracing::info!(
-                        backlog_key = ?backlog_key,
-                        "steer-backlog: resuming original task after steered response"
-                    );
-                    *history = saved_history;
-                    history.push(backlog_user_msg);
-                    history.push(ChatMessage::assistant(response_text.clone()));
-                    continue;
-                }
-            }
-
             return Ok(display_text);
         }
 
@@ -736,7 +693,7 @@ pub(crate) async fn run_tool_call_loop(
             });
             let start = Instant::now();
             let tool_args =
-                maybe_bind_source_session_id(&call.name, call.arguments.clone(), backlog_key);
+                maybe_bind_source_session_id(&call.name, call.arguments.clone(), source_session_id);
             let disallowed =
                 tool_allow_list.map(|allow| !allow.iter().any(|n| n.as_str() == call.name));
             let result = if disallowed == Some(true) {
@@ -782,8 +739,7 @@ pub(crate) async fn run_tool_call_loop(
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
 
-        // Safe boundary (after each tool round): check agent queue; if non-empty, merge messages,
-        // push current user message onto agent queue, and steer to merged for the next AI call.
+        // Safe boundary (after each tool round): check agent queue and steer to merged content.
         let current_user_content = history
             .iter()
             .rev()
@@ -794,11 +750,7 @@ pub(crate) async fn run_tool_call_loop(
             .as_mut()
             .and_then(|steer| steer(current_user_content));
         if let Some(merged_content) = merged {
-            let backlog_user = ChatMessage::user(merged_content);
-            if let Some(q) = agent_queue.as_deref_mut() {
-                q.push_back((history.clone(), backlog_user.clone()));
-            }
-            history.push(backlog_user);
+            history.push(ChatMessage::user(merged_content));
         }
     }
 
@@ -984,7 +936,6 @@ pub async fn run(
             "cli",
             None,
             None,
-            None,
         )
         .await?;
         final_output = response.clone();
@@ -1060,7 +1011,6 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
-                None,
                 None,
                 None,
             )
@@ -1236,41 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn inject_backlog_messages_drains_and_merges_into_single_user_message() {
-        let session_key = "session-checkpoint-merge";
-        let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "steer one");
-        crate::session::backlog::enqueue(session_key, "steer two");
-
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("task start"),
-        ];
-        let injected = inject_backlog_messages(&mut history, Some(session_key));
-
-        assert_eq!(injected, 2);
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[2].role, "user");
-        assert_eq!(history[2].content, "[Backlog]\nsteer one\nsteer two");
-        assert!(crate::session::backlog::drain(session_key).is_empty());
-    }
-
-    #[test]
-    fn inject_backlog_messages_noop_without_key() {
-        let session_key = "session-noop-without-key";
-        let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "ignored");
-
-        let mut history = vec![ChatMessage::system("system")];
-        let injected = inject_backlog_messages(&mut history, None);
-
-        assert_eq!(injected, 0);
-        assert_eq!(history.len(), 1);
-        let pending = crate::session::backlog::drain(session_key);
-        assert_eq!(pending, vec!["ignored"]);
-    }
-
-    #[test]
     fn maybe_bind_source_session_id_injects_parent_session_id_for_subagent_send() {
         let args = serde_json::json!({"prompt": "task"});
         let out = maybe_bind_source_session_id("subagent_send", args, Some("session-123"));
@@ -1301,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_bind_source_session_id_returns_unchanged_when_no_backlog_key() {
+    fn maybe_bind_source_session_id_returns_unchanged_when_no_source_session_id() {
         let args = serde_json::json!({"prompt": "task"});
         let out = maybe_bind_source_session_id("subagent_send", args, None);
         assert!(out.get("parent_session_id").is_none());

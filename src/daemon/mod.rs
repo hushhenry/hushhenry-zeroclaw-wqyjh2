@@ -195,9 +195,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
-            let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await
-            {
+            let store = crate::session::SessionStore::new(&config.workspace_dir)?;
+            let session_id = store.get_or_create_active(&crate::session::SessionKey::new(
+                "internal:heartbeat:main",
+            ))?;
+            let msg = crate::channels::build_internal_channel_message(
+                "zeroclaw_heartbeat",
+                session_id.as_str(),
+                prompt,
+                None,
+            );
+            if let Err(e) = crate::channels::dispatch_internal_message(msg).await {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
             } else {

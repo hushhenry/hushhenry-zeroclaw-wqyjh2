@@ -1,6 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, LarkChannel, MattermostChannel, SendMessage, SlackChannel,
-    TelegramChannel,
+    build_internal_channel_message, dispatch_internal_message, Channel, DiscordChannel,
+    LarkChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -8,7 +8,7 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
-use crate::session::{SessionId, SessionStore};
+use crate::session::{SessionId, SessionKey, SessionStore};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
@@ -109,31 +109,39 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
-    let model_override = job.model.clone();
-
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
-                config.clone(),
-                Some(prefixed_prompt),
-                None,
-                model_override,
-                config.default_temperature,
-            )
-            .await
-        }
+    let store = match SessionStore::new(&config.workspace_dir) {
+        Ok(s) => s,
+        Err(e) => return (false, format!("agent job enqueue failed: {e}")),
     };
-
-    match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+    let session_id = match job.session_target {
+        SessionTarget::Main => job
+            .source_session_id
+            .as_ref()
+            .map(|id| SessionId::from_string(id.to_string()))
+            .or_else(|| {
+                store
+                    .get_or_create_active(&SessionKey::new("internal:cron:main"))
+                    .ok()
+            }),
+        SessionTarget::Isolated => store
+            .get_or_create_active(&SessionKey::new(format!("internal:cron:{}", job.id)))
+            .ok(),
+    };
+    let Some(session_id) = session_id else {
+        return (
+            false,
+            "agent job enqueue failed: could not resolve target session".to_string(),
+        );
+    };
+    let msg = build_internal_channel_message(
+        "zeroclaw_scheduler",
+        session_id.as_str(),
+        prefixed_prompt,
+        None,
+    );
+    match dispatch_internal_message(msg).await {
+        Ok(()) => (true, "agent job enqueued to internal channel".to_string()),
+        Err(e) => (false, format!("agent job enqueue failed: {e}")),
     }
 }
 
@@ -665,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_agent_job_returns_error_without_provider_key() {
+    async fn run_agent_job_returns_error_when_dispatcher_not_running() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let mut job = test_job("");
@@ -674,7 +682,7 @@ mod tests {
 
         let (success, output) = run_agent_job(&config, &job).await;
         assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert!(output.contains("agent job enqueue failed:"));
     }
 
     #[tokio::test]

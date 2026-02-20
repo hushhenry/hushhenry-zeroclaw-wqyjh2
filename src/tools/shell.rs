@@ -455,7 +455,7 @@ impl Tool for ShellTool {
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Creating session id for routing and backlog delivery"
+                    "description": "Session id used for tool-call routing and watcher correlation"
                 },
                 "run_id": {
                     "type": "string",
@@ -519,7 +519,7 @@ mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use crate::session::{backlog, ExecRunStatus, SessionStore};
+    use crate::session::{ExecRunStatus, SessionStore};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_watcher_match_enqueues_backlog_item() {
+    async fn shell_watcher_match_records_event_item() {
         let tmp = TempDir::new().unwrap();
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised, tmp.path()),
@@ -697,8 +697,28 @@ mod tests {
         let run_id = payload["run_id"].as_str().unwrap();
 
         let _ = wait_for_terminal(&tool, run_id).await;
-        let backlog_items = backlog::drain("session-watch");
-        assert!(backlog_items.iter().any(|item| item.contains("ready")));
+        let log = tool
+            .execute(json!({"action":"log", "run_id": run_id}))
+            .await
+            .unwrap();
+        assert!(log.success, "log failed: {:?}", log.error);
+        let payload: serde_json::Value = serde_json::from_str(log.output.as_str()).unwrap();
+        let empty_items: Vec<serde_json::Value> = Vec::new();
+        let has_ready = payload["items"]
+            .as_array()
+            .unwrap_or(&empty_items)
+            .iter()
+            .any(|item| {
+                item["type"].as_str() == Some("event")
+                    && item["payload"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("ready")
+            });
+        assert!(
+            has_ready,
+            "expected watcher event payload to contain `ready`"
+        );
     }
 
     #[tokio::test]

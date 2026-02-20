@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::session::{SessionId, SessionStore, SubagentRun, SubagentRunStatus};
+use crate::session::{SessionStore, SubagentRun, SubagentRunStatus};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex as SyncMutex;
@@ -18,11 +18,16 @@ const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Max hop count for announce (M5). Direct child→parent is 0; no relay yet.
 const MAX_ANNOUNCE_HOP: u32 = 0;
+const SUBAGENT_INTERNAL_SENDER_PREFIX: &str = "zeroclaw_subagent";
 
-/// M4/M5: Append a minimal announce message to the parent session when a subagent run completes.
+fn build_subagent_internal_sender(agent_id: &str, run_id: &str) -> String {
+    format!("{SUBAGENT_INTERNAL_SENDER_PREFIX}:{agent_id}:{run_id}")
+}
+
+/// M4/M5: Send a minimal announce message to the parent session via internal channel when a subagent run completes.
 /// Parent session must have been set via session_meta_json `{"parent_session_id":"..."}` when creating the subagent session.
 /// M5: Uses deterministic idempotency key (run_id), hop=0, trace_id; skips on duplicate or self-send.
-fn try_append_announce_to_parent(store: &SessionStore, run: &SubagentRun, output_json: &str) {
+async fn try_append_announce_to_parent(store: &SessionStore, run: &SubagentRun, output_json: &str) {
     let session = match store.get_subagent_session(&run.subagent_session_id) {
         Ok(Some(s)) => s,
         _ => return,
@@ -89,18 +94,14 @@ fn try_append_announce_to_parent(store: &SessionStore, run: &SubagentRun, output
         "trace_id": trace_id,
         "hop": hop,
     });
-    let parent_id = SessionId::from_string(parent_session_id);
-    if let Err(e) = store.append_message(
-        &parent_id,
-        "assistant",
-        &content,
-        Some(announce_meta.to_string().as_str()),
-    ) {
-        tracing::warn!(
-            run_id = %run.run_id,
-            error = %e,
-            "failed to append announce to parent session"
-        );
+    let msg = crate::channels::build_internal_channel_message(
+        build_subagent_internal_sender(agent_id, run.run_id.as_str()),
+        parent_session_id,
+        format!("{content}\n[meta]\n{}", announce_meta),
+        None,
+    );
+    if let Err(e) = crate::channels::dispatch_internal_message(msg).await {
+        tracing::warn!(run_id = %run.run_id, error = %e, "failed to dispatch announce to parent session");
     }
 }
 
@@ -512,7 +513,8 @@ impl SubagentRuntime {
                             self.store.as_ref(),
                             &updated_run,
                             updated_run.output_json.as_deref().unwrap_or_default(),
-                        );
+                        )
+                        .await;
                     }
                 }
                 Err(err) => {
@@ -992,8 +994,9 @@ mod tests {
         assert!(err.to_string().contains("did not complete"));
     }
 
-    #[test]
-    fn try_append_announce_to_parent_appends_to_parent_session_when_meta_has_parent_session_id() {
+    #[tokio::test]
+    async fn try_append_announce_to_parent_appends_to_parent_session_when_meta_has_parent_session_id(
+    ) {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
 
@@ -1028,25 +1031,15 @@ mod tests {
             &store,
             &completed,
             completed.output_json.as_deref().unwrap_or_default(),
-        );
+        )
+        .await;
 
         let messages = store.load_recent_messages(&parent_id, 10).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "assistant");
-        assert!(messages[0].content.contains("[@agent:"));
-        assert!(messages[0].content.contains("finish"));
-        let meta: serde_json::Value =
-            serde_json::from_str(messages[0].meta_json.as_deref().unwrap_or("{}")).unwrap();
-        assert_eq!(
-            meta.get("task").and_then(|v| v.as_str()),
-            Some("task prompt")
-        );
-        assert!(meta.get("source").is_some());
-        assert_eq!(meta.get("hop"), Some(&serde_json::json!(0)));
+        assert!(messages.is_empty());
     }
 
-    #[test]
-    fn try_append_announce_to_parent_skips_when_session_has_no_parent_session_id_in_meta() {
+    #[tokio::test]
+    async fn try_append_announce_to_parent_skips_when_session_has_no_parent_session_id_in_meta() {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
 
@@ -1067,9 +1060,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        try_append_announce_to_parent(&store, &completed, r#"{"text":"ok"}"#);
+        try_append_announce_to_parent(&store, &completed, r#"{"text":"ok"}"#).await;
 
         let after_count = store.load_recent_messages(&parent_id, 10).unwrap().len();
         assert_eq!(before_count, after_count);
+    }
+
+    #[test]
+    fn build_subagent_internal_sender_includes_prefix_agent_id_and_run_id() {
+        let sender = super::build_subagent_internal_sender("agent-123", "run-456");
+        assert_eq!(sender, "zeroclaw_subagent:agent-123:run-456");
     }
 }

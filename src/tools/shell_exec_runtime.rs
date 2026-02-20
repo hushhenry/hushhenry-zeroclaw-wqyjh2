@@ -12,7 +12,7 @@
 
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
-use crate::session::{backlog, ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
+use crate::session::{ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as SyncMutex;
 use regex::Regex;
@@ -95,8 +95,7 @@ struct OutputChunk {
     text: String,
 }
 
-/// Sink for exec events (status change, watcher hit, output). Decouples notifications from
-/// backlog; default implementation bridges watcher hits to session backlog.
+/// Sink for exec events (status change, watcher hit, output).
 pub trait ExecEventSink: Send + Sync {
     /// Called when a watcher regex matches. Include bounded snippet so consumers can react without an extra poll.
     fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, snippet: &str);
@@ -114,14 +113,17 @@ pub trait ExecEventSink: Send + Sync {
     }
 }
 
-/// Default sink: bridges watcher hits to session backlog (current system behavior).
-struct BacklogSink;
+/// Default sink: emits watcher hits to tracing.
+struct LoggingSink;
 
-impl ExecEventSink for BacklogSink {
-    fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, _snippet: &str) {
-        backlog::enqueue(
+impl ExecEventSink for LoggingSink {
+    fn on_watcher_hit(&self, run_id: &str, session_id: &str, event: &str, snippet: &str) {
+        tracing::info!(
+            run_id,
             session_id,
-            format!("Shell watcher `{event}` matched for run `{run_id}`."),
+            event,
+            snippet = snippet,
+            "shell watcher matched"
         );
     }
 }
@@ -160,7 +162,7 @@ impl ShellExecRuntime {
             worker_notify: Notify::new(),
             worker_started: AtomicBool::new(false),
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
-            event_sink: Arc::new(BacklogSink),
+            event_sink: Arc::new(LoggingSink),
         });
         runtime_instance.start_background_worker();
 

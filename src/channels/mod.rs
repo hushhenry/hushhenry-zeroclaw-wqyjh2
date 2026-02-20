@@ -30,7 +30,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, AgentQueue};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -52,7 +52,6 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -64,11 +63,12 @@ use uuid::Uuid;
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
-const DEFAULT_QUEUE_MODE: &str = "steer-backlog";
+const DEFAULT_QUEUE_MODE: &str = "steer-merge";
 const COMMAND_LIST_LIMIT: u32 = 20;
 
 /// Reserved channel for internal/child sessions. Sessions with this channel do not deliver to external users (M4).
 pub const INTERNAL_MESSAGE_CHANNEL: &str = "internal";
+const INTERNAL_SESSION_ID_PREFIX: &str = "session:";
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -159,11 +159,99 @@ struct AgentHandle {
     tx: mpsc::Sender<AgentWorkItem>,
 }
 
-/// Registry of per-session agents. Key = session_key. Unregistered when agent loop exits.
+/// Registry of per-session agents. Key = session_id. Unregistered when agent loop exits.
 fn agent_registry() -> Arc<ParkingMutex<HashMap<String, AgentHandle>>> {
     static REGISTRY: LazyLock<Arc<ParkingMutex<HashMap<String, AgentHandle>>>> =
         LazyLock::new(|| Arc::new(ParkingMutex::new(HashMap::new())));
     REGISTRY.clone()
+}
+
+fn internal_dispatch_sender() -> Arc<ParkingMutex<Option<mpsc::Sender<traits::ChannelMessage>>>> {
+    static INTERNAL_DISPATCH: LazyLock<
+        Arc<ParkingMutex<Option<mpsc::Sender<traits::ChannelMessage>>>>,
+    > = LazyLock::new(|| Arc::new(ParkingMutex::new(None)));
+    INTERNAL_DISPATCH.clone()
+}
+
+fn set_internal_dispatch_sender(sender: Option<mpsc::Sender<traits::ChannelMessage>>) {
+    let registry = internal_dispatch_sender();
+    let mut guard = registry.lock();
+    *guard = sender;
+}
+
+pub async fn dispatch_internal_message(message: traits::ChannelMessage) -> Result<()> {
+    let tx_opt = {
+        let registry = internal_dispatch_sender();
+        let guard = registry.lock();
+        guard.clone()
+    };
+    let tx = tx_opt.ok_or_else(|| anyhow::anyhow!("channel dispatcher is not running"))?;
+    tx.send(message)
+        .await
+        .map_err(|_| anyhow::anyhow!("channel dispatcher queue is closed"))
+}
+
+pub fn build_internal_channel_message(
+    sender: impl Into<String>,
+    target_session_id: impl Into<String>,
+    content: impl Into<String>,
+    session_key: Option<&str>,
+) -> traits::ChannelMessage {
+    let chat_id = format!("{INTERNAL_SESSION_ID_PREFIX}{}", target_session_id.into());
+    traits::ChannelMessage {
+        id: Uuid::new_v4().to_string(),
+        agent_id: None,
+        account_id: None,
+        sender: sender.into(),
+        reply_target: chat_id.clone(),
+        content: content.into(),
+        channel: INTERNAL_MESSAGE_CHANNEL.to_string(),
+        title: None,
+        chat_type: traits::ChatType::Direct,
+        raw_chat_type: Some("internal".to_string()),
+        chat_id,
+        thread_id: session_key.map(ToOwned::to_owned),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }
+}
+
+pub fn parse_internal_target_session_id(msg: &traits::ChannelMessage) -> Option<SessionId> {
+    if msg.channel != INTERNAL_MESSAGE_CHANNEL {
+        return None;
+    }
+    msg.chat_id
+        .strip_prefix(INTERNAL_SESSION_ID_PREFIX)
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| SessionId::from_string(raw.to_string()))
+}
+
+async fn send_delivery_message(
+    target_channel: Option<&Arc<dyn Channel>>,
+    delivery_channel_name: &str,
+    delivery_reply_target: &str,
+    content: &str,
+) -> Result<()> {
+    if delivery_channel_name == INTERNAL_MESSAGE_CHANNEL {
+        let target_session_id = delivery_reply_target
+            .strip_prefix(INTERNAL_SESSION_ID_PREFIX)
+            .unwrap_or(delivery_reply_target)
+            .trim();
+        if target_session_id.is_empty() {
+            anyhow::bail!("internal delivery target session_id is empty");
+        }
+        let msg =
+            build_internal_channel_message("zeroclaw_internal", target_session_id, content, None);
+        return dispatch_internal_message(msg).await;
+    }
+
+    let channel = target_channel
+        .ok_or_else(|| anyhow::anyhow!("delivery channel not found: {delivery_channel_name}"))?;
+    channel
+        .send(&SendMessage::new(content, delivery_reply_target))
+        .await
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -1052,12 +1140,24 @@ async fn run_session_turn(
     #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
         &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
     >,
-    agent_queue: Option<&mut AgentQueue>,
 ) -> Result<()> {
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let mut delivery_channel_name = msg.channel.clone();
+    let mut delivery_reply_target = msg.reply_target.clone();
+    if msg.channel == INTERNAL_MESSAGE_CHANNEL {
+        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
+            if let Ok(Some(meta)) = store.load_route_metadata(session_id) {
+                if meta.channel != INTERNAL_MESSAGE_CHANNEL {
+                    delivery_reply_target = meta.route_id.unwrap_or(meta.chat_id);
+                    delivery_channel_name = meta.channel;
+                }
+            }
+        }
+    }
+
+    let target_channel = ctx.channels_by_name.get(&delivery_channel_name).cloned();
     let merged_system_prompt = build_merged_system_prompt(
         ctx.system_prompt.as_str(),
-        channel_delivery_instructions(&msg.channel),
+        channel_delivery_instructions(&delivery_channel_name),
     );
     let enriched_message = if ctx.session_enabled {
         msg.content.clone()
@@ -1088,7 +1188,7 @@ async fn run_session_turn(
     };
 
     if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&msg.reply_target).await {
+        if let Err(e) = channel.start_typing(&delivery_reply_target).await {
             tracing::debug!("Failed to start typing on {}: {e}", channel.name());
         }
     }
@@ -1333,10 +1433,9 @@ async fn run_session_turn(
             temp,
             true,
             None,
-            msg.channel.as_str(),
+            delivery_channel_name.as_str(),
             active_session.map(SessionId::as_str),
             steer_at_checkpoint,
-            agent_queue,
         ),
     )
     .await;
@@ -1344,7 +1443,7 @@ async fn run_session_turn(
     let deliver = should_deliver_to_external_channel(ctx.session_store.as_ref(), active_session);
     if deliver {
         if let Some(channel) = target_channel.as_ref() {
-            if let Err(e) = channel.stop_typing(&msg.reply_target).await {
+            if let Err(e) = channel.stop_typing(&delivery_reply_target).await {
                 tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
             }
         }
@@ -1358,13 +1457,15 @@ async fn run_session_turn(
                 truncate_with_ellipsis(&response, 80)
             );
             if deliver {
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Err(e) = channel
-                        .send(&SendMessage::new(&response, &msg.reply_target))
-                        .await
-                    {
-                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
-                    }
+                if let Err(e) = send_delivery_message(
+                    target_channel.as_ref(),
+                    &delivery_channel_name,
+                    &delivery_reply_target,
+                    &response,
+                )
+                .await
+                {
+                    eprintln!("  ❌ Failed to reply on {}: {e}", delivery_channel_name);
                 }
             }
 
@@ -1373,7 +1474,7 @@ async fn run_session_turn(
                     (ctx.session_store.as_ref(), active_session)
                 {
                     // Persist the user message we actually replied to (may differ from msg.content
-                    // when steer-backlog injected merged content).
+                    // when steer-merge injected merged content).
                     let user_content = history
                         .iter()
                         .rev()
@@ -1405,13 +1506,18 @@ async fn run_session_turn(
                 started_at.elapsed().as_millis()
             );
             if deliver {
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = channel
-                        .send(&SendMessage::new(
-                            format!("⚠️ Error: {e}"),
-                            &msg.reply_target,
-                        ))
-                        .await;
+                if let Err(send_err) = send_delivery_message(
+                    target_channel.as_ref(),
+                    &delivery_channel_name,
+                    &delivery_reply_target,
+                    &format!("⚠️ Error: {e}"),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        "Failed to send model error message on {}: {send_err}",
+                        delivery_channel_name
+                    );
                 }
             }
         }
@@ -1426,13 +1532,18 @@ async fn run_session_turn(
                 started_at.elapsed().as_millis()
             );
             if deliver {
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = channel
-                        .send(&SendMessage::new(
-                            "⚠️ Request timed out while waiting for the model. Please try again.",
-                            &msg.reply_target,
-                        ))
-                        .await;
+                if let Err(send_err) = send_delivery_message(
+                    target_channel.as_ref(),
+                    &delivery_channel_name,
+                    &delivery_reply_target,
+                    "⚠️ Request timed out while waiting for the model. Please try again.",
+                )
+                .await
+                {
+                    tracing::debug!(
+                        "Failed to send timeout message on {}: {send_err}",
+                        delivery_channel_name
+                    );
                 }
             }
         }
@@ -1474,11 +1585,27 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     }
 
     if ctx.session_enabled {
+        let session_id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
+            internal_target
+        } else {
+            let Some(store) = ctx.session_store.as_ref() else {
+                tracing::error!("Session store missing in session mode");
+                return;
+            };
+            match store.get_or_create_active(&session_key) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
+                    return;
+                }
+            }
+        };
+
         // Enqueue to agent's internal queue only; agent loop consumes and runs the turn.
         let work = AgentWorkItem::from_message(&msg);
-        let tx = get_or_create_agent(Arc::clone(&ctx), session_key.clone());
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_id.clone());
         if tx.send(work).await.is_err() {
-            tracing::debug!(session_key = %session_key, "Agent queue closed");
+            tracing::debug!(session_id = %session_id.as_str(), "Agent queue closed");
         }
         return;
     }
@@ -1488,9 +1615,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         .session_store
         .as_ref()
         .and_then(|store| store.get_or_create_active(&session_key).ok());
-    if let Err(e) =
-        run_session_turn(ctx.clone(), active_session.as_ref(), msg, None, None).await
-    {
+    if let Err(e) = run_session_turn(ctx.clone(), active_session.as_ref(), msg, None).await {
         tracing::error!("Session turn failed: {e}");
     }
 }
@@ -1498,9 +1623,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 /// Returns a sender to the agent's queue. Caller enqueues work; agent loop is the only consumer.
 fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
-    session_key: SessionKey,
+    session_id: SessionId,
 ) -> mpsc::Sender<AgentWorkItem> {
-    let key_str = session_key.to_string();
+    let key_str = session_id.as_str().to_string();
     let registry = agent_registry();
     let mut guard = registry.lock();
     if let Some(handle) = guard.get(&key_str) {
@@ -1511,113 +1636,100 @@ fn get_or_create_agent(
     guard.insert(key_str.clone(), handle);
     drop(guard);
     let runner_ctx = Arc::clone(&ctx);
-    let agent_queue: AgentQueue = VecDeque::new();
-    tokio::spawn(agent_loop(
-        registry,
-        key_str,
-        session_key,
-        rx,
-        agent_queue,
-        runner_ctx,
-    ));
+    tokio::spawn(agent_loop(registry, key_str, session_id, rx, runner_ctx));
     tx
 }
 
-/// Drain receiver without blocking; merge all into one work item (content joined, metadata from last).
-fn drain_agent_queue(rx: &mut mpsc::Receiver<AgentWorkItem>) -> Option<AgentWorkItem> {
+/// Drain receiver without blocking.
+fn drain_agent_queue(rx: &mut mpsc::Receiver<AgentWorkItem>) -> Vec<AgentWorkItem> {
     let mut batch: Vec<AgentWorkItem> = Vec::new();
     while let Ok(w) = rx.try_recv() {
         batch.push(w);
     }
+    batch
+}
+
+fn merge_work_items(mut batch: Vec<AgentWorkItem>) -> Option<AgentWorkItem> {
     if batch.is_empty() {
         return None;
     }
-    let merged_content = batch
-        .iter()
-        .map(|w| w.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let last = batch.into_iter().last().unwrap();
+    let last = batch.pop()?;
+    let mut contents: Vec<String> = batch.into_iter().map(|w| w.content).collect();
+    contents.push(last.content.clone());
     Some(AgentWorkItem {
-        content: merged_content,
+        content: contents.join("\n\n"),
         ..last
     })
 }
 
-/// Agent run loop: sole consumer of this agent's queue. Runs one turn per work item; at checkpoints
-/// drains queue for steer-backlog (merge new messages, push current to queue). Unregisters on exit.
-/// The agent's single queue is created at agent creation (get_or_create_agent) and passed in here.
+fn escape_xml_text(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn build_steer_merge_message(current_user_content: &str, pending: Vec<AgentWorkItem>) -> String {
+    let mut out = String::from("<messages>\n");
+    out.push_str("<item>");
+    out.push_str(&escape_xml_text(current_user_content));
+    out.push_str("</item>\n");
+    for item in pending {
+        out.push_str("<item>");
+        out.push_str(&escape_xml_text(item.content.as_str()));
+        out.push_str("</item>\n");
+    }
+    out.push_str("</messages>");
+    out
+}
+
+/// Agent run loop: sole consumer of this agent's queue. Runs one turn per work item and performs
+/// checkpoint steer-merge by non-blocking drain.
 async fn agent_loop(
     registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
     key_str: String,
-    session_key: SessionKey,
+    session_id: SessionId,
     mut rx: mpsc::Receiver<AgentWorkItem>,
-    mut agent_queue: AgentQueue,
     ctx: Arc<ChannelRuntimeContext>,
 ) {
-    let tx = {
-        let guard = registry.lock();
-        guard.get(&key_str).map(|h| h.tx.clone())
-    };
-    let Some(tx) = tx else {
-        return;
-    };
-    let mut backlog: VecDeque<AgentWorkItem> = VecDeque::new();
     loop {
-        let work = backlog.pop_front().or_else(|| drain_agent_queue(&mut rx));
-        let work = match work {
+        let first = match rx.recv().await {
             Some(w) => w,
-            None => match rx.recv().await {
-                Some(w) => w,
-                None => break,
-            },
+            None => break,
         };
-        // Merge any further immediately-available messages
-        let work = match drain_agent_queue(&mut rx) {
-            None => work,
-            Some(d) => AgentWorkItem {
-                content: format!("{}\n\n{}", work.content, d.content),
-                ..d
-            },
+        let mut batch = vec![first];
+        batch.extend(drain_agent_queue(&mut rx));
+        let Some(work) = merge_work_items(batch) else {
+            continue;
         };
+
         let session_store = match ctx.session_store.as_ref() {
             Some(s) => s,
             None => continue,
         };
-        let session_id = match session_store.get_or_create_active(&session_key) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(session_key = %session_key, "Agent get_or_create_active failed: {e}");
-                continue;
-            }
-        };
         let msg = work.to_channel_message();
-        if let Err(e) =
-            session_store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
-        {
-            tracing::warn!(
-                session_id = %session_id.as_str(),
-                "Failed to persist route metadata: {e}"
-            );
+        if msg.channel != INTERNAL_MESSAGE_CHANNEL {
+            if let Err(e) =
+                session_store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
+            {
+                tracing::warn!(
+                    session_id = %session_id.as_str(),
+                    "Failed to persist route metadata: {e}"
+                );
+            }
         }
         let mut steer_fn = |current_user_content: &str| {
-            let merged = drain_agent_queue(&mut rx)?;
-            let _ = tx.try_send(AgentWorkItem {
-                content: current_user_content.to_string(),
-                ..work.clone()
-            });
-            Some(merged.content)
+            let pending = drain_agent_queue(&mut rx);
+            if pending.is_empty() {
+                None
+            } else {
+                Some(build_steer_merge_message(current_user_content, pending))
+            }
         };
-        if let Err(e) = run_session_turn(
-            ctx.clone(),
-            Some(&session_id),
-            msg,
-            Some(&mut steer_fn),
-            Some(&mut agent_queue),
-        )
-        .await
+        if let Err(e) =
+            run_session_turn(ctx.clone(), Some(&session_id), msg, Some(&mut steer_fn)).await
         {
-            tracing::error!(session_key = %session_key, "Agent turn error: {e}");
+            tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
         }
     }
     registry.lock().remove(&key_str);
@@ -1628,10 +1740,6 @@ async fn run_message_dispatch_loop(
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
 ) {
-    if ctx.session_enabled {
-        run_message_dispatch_loop_session(rx, ctx).await;
-        return;
-    }
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
 
@@ -1654,22 +1762,6 @@ async fn run_message_dispatch_loop(
 
     while let Some(result) = workers.join_next().await {
         log_worker_join_result(result);
-    }
-}
-
-/// Session-enabled dispatch: resolve session_key, get or create agent, enqueue to agent's queue only.
-async fn run_message_dispatch_loop_session(
-    mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
-    ctx: Arc<ChannelRuntimeContext>,
-) {
-    while let Some(msg) = rx.recv().await {
-        let session_context = normalize_session_context(&msg);
-        let session_key = ctx.session_resolver.resolve(&session_context);
-        let work = AgentWorkItem::from_message(&msg);
-        let tx = get_or_create_agent(Arc::clone(&ctx), session_key.clone());
-        if tx.send(work).await.is_err() {
-            tracing::debug!(session_key = %session_key, "Agent queue closed");
-        }
     }
 }
 
@@ -2553,6 +2645,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
+    set_internal_dispatch_sender(Some(tx.clone()));
 
     // Spawn a listener for each channel
     let mut handles = Vec::new();
@@ -2566,12 +2659,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
-    let channels_by_name = Arc::new(
-        channels
-            .iter()
-            .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
-            .collect::<HashMap<_, _>>(),
-    );
+    let channels_by_name_map = channels
+        .iter()
+        .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
+        .collect::<HashMap<_, _>>();
+    let channels_by_name = Arc::new(channels_by_name_map);
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -2595,6 +2687,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    set_internal_dispatch_sender(None);
 
     // Wait for all channel tasks
     for h in handles {
@@ -2852,9 +2945,9 @@ mod tests {
             Some(SlashCommand::Compact)
         );
         assert_eq!(
-            parse_slash_command("/queue steer-backlog"),
+            parse_slash_command("/queue steer-merge"),
             Some(SlashCommand::Queue {
-                mode: Some("steer-backlog".to_string())
+                mode: Some("steer-merge".to_string())
             })
         );
         assert_eq!(
@@ -3056,7 +3149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_agent_queue_merges_items_and_keeps_last_metadata() {
+    async fn drain_agent_queue_returns_all_items_in_order() {
         let (tx, mut rx) = mpsc::channel(4);
         let msg1 = traits::ChannelMessage {
             id: "i1".to_string(),
@@ -3108,18 +3201,19 @@ mod tests {
         let _ = tx.send(AgentWorkItem::from_message(&msg3)).await;
         drop(tx);
 
-        let merged = drain_agent_queue(&mut rx);
-        let m = merged.expect("drain should return one merged item");
+        let drained = drain_agent_queue(&mut rx);
+        assert_eq!(drained.len(), 3);
+        let m = merge_work_items(drained).expect("merge should return one merged item");
         assert_eq!(m.content, "one\n\ntwo\n\nthree");
         assert_eq!(m.reply_target, "target-last");
         assert_eq!(m.sender, "u3");
     }
 
     #[tokio::test]
-    async fn drain_agent_queue_returns_none_when_empty() {
+    async fn drain_agent_queue_returns_empty_when_empty() {
         let (_tx, mut rx) = mpsc::channel::<AgentWorkItem>(2);
-        let merged = drain_agent_queue(&mut rx);
-        assert!(merged.is_none());
+        let drained = drain_agent_queue(&mut rx);
+        assert!(drained.is_empty());
     }
 
     #[tokio::test]
@@ -3183,7 +3277,7 @@ mod tests {
 
         process_channel_message(
             runtime_ctx.clone(),
-            session_test_message("/queue steer-backlog", "cmd-queue-1"),
+            session_test_message("/queue steer-merge", "cmd-queue-1"),
         )
         .await;
         process_channel_message(
@@ -3197,11 +3291,11 @@ mod tests {
                 .get_state_key(&session_id, SESSION_QUEUE_MODE_KEY)
                 .unwrap(),
         );
-        assert_eq!(stored_mode.as_deref(), Some("steer-backlog"));
+        assert_eq!(stored_mode.as_deref(), Some("steer-merge"));
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2);
-        assert!(sent[0].contains("`steer-backlog`"));
+        assert!(sent[0].contains("`steer-merge`"));
         assert!(sent[1].contains("Unsupported queue mode"));
     }
 
@@ -3515,8 +3609,8 @@ mod tests {
         }
     }
 
-    /// Provider for steer-backlog test: first call delays then returns tool call; later calls
-    /// return text based on last user message (steered vs backlog).
+    /// Provider for steer-merge test: first call delays then returns tool call; later calls
+    /// return text based on the merged user message.
     struct SteerTestProvider {
         call_count: std::sync::atomic::AtomicUsize,
     }
@@ -3557,7 +3651,12 @@ mod tests {
                 })
             } else if has_tool_results {
                 Ok(ChatResponse {
-                    text: Some("reply to new priority".to_string()),
+                    text: Some("reply to tool results".to_string()),
+                    tool_calls: vec![],
+                })
+            } else if last_user.contains("<messages>") {
+                Ok(ChatResponse {
+                    text: Some("reply to steer merge".to_string()),
                     tool_calls: vec![],
                 })
             } else if last_user.contains("trigger tool") {
@@ -3634,8 +3733,14 @@ mod tests {
         };
 
         let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), key.clone());
-        let tx2 = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let session_id = ctx
+            .session_store
+            .as_ref()
+            .unwrap()
+            .get_or_create_active(&key)
+            .unwrap();
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone());
+        let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id);
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         drop(tx1);
@@ -3698,13 +3803,19 @@ mod tests {
         };
 
         let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let session_id = ctx
+            .session_store
+            .as_ref()
+            .unwrap()
+            .get_or_create_active(&key)
+            .unwrap();
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone());
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         drop(tx1);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let tx2 = get_or_create_agent(ctx, key);
+        let tx2 = get_or_create_agent(ctx, session_id);
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -3718,7 +3829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_steer_backlog_interrupts_current_and_processes_new_then_backlog() {
+    async fn integration_steer_merge_combines_current_and_pending_messages() {
         let temp = TempDir::new().unwrap();
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let provider = Arc::new(SteerTestProvider::default());
@@ -3777,7 +3888,13 @@ mod tests {
         };
 
         let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
-        let tx = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let session_id = ctx
+            .session_store
+            .as_ref()
+            .unwrap()
+            .get_or_create_active(&key)
+            .unwrap();
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_id);
         let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3786,22 +3903,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         let sent = channel_impl.sent_messages.lock().await;
-        assert!(
-            sent.len() >= 2,
-            "steer should deliver reply to new priority then reply to trigger tool; got {}",
-            sent.len()
+        assert_eq!(
+            sent.len(),
+            1,
+            "steer-merge should produce a single merged turn"
         );
-        let first_reply = sent.first().map(String::as_str).unwrap_or("");
-        let second_reply = sent.get(1).map(String::as_str).unwrap_or("");
+        let reply = sent.first().map(String::as_str).unwrap_or("");
         assert!(
-            first_reply.contains("reply to new priority"),
-            "first reply should be to steered message; got: {}",
-            first_reply
-        );
-        assert!(
-            second_reply.contains("reply to trigger tool"),
-            "second reply should be to backlog (original) message; got: {}",
-            second_reply
+            reply.contains("reply to steer merge"),
+            "expected steer-merge reply; got: {}",
+            reply
         );
     }
 
