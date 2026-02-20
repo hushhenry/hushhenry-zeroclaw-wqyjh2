@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::session::{SessionStore, SubagentRun, SubagentRunStatus};
+use crate::session::{SessionId, SessionStore, SubagentRun, SubagentRunStatus};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex as SyncMutex;
@@ -15,6 +15,94 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Max hop count for announce (M5). Direct child→parent is 0; no relay yet.
+const MAX_ANNOUNCE_HOP: u32 = 0;
+
+/// M4/M5: Append a minimal announce message to the parent session when a subagent run completes.
+/// Parent session must have been set via session_meta_json `{"parent_session_id":"..."}` when creating the subagent session.
+/// M5: Uses deterministic idempotency key (run_id), hop=0, trace_id; skips on duplicate or self-send.
+fn try_append_announce_to_parent(store: &SessionStore, run: &SubagentRun, output_json: &str) {
+    let session = match store.get_subagent_session(&run.subagent_session_id) {
+        Ok(Some(s)) => s,
+        _ => return,
+    };
+    let meta: serde_json::Value = match session
+        .meta_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+    {
+        Some(m) => m,
+        _ => return,
+    };
+    let parent_session_id = match meta.get("parent_session_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        _ => return,
+    };
+    // M5: No self-send loops (parent must not be the same entity as child session key).
+    if parent_session_id == run.subagent_session_id {
+        tracing::debug!(
+            run_id = %run.run_id,
+            "skip announce: self-send loop prevention (parent == child_session_key)"
+        );
+        return;
+    }
+    let hop: u32 = 0;
+    if hop > MAX_ANNOUNCE_HOP {
+        tracing::debug!(run_id = %run.run_id, hop, "skip announce: hop exceeds max");
+        return;
+    }
+    // M5: Deterministic idempotency key (one announce per run).
+    let idempotency_key = run.run_id.as_str();
+    match store.try_claim_announce_idempotency(idempotency_key) {
+        Ok(false) => {
+            tracing::debug!(run_id = %run.run_id, "skip announce: duplicate idempotency key");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(run_id = %run.run_id, error = %e, "failed to claim announce idempotency");
+            return;
+        }
+        Ok(true) => {}
+    }
+    let agent_name = session
+        .spec_id
+        .as_deref()
+        .and_then(|spec_id| store.get_subagent_spec_by_id(spec_id).ok().flatten())
+        .map(|spec| spec.name)
+        .unwrap_or_else(|| run.subagent_session_id.clone());
+    let agent_id = session
+        .spec_id
+        .as_deref()
+        .unwrap_or(run.subagent_session_id.as_str());
+    let content = format!("[@agent:{}#{}] finish", agent_name, agent_id);
+    let trace_id = run.run_id.clone();
+    let announce_meta = json!({
+        "task": run.prompt,
+        "result": output_json,
+        "source": {
+            "agent_id": agent_id,
+            "child_session_key": run.subagent_session_id,
+            "run_id": run.run_id,
+        },
+        "idempotency_key": idempotency_key,
+        "trace_id": trace_id,
+        "hop": hop,
+    });
+    let parent_id = SessionId::from_string(parent_session_id);
+    if let Err(e) = store.append_message(
+        &parent_id,
+        "assistant",
+        &content,
+        Some(announce_meta.to_string().as_str()),
+    ) {
+        tracing::warn!(
+            run_id = %run.run_id,
+            error = %e,
+            "failed to append announce to parent session"
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EnqueueSubagentRunRequest {
@@ -417,6 +505,14 @@ impl SubagentRuntime {
                         if !self.run_is_canceled(run_id.as_str()).await {
                             tracing::warn!(run_id = %run_id, error = %err, "failed to mark subagent run succeeded");
                         }
+                    } else if let Ok(Some(updated_run)) =
+                        self.store.get_subagent_run(run_id.as_str())
+                    {
+                        try_append_announce_to_parent(
+                            self.store.as_ref(),
+                            &updated_run,
+                            updated_run.output_json.as_deref().unwrap_or_default(),
+                        );
                     }
                 }
                 Err(err) => {
@@ -450,11 +546,11 @@ impl SubagentRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnqueueSubagentRunRequest, SubagentRunExecutor, SubagentRuntime,
-        DEFAULT_WORKER_POLL_INTERVAL,
+        try_append_announce_to_parent, EnqueueSubagentRunRequest, SubagentRunExecutor,
+        SubagentRuntime, DEFAULT_WORKER_POLL_INTERVAL,
     };
     use crate::config::Config;
-    use crate::session::{SessionStore, SubagentRun, SubagentRunStatus};
+    use crate::session::{SessionKey, SessionStore, SubagentRun, SubagentRunStatus};
     use anyhow::Result;
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -894,5 +990,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("did not complete"));
+    }
+
+    #[test]
+    fn try_append_announce_to_parent_appends_to_parent_session_when_meta_has_parent_session_id() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let parent_key = SessionKey::new("group:test:announce-parent");
+        let parent_id = store.get_or_create_active(&parent_key).unwrap();
+
+        let spec = store
+            .upsert_subagent_spec("runner", r#"{"provider":"ollama","model":"llama3"}"#)
+            .unwrap();
+        let meta_json = serde_json::json!({"parent_session_id": parent_id.as_str()}).to_string();
+        let subagent_session = store
+            .create_subagent_session(Some(spec.spec_id.as_str()), Some(meta_json.as_str()))
+            .unwrap();
+
+        let _ = store
+            .enqueue_subagent_run(
+                subagent_session.subagent_session_id.as_str(),
+                "task prompt",
+                None,
+            )
+            .unwrap();
+        let claimed = store.claim_next_queued_subagent_run().unwrap().unwrap();
+        store
+            .mark_subagent_run_succeeded(claimed.run_id.as_str(), r#"{"text":"done"}"#)
+            .unwrap();
+        let completed = store
+            .get_subagent_run(claimed.run_id.as_str())
+            .unwrap()
+            .unwrap();
+
+        try_append_announce_to_parent(
+            &store,
+            &completed,
+            completed.output_json.as_deref().unwrap_or_default(),
+        );
+
+        let messages = store.load_recent_messages(&parent_id, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0].content.contains("[@agent:"));
+        assert!(messages[0].content.contains("finish"));
+        let meta: serde_json::Value =
+            serde_json::from_str(messages[0].meta_json.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            meta.get("task").and_then(|v| v.as_str()),
+            Some("task prompt")
+        );
+        assert!(meta.get("source").is_some());
+        assert_eq!(meta.get("hop"), Some(&serde_json::json!(0)));
+    }
+
+    #[test]
+    fn try_append_announce_to_parent_skips_when_session_has_no_parent_session_id_in_meta() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let parent_key = SessionKey::new("group:test:no-announce");
+        let parent_id = store.get_or_create_active(&parent_key).unwrap();
+        let before_count = store.load_recent_messages(&parent_id, 10).unwrap().len();
+
+        let subagent_session = store.create_subagent_session(None, None).unwrap();
+        let _run = store
+            .enqueue_subagent_run(subagent_session.subagent_session_id.as_str(), "task", None)
+            .unwrap();
+        let claimed = store.claim_next_queued_subagent_run().unwrap().unwrap();
+        store
+            .mark_subagent_run_succeeded(claimed.run_id.as_str(), r#"{"text":"ok"}"#)
+            .unwrap();
+        let completed = store
+            .get_subagent_run(claimed.run_id.as_str())
+            .unwrap()
+            .unwrap();
+
+        try_append_announce_to_parent(&store, &completed, r#"{"text":"ok"}"#);
+
+        let after_count = store.load_recent_messages(&parent_id, 10).unwrap().len();
+        assert_eq!(before_count, after_count);
     }
 }

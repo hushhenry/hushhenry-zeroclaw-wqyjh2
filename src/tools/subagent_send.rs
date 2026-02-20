@@ -102,6 +102,27 @@ impl Tool for SubagentSendTool {
             .get("session_meta_json")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        let parent_session_id = args
+            .get("parent_session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // M4: when creating a new session, merge parent_session_id into meta so announce can target parent
+        let session_meta_json = if subagent_session_id.is_none() && parent_session_id.is_some() {
+            let mut meta: serde_json::Map<String, serde_json::Value> = session_meta_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v: serde_json::Value| v.as_object().cloned())
+                .unwrap_or_default();
+            meta.insert(
+                "parent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.unwrap().to_string()),
+            );
+            Some(serde_json::to_string(&meta).unwrap_or_default())
+        } else {
+            session_meta_json
+        };
 
         let runtime = SubagentRuntime::shared(Arc::clone(&self.config))?;
         let resolved_spec_id = if spec_id.is_some() || subagent_session_id.is_some() {

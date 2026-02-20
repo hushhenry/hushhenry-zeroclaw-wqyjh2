@@ -9,6 +9,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -85,8 +86,20 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
 /// Convert a tool registry to provider-agnostic tool specifications.
-fn tools_to_specs(tools_registry: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSpec> {
-    tools_registry.iter().map(|tool| tool.spec()).collect()
+/// When tool_allow_list is Some, only include tools whose name is in the list.
+fn tools_to_specs(
+    tools_registry: &[Box<dyn Tool>],
+    tool_allow_list: Option<&[String]>,
+) -> Vec<crate::tools::ToolSpec> {
+    tools_registry
+        .iter()
+        .filter(|tool| {
+            tool_allow_list
+                .map(|allow| allow.iter().any(|n| n == tool.name()))
+                .unwrap_or(true)
+        })
+        .map(|tool| tool.spec())
+        .collect()
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
@@ -229,17 +242,15 @@ fn maybe_bind_source_session_id(
         return arguments;
     };
 
-    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule" | "shell") {
-        return arguments;
-    }
+    let field_name = match tool_name {
+        "cron_add" | "cron_update" | "schedule" => "source_session_id",
+        "shell" => "session_id",
+        "subagent_send" => "parent_session_id",
+        _ => return arguments,
+    };
 
     match arguments {
         serde_json::Value::Object(mut obj) => {
-            let field_name = if tool_name == "shell" {
-                "session_id"
-            } else {
-                "source_session_id"
-            };
             obj.entry(field_name.to_string())
                 .or_insert_with(|| serde_json::Value::String(source_session_id.to_string()));
             serde_json::Value::Object(obj)
@@ -537,6 +548,7 @@ pub(crate) async fn agent_turn(
         provider,
         history,
         tools_registry,
+        None,
         observer,
         provider_name,
         model,
@@ -545,17 +557,31 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         None,
+        None,
+        None,
     )
     .await
 }
 
+/// Steer callback: at a tool-call checkpoint, called with the current user message content.
+/// If the implementation has new messages (e.g. drained from a queue), it pushes the current
+/// content to its backlog and returns Some(merged_new_content) to steer the loop.
+pub type SteerAtCheckpoint = dyn FnMut(&str) -> Option<String> + Send;
+
+/// The agent's single internal queue. Used for steer-backlog: holds (saved_history, user_msg) to resume after a steered response.
+/// Created once when the agent is created; caller passes Some(&mut queue) when using steer_at_checkpoint.
+pub(crate) type AgentQueue = VecDeque<(Vec<ChatMessage>, ChatMessage)>;
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+/// When tool_allow_list is Some, only those tools are exposed to the model and executable.
+/// When steer_at_checkpoint is Some, it is used at safe boundaries; pass agent_resume_queue so we push/pop there (no local stack).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
+    tool_allow_list: Option<&[String]>,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -564,13 +590,21 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     backlog_key: Option<&str>,
+    #[allow(clippy::type_complexity)] mut steer_at_checkpoint: Option<
+        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
+    >,
+    mut agent_queue: Option<&mut AgentQueue>,
 ) -> Result<String> {
-    let tool_specs = tools_to_specs(tools_registry);
+    let tool_specs = tools_to_specs(tools_registry, tool_allow_list);
     let tool_slice = if tool_specs.is_empty() {
         None
     } else {
         Some(tool_specs.as_slice())
     };
+
+    // Steer-backlog: after each tool round we check the agent queue (via steer_at_checkpoint).
+    // If there are new messages we push (saved_history, user_msg) onto the agent's queue and steer to merged.
+    // When that AI call returns (final response), we pop from the agent's queue and call AI again in this same run.
 
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -641,6 +675,22 @@ pub(crate) async fn run_tool_call_loop(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
             history.push(ChatMessage::assistant(response_text.clone()));
+
+            // Steer-backlog: if we were steered, resume the original task immediately in this same run:
+            // pop from agent internal queue and call AI again for the message we had pushed.
+            if let Some(q) = agent_queue.as_deref_mut() {
+                if let Some((saved_history, backlog_user_msg)) = q.pop_front() {
+                    tracing::info!(
+                        backlog_key = ?backlog_key,
+                        "steer-backlog: resuming original task after steered response"
+                    );
+                    *history = saved_history;
+                    history.push(backlog_user_msg);
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    continue;
+                }
+            }
+
             return Ok(display_text);
         }
 
@@ -687,7 +737,14 @@ pub(crate) async fn run_tool_call_loop(
             let start = Instant::now();
             let tool_args =
                 maybe_bind_source_session_id(&call.name, call.arguments.clone(), backlog_key);
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
+            let disallowed =
+                tool_allow_list.map(|allow| !allow.iter().any(|n| n.as_str() == call.name));
+            let result = if disallowed == Some(true) {
+                format!(
+                    "Tool '{}' is not available for this agent (policy restriction).",
+                    call.name
+                )
+            } else if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(tool_args).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -724,15 +781,36 @@ pub(crate) async fn run_tool_call_loop(
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-        let _ = inject_backlog_messages(history, backlog_key);
+
+        // Safe boundary (after each tool round): check agent queue; if non-empty, merge messages,
+        // push current user message onto agent queue, and steer to merged for the next AI call.
+        let current_user_content = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user" && !m.content.starts_with("[Tool results]"))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let merged = steer_at_checkpoint
+            .as_mut()
+            .and_then(|steer| steer(current_user_content));
+        if let Some(merged_content) = merged {
+            let backlog_user = ChatMessage::user(merged_content);
+            if let Some(q) = agent_queue.as_deref_mut() {
+                q.push_back((history.clone(), backlog_user.clone()));
+            }
+            history.push(backlog_user);
+        }
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+/// how to invoke tools. When tool_allow_list is Some, only those tools are listed.
+pub(crate) fn build_tool_instructions(
+    tools_registry: &[Box<dyn Tool>],
+    tool_allow_list: Option<&[String]>,
+) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -748,13 +826,18 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
-        let _ = writeln!(
-            instructions,
-            "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            tool.description(),
-            tool.parameters_schema()
-        );
+        let allowed = tool_allow_list
+            .map(|allow| allow.iter().any(|n| n == tool.name()))
+            .unwrap_or(true);
+        if allowed {
+            let _ = writeln!(
+                instructions,
+                "**{}**: {}\nParameters: `{}`\n",
+                tool.name(),
+                tool.description(),
+                tool.parameters_schema()
+            );
+        }
     }
 
     instructions
@@ -805,8 +888,6 @@ pub async fn run(
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
         &config,
     );
 
@@ -856,7 +937,7 @@ pub async fn run(
     );
 
     // Append structured tool-use instructions with schemas
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    system_prompt.push_str(&build_tool_instructions(&tools_registry, None));
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
@@ -893,6 +974,7 @@ pub async fn run(
             provider.as_ref(),
             &mut history,
             &tools_registry,
+            None,
             observer.as_ref(),
             provider_name,
             model_name,
@@ -900,6 +982,8 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
+            None,
             None,
         )
         .await?;
@@ -968,6 +1052,7 @@ pub async fn run(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
+                None,
                 observer.as_ref(),
                 provider_name,
                 model_name,
@@ -975,6 +1060,8 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
+                None,
                 None,
             )
             .await
@@ -1063,8 +1150,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
         &config,
     );
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -1099,7 +1184,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    system_prompt.push_str(&build_tool_instructions(&tools_registry, None));
 
     let mem_context = build_context(mem.as_ref(), message).await;
     let context = mem_context;
@@ -1184,6 +1269,44 @@ mod tests {
         let pending = crate::session::backlog::drain(session_key);
         assert_eq!(pending, vec!["ignored"]);
     }
+
+    #[test]
+    fn maybe_bind_source_session_id_injects_parent_session_id_for_subagent_send() {
+        let args = serde_json::json!({"prompt": "task"});
+        let out = maybe_bind_source_session_id("subagent_send", args, Some("session-123"));
+        assert_eq!(
+            out.get("parent_session_id").and_then(|v| v.as_str()),
+            Some("session-123")
+        );
+    }
+
+    #[test]
+    fn maybe_bind_source_session_id_injects_session_id_for_shell() {
+        let args = serde_json::json!({"command": "ls"});
+        let out = maybe_bind_source_session_id("shell", args, Some("session-shell"));
+        assert_eq!(
+            out.get("session_id").and_then(|v| v.as_str()),
+            Some("session-shell")
+        );
+    }
+
+    #[test]
+    fn maybe_bind_source_session_id_does_not_override_existing() {
+        let args = serde_json::json!({"prompt": "task", "parent_session_id": "existing"});
+        let out = maybe_bind_source_session_id("subagent_send", args, Some("new-session"));
+        assert_eq!(
+            out.get("parent_session_id").and_then(|v| v.as_str()),
+            Some("existing")
+        );
+    }
+
+    #[test]
+    fn maybe_bind_source_session_id_returns_unchanged_when_no_backlog_key() {
+        let args = serde_json::json!({"prompt": "task"});
+        let out = maybe_bind_source_session_id("subagent_send", args, None);
+        assert!(out.get("parent_session_id").is_none());
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
@@ -1393,13 +1516,34 @@ I will now call the tool with this payload:
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, None);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn build_tool_instructions_and_tools_to_specs_respect_allow_list() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let allow = vec!["shell".to_string(), "file_read".to_string()];
+        let instructions = build_tool_instructions(&tools, Some(&allow));
+        assert!(instructions.contains("shell"));
+        assert!(instructions.contains("file_read"));
+        assert!(!instructions.contains("file_write"));
+
+        let specs = tools_to_specs(&tools, Some(&allow));
+        let names: Vec<&str> = specs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
     }
 
     #[test]
@@ -1410,7 +1554,7 @@ I will now call the tool with this payload:
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let formatted = tools_to_specs(&tools);
+        let formatted = tools_to_specs(&tools, None);
 
         assert!(!formatted.is_empty());
         for tool in &formatted {

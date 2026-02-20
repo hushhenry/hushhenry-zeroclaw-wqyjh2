@@ -48,9 +48,9 @@ where
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(
-                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
+                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to sqlite"
             );
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+            Ok(Box::new(sqlite_builder()?))
         }
     }
 }
@@ -221,14 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_markdown() {
+    fn factory_unknown_falls_back_to_sqlite() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "markdown");
+        assert_eq!(mem.name(), "sqlite");
     }
 
     #[test]

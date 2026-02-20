@@ -102,7 +102,7 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 4;
+const SESSION_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubagentRunStatus {
@@ -179,6 +179,17 @@ pub struct SubagentSession {
     pub created_at: String,
     pub updated_at: String,
     pub meta_json: Option<String>,
+}
+
+/// Multi-agent profile: model defaults + policies (tools/skills/context).
+/// Stored in sessions.db for per-session agent switching.
+#[derive(Debug, Clone)]
+pub struct AgentSpec {
+    pub agent_id: String,
+    pub name: String,
+    pub config_json: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +451,37 @@ impl SessionStore {
             conn.pragma_update(None, "user_version", 4_i64)
                 .context("Failed to set sessions schema version to 4")?;
             version = 4;
+        }
+
+        if version < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_specs (
+                    agent_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_agent_specs_name
+                    ON agent_specs(name);",
+            )
+            .context("Failed to apply sessions schema migration v5")?;
+            conn.pragma_update(None, "user_version", 5_i64)
+                .context("Failed to set sessions schema version to 5")?;
+            version = 5;
+        }
+
+        if version < 6 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS announce_idempotency (
+                    idempotency_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                 );",
+            )
+            .context("Failed to apply sessions schema migration v6")?;
+            conn.pragma_update(None, "user_version", 6_i64)
+                .context("Failed to set sessions schema version to 6")?;
+            version = 6;
         }
 
         if version != SESSION_SCHEMA_VERSION {
@@ -801,6 +843,105 @@ impl SessionStore {
         self.set_state_key(session_id, key, value_json)
     }
 
+    /// Session state key for the active multi-agent profile (agent_specs.agent_id).
+    pub const ACTIVE_AGENT_ID_KEY: &'static str = "active_agent_id";
+    /// Session state key for model override (e.g. "openrouter/anthropic/claude-sonnet-4").
+    pub const MODEL_OVERRIDE_KEY: &'static str = "model_override";
+
+    pub fn list_agent_specs(&self, limit: u32) -> Result<Vec<AgentSpec>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, name, config_json, created_at, updated_at
+                 FROM agent_specs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_agent_specs query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .context("Failed to query agent specs list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode agent specs list")
+    }
+
+    pub fn get_agent_spec_by_id(&self, agent_id: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE agent_id = ?1",
+            params![agent_id],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent spec by id")
+    }
+
+    pub fn get_agent_spec_by_name(&self, name: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent spec by name")
+    }
+
+    pub fn upsert_agent_spec(&self, name: &str, config_json: &str) -> Result<AgentSpec> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO agent_specs (agent_id, name, config_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at",
+            params![agent_id, name, config_json, now],
+        )
+        .context("Failed to upsert agent spec")?;
+
+        let resolved_id = conn
+            .query_row(
+                "SELECT agent_id FROM agent_specs WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .context("Failed to read back agent_id after upsert")?;
+
+        drop(conn);
+        self.get_agent_spec_by_id(&resolved_id)?
+            .ok_or_else(|| anyhow::anyhow!("Agent spec missing after upsert for name '{name}'"))
+    }
+
     pub fn find_chat_candidates_by_title(
         &self,
         title_substring: &str,
@@ -1072,6 +1213,21 @@ impl SessionStore {
             .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
             .context("Failed to query recovered subagent run changes")?;
         Ok(changes.max(0) as usize)
+    }
+
+    /// M5: Claim an idempotency key for announce. Returns true if key was inserted (first use), false if already present (duplicate).
+    pub fn try_claim_announce_idempotency(&self, idempotency_key: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "INSERT OR IGNORE INTO announce_idempotency (idempotency_key, created_at) VALUES (?1, ?2)",
+            params![idempotency_key, now],
+        )
+        .context("Failed to insert announce idempotency key")?;
+        let changes = conn
+            .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
+            .context("Failed to read changes after announce idempotency insert")?;
+        Ok(changes == 1)
     }
 
     fn mark_subagent_run_final(
@@ -1798,6 +1954,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exec_runs_exists, 1);
+
+        let agent_specs_exists: i64 = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_specs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_specs_exists, 1);
+
+        let announce_idempotency_exists: i64 = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='announce_idempotency')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(announce_idempotency_exists, 1);
+    }
+
+    #[test]
+    fn agent_spec_upsert_list_get_by_id_and_name() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let spec = store
+            .upsert_agent_spec(
+                "coder",
+                r#"{"defaults":{"provider":"openrouter","model":"anthropic/claude-sonnet-4","temperature":0.2}}"#,
+            )
+            .unwrap();
+        assert_eq!(spec.name, "coder");
+        assert!(!spec.agent_id.is_empty());
+
+        let by_id = store.get_agent_spec_by_id(&spec.agent_id).unwrap().unwrap();
+        assert_eq!(by_id.name, "coder");
+        let by_name = store.get_agent_spec_by_name("coder").unwrap().unwrap();
+        assert_eq!(by_name.agent_id, spec.agent_id);
+
+        let updated = store
+            .upsert_agent_spec("coder", r#"{"defaults":{"model":"gpt-4"}}"#)
+            .unwrap();
+        assert_eq!(updated.agent_id, spec.agent_id);
+        assert_eq!(updated.config_json, r#"{"defaults":{"model":"gpt-4"}}"#);
+
+        let list = store.list_agent_specs(10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "coder");
+    }
+
+    #[test]
+    fn get_agent_spec_by_id_returns_none_for_unknown_id() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let spec = store.get_agent_spec_by_id("unknown-agent-id").unwrap();
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn list_agent_specs_returns_empty_when_no_specs() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let list = store.list_agent_specs(10).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn session_state_keys_active_agent_id_and_model_override_persist() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let session_key = SessionKey::new("group:test:state-keys");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+
+        store
+            .set_state_key(
+                &session_id,
+                SessionStore::ACTIVE_AGENT_ID_KEY,
+                "\"agent-abc\"",
+            )
+            .unwrap();
+        store
+            .set_state_key(
+                &session_id,
+                SessionStore::MODEL_OVERRIDE_KEY,
+                "\"openrouter/anthropic/claude-sonnet-4\"",
+            )
+            .unwrap();
+
+        let active = store
+            .get_state_key(&session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
+            .unwrap();
+        assert_eq!(active.as_deref(), Some("\"agent-abc\""));
+
+        let model = store
+            .get_state_key(&session_id, SessionStore::MODEL_OVERRIDE_KEY)
+            .unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("\"openrouter/anthropic/claude-sonnet-4\"")
+        );
+    }
+
+    #[test]
+    fn announce_idempotency_first_claim_succeeds_second_is_duplicate() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let key = "announce:run-123";
+        assert!(store.try_claim_announce_idempotency(key).unwrap());
+        assert!(!store.try_claim_announce_idempotency(key).unwrap());
+        assert!(!store.try_claim_announce_idempotency(key).unwrap());
+        assert!(store
+            .try_claim_announce_idempotency("announce:run-456")
+            .unwrap());
     }
 
     #[test]

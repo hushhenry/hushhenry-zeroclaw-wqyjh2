@@ -3,7 +3,6 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -82,39 +81,6 @@ pub struct Config {
 
     #[serde(default)]
     pub cost: CostConfig,
-
-    /// Legacy delegate agent configurations.
-    /// Deprecated: entries are mapped into subagent specs for compatibility.
-    #[serde(default)]
-    pub agents: HashMap<String, DelegateAgentConfig>,
-}
-
-// ── Delegate Agents ──────────────────────────────────────────────
-
-/// Configuration for a legacy delegate agent entry in config.
-/// Deprecated: parsed for compatibility and mapped to subagent specs at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
-    pub provider: String,
-    /// Model name
-    pub model: String,
-    /// Optional system prompt for the sub-agent
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    /// Optional API key override
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Temperature override
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    /// Max recursion depth for nested delegation
-    #[serde(default = "default_max_depth")]
-    pub max_depth: u32,
-}
-
-fn default_max_depth() -> u32 {
-    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1545,7 +1511,6 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
         }
     }
 }
@@ -1731,14 +1696,6 @@ fn encrypt_optional_secret(
 }
 
 impl Config {
-    fn warn_legacy_agents_usage(&self) {
-        if !self.agents.is_empty() {
-            tracing::warn!(
-                "config.agents is deprecated and delegate tool is removed; legacy agents will be mapped to subagent specs for compatibility"
-            );
-        }
-    }
-
     pub fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -1799,11 +1756,7 @@ impl Config {
                 "config.browser.computer_use.api_key",
             )?;
 
-            for agent in config.agents.values_mut() {
-                decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-            }
             config.apply_env_overrides();
-            config.warn_legacy_agents_usage();
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -1819,7 +1772,6 @@ impl Config {
             }
 
             config.apply_env_overrides();
-            config.warn_legacy_agents_usage();
             Ok(config)
         }
     }
@@ -1926,10 +1878,6 @@ impl Config {
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
         )?;
-
-        for agent in config_to_save.agents.values_mut() {
-            encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-        }
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
@@ -2199,7 +2147,6 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2306,7 +2253,6 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
         };
 
         config.save().unwrap();
@@ -2342,18 +2288,6 @@ tool_dispatcher = "xml"
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
 
-        config.agents.insert(
-            "worker".into(),
-            DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
-                system_prompt: None,
-                api_key: Some("agent-credential".into()),
-                temperature: None,
-                max_depth: 3,
-            },
-        );
-
         config.save().unwrap();
 
         let contents = fs::read_to_string(config.config_path.clone()).unwrap();
@@ -2381,11 +2315,6 @@ tool_dispatcher = "xml"
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
         );
-
-        let worker = stored.agents.get("worker").unwrap();
-        let worker_encrypted = worker.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
-        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let _ = fs::remove_dir_all(&dir);
     }

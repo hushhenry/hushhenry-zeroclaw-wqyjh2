@@ -26,7 +26,6 @@ pub mod shell;
 mod shell_exec_runtime;
 pub mod subagent_poll;
 pub mod subagent_send;
-pub mod subagent_spawn_oneshot;
 pub mod subagent_stop;
 pub mod traits;
 
@@ -58,19 +57,15 @@ pub use sessions_send::SessionsSendTool;
 pub use shell::ShellTool;
 pub use subagent_poll::SubagentPollTool;
 pub use subagent_send::SubagentSendTool;
-pub use subagent_spawn_oneshot::SubagentSpawnOneshotTool;
 pub use subagent_stop::SubagentStopTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 
-use crate::config::{Config, DelegateAgentConfig};
+use crate::config::Config;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use crate::session::SessionStore;
-use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Create the default tool registry
@@ -101,8 +96,6 @@ pub fn all_tools(
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig>,
-    fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
@@ -115,8 +108,6 @@ pub fn all_tools(
         browser_config,
         http_config,
         workspace_dir,
-        agents,
-        fallback_api_key,
         root_config,
     )
 }
@@ -133,12 +124,8 @@ pub fn all_tools_with_runtime(
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig>,
-    fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
-    sync_legacy_delegate_agents_to_subagent_specs(workspace_dir, agents, fallback_api_key);
-
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
@@ -165,7 +152,6 @@ pub fn all_tools_with_runtime(
         Box::new(SessionsHistoryTool::new(workspace_dir.to_path_buf())),
         Box::new(SessionsSendTool::new(workspace_dir.to_path_buf())),
         Box::new(SubagentSendTool::new(config.clone())),
-        Box::new(SubagentSpawnOneshotTool::new(config.clone())),
         Box::new(SubagentStopTool::new(config)),
         Box::new(SubagentPollTool::new(workspace_dir.to_path_buf())),
     ];
@@ -219,70 +205,6 @@ pub fn all_tools_with_runtime(
     tools
 }
 
-fn sync_legacy_delegate_agents_to_subagent_specs(
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig>,
-    fallback_api_key: Option<&str>,
-) {
-    if agents.is_empty() {
-        return;
-    }
-
-    tracing::warn!(
-        "config.agents is deprecated and the delegate tool has been removed; mapping {} legacy agent configs into subagent specs for compatibility",
-        agents.len()
-    );
-
-    let store = match SessionStore::new(workspace_dir) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to initialize SessionStore for legacy config.agents migration"
-            );
-            return;
-        }
-    };
-
-    let fallback_api_key = fallback_api_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    for (name, legacy_agent) in agents {
-        let api_key = legacy_agent
-            .api_key
-            .clone()
-            .or_else(|| fallback_api_key.clone());
-        let config_json = json!({
-            "provider": legacy_agent.provider.clone(),
-            "model": legacy_agent.model.clone(),
-            "system_prompt": legacy_agent.system_prompt.clone(),
-            "api_key": api_key,
-            "temperature": legacy_agent.temperature
-        });
-        let serialized = match serde_json::to_string(&config_json) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    spec_name = name,
-                    error = %error,
-                    "failed to serialize legacy config.agents entry as subagent spec"
-                );
-                continue;
-            }
-        };
-
-        if let Err(error) = store.upsert_subagent_spec(name, serialized.as_str()) {
-            tracing::warn!(
-                spec_name = name,
-                error = %error,
-                "failed to upsert legacy config.agents entry as subagent spec"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,8 +255,6 @@ mod tests {
             &browser,
             &http,
             tmp.path(),
-            &HashMap::new(),
-            None,
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -345,7 +265,6 @@ mod tests {
         assert!(names.contains(&"sessions_history"));
         assert!(names.contains(&"sessions_send"));
         assert!(names.contains(&"subagent_send"));
-        assert!(names.contains(&"subagent_spawn_oneshot"));
         assert!(names.contains(&"subagent_stop"));
         assert!(names.contains(&"subagent_poll"));
     }
@@ -379,8 +298,6 @@ mod tests {
             &browser,
             &http,
             tmp.path(),
-            &HashMap::new(),
-            None,
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -390,7 +307,6 @@ mod tests {
         assert!(names.contains(&"sessions_history"));
         assert!(names.contains(&"sessions_send"));
         assert!(names.contains(&"subagent_send"));
-        assert!(names.contains(&"subagent_spawn_oneshot"));
         assert!(names.contains(&"subagent_stop"));
         assert!(names.contains(&"subagent_poll"));
     }
@@ -490,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_maps_legacy_agents_to_subagent_specs() {
+    fn all_tools_includes_subagent_tools_and_excludes_delegate() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -503,19 +419,6 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-            },
-        );
 
         let tools = all_tools(
             Arc::new(Config::default()),
@@ -526,55 +429,10 @@ mod tests {
             &browser,
             &http,
             cfg.workspace_dir.as_path(),
-            &agents,
-            Some("delegate-test-credential"),
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"subagent_spawn_oneshot"));
+        assert!(names.contains(&"subagent_send"));
         assert!(!names.contains(&"delegate"));
-
-        let store = SessionStore::new(cfg.workspace_dir.as_path()).unwrap();
-        let spec = store
-            .get_subagent_spec_by_name("researcher")
-            .unwrap()
-            .unwrap();
-        assert!(spec.config_json.contains("\"provider\":\"ollama\""));
-        assert!(spec
-            .config_json
-            .contains("\"api_key\":\"delegate-test-credential\""));
-    }
-
-    #[test]
-    fn all_tools_excludes_delegate_when_no_agents() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"delegate"));
-        assert!(names.contains(&"subagent_spawn_oneshot"));
     }
 }

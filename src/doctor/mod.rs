@@ -239,19 +239,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             "no channels configured — run `zeroclaw onboard` to set one up",
         ));
     }
-
-    // Delegate agents: provider validity
-    for (name, agent) in &config.agents {
-        if let Some(reason) = provider_validation_error(&agent.provider) {
-            items.push(DiagItem::warn(
-                cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
-            ));
-        }
-    }
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {

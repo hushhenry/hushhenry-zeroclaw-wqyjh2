@@ -250,8 +250,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
         &config,
     ));
     // Extract webhook secret for authentication

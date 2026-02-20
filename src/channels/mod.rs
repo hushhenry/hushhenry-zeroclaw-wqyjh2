@@ -30,7 +30,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, AgentQueue};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -41,27 +41,34 @@ use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::{
         build_compaction_summary_message, build_merged_system_prompt, estimate_tokens,
-        load_compaction_state, maybe_compact, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
-        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+        load_compaction_state, maybe_compact, CompactionState,
+        SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS, SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
     },
-    SessionContext, SessionId, SessionKey, SessionMessageRole, SessionResolver,
+    SessionContext, SessionId, SessionKey, SessionMessage, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
 const DEFAULT_QUEUE_MODE: &str = "steer-backlog";
 const COMMAND_LIST_LIMIT: u32 = 20;
+
+/// Reserved channel for internal/child sessions. Sessions with this channel do not deliver to external users (M4).
+pub const INTERNAL_MESSAGE_CHANNEL: &str = "internal";
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -87,26 +94,76 @@ struct ChannelRuntimeContext {
     session_history_limit: u32,
     session_store: Option<Arc<SessionStore>>,
     session_resolver: SessionResolver,
+    /// Config for per-session agent/model resolution (multi-agent).
+    config: Arc<Config>,
+    /// All skills (for per-agent filtering in Milestone 2).
+    all_skills: Arc<Vec<crate::skills::Skill>>,
 }
 
-struct SessionTurnGuard {
-    session_key: String,
+/// One unit of work for an agent's internal queue. External and internal producers both push this.
+#[derive(Clone)]
+struct AgentWorkItem {
+    content: String,
+    reply_target: String,
+    channel: String,
+    sender: String,
+    chat_id: String,
+    thread_id: Option<String>,
+    agent_id: Option<String>,
+    account_id: Option<String>,
+    title: Option<String>,
+    chat_type: traits::ChatType,
+    raw_chat_type: Option<String>,
 }
 
-impl SessionTurnGuard {
-    fn acquire(session_key: String) -> Option<Self> {
-        if crate::session::backlog::try_begin_turn(&session_key) {
-            Some(Self { session_key })
-        } else {
-            None
+impl AgentWorkItem {
+    fn from_message(msg: &traits::ChannelMessage) -> Self {
+        Self {
+            content: msg.content.clone(),
+            reply_target: msg.reply_target.clone(),
+            channel: msg.channel.clone(),
+            sender: msg.sender.clone(),
+            chat_id: msg.chat_id.clone(),
+            thread_id: msg.thread_id.clone(),
+            agent_id: msg.agent_id.clone(),
+            account_id: msg.account_id.clone(),
+            title: msg.title.clone(),
+            chat_type: msg.chat_type,
+            raw_chat_type: msg.raw_chat_type.clone(),
+        }
+    }
+
+    fn to_channel_message(&self) -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: Uuid::new_v4().to_string(),
+            agent_id: self.agent_id.clone(),
+            account_id: self.account_id.clone(),
+            sender: self.sender.clone(),
+            reply_target: self.reply_target.clone(),
+            content: self.content.clone(),
+            channel: self.channel.clone(),
+            title: self.title.clone(),
+            chat_type: self.chat_type,
+            raw_chat_type: self.raw_chat_type.clone(),
+            chat_id: self.chat_id.clone(),
+            thread_id: self.thread_id.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         }
     }
 }
 
-impl Drop for SessionTurnGuard {
-    fn drop(&mut self) {
-        crate::session::backlog::finish_turn(&self.session_key);
-    }
+struct AgentHandle {
+    tx: mpsc::Sender<AgentWorkItem>,
+}
+
+/// Registry of per-session agents. Key = session_key. Unregistered when agent loop exits.
+fn agent_registry() -> Arc<ParkingMutex<HashMap<String, AgentHandle>>> {
+    static REGISTRY: LazyLock<Arc<ParkingMutex<HashMap<String, AgentHandle>>>> =
+        LazyLock::new(|| Arc::new(ParkingMutex::new(HashMap::new())));
+    REGISTRY.clone()
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -120,6 +177,10 @@ enum SlashCommand {
     Queue { mode: Option<String> },
     Subagents,
     Sessions,
+    Agents,
+    AgentSwitch { id_or_name: String },
+    Models,
+    Model { provider_model: String },
 }
 
 fn parse_slash_command(content: &str) -> Option<SlashCommand> {
@@ -139,6 +200,14 @@ fn parse_slash_command(content: &str) -> Option<SlashCommand> {
         }),
         "/subagents" => Some(SlashCommand::Subagents),
         "/sessions" => Some(SlashCommand::Sessions),
+        "/agents" => Some(SlashCommand::Agents),
+        "/agent" => Some(SlashCommand::AgentSwitch {
+            id_or_name: parts.next().map(str::trim).unwrap_or_default().to_string(),
+        }),
+        "/models" => Some(SlashCommand::Models),
+        "/model" => Some(SlashCommand::Model {
+            provider_model: parts.next().map(str::trim).unwrap_or_default().to_string(),
+        }),
         _ => None,
     }
 }
@@ -150,6 +219,131 @@ fn decode_session_string_state(value_json: Option<String>) -> Option<String> {
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         })
     })
+}
+
+/// Minimal parsed shape of AgentSpec.config_json for turn resolution.
+#[derive(serde::Deserialize, Default)]
+struct AgentSpecDefaults {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    temperature: Option<f64>,
+}
+
+/// Allow-list policy for tools and skills (Milestone 2).
+#[derive(serde::Deserialize, Default)]
+struct AgentSpecPolicy {
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct AgentSpecConfigJson {
+    #[serde(default)]
+    defaults: AgentSpecDefaults,
+    #[serde(default)]
+    policy: AgentSpecPolicy,
+}
+
+fn parse_agent_spec_defaults(config_json: &str) -> AgentSpecDefaults {
+    serde_json::from_str::<AgentSpecConfigJson>(config_json)
+        .ok()
+        .map(|c| c.defaults)
+        .unwrap_or_default()
+}
+
+fn parse_agent_spec_policy(config_json: &str) -> AgentSpecPolicy {
+    serde_json::from_str::<AgentSpecConfigJson>(config_json)
+        .ok()
+        .map(|c| c.policy)
+        .unwrap_or_default()
+}
+
+/// Resolve effective provider, model, and temperature for a session (multi-agent turn resolution).
+fn resolve_effective_provider_model(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    config: &Config,
+) -> (String, String, f64) {
+    let default_provider = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".into());
+    let default_model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    let default_temperature = config.default_temperature;
+
+    let active_agent_id = decode_session_string_state(
+        session_store
+            .get_state_key(session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
+            .ok()
+            .flatten(),
+    );
+    let model_override = decode_session_string_state(
+        session_store
+            .get_state_key(session_id, SessionStore::MODEL_OVERRIDE_KEY)
+            .ok()
+            .flatten(),
+    );
+
+    let spec_defaults = active_agent_id
+        .and_then(|id| {
+            session_store
+                .get_agent_spec_by_id(&id)
+                .ok()
+                .flatten()
+                .or_else(|| session_store.get_agent_spec_by_name(&id).ok().flatten())
+        })
+        .map(|spec| parse_agent_spec_defaults(&spec.config_json));
+
+    let effective_provider = spec_defaults
+        .as_ref()
+        .and_then(|d| d.provider.clone())
+        .unwrap_or_else(|| default_provider);
+    let effective_model = model_override
+        .or_else(|| spec_defaults.as_ref().and_then(|d| d.model.clone()))
+        .unwrap_or_else(|| default_model);
+    let effective_temperature = spec_defaults
+        .and_then(|d| d.temperature)
+        .unwrap_or(default_temperature);
+
+    (effective_provider, effective_model, effective_temperature)
+}
+
+/// Resolve AgentSpec policy for a session (tools/skills allow-lists). Returns None if no active agent or no policy.
+fn resolve_agent_spec_policy(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+) -> Option<AgentSpecPolicy> {
+    let active_agent_id = decode_session_string_state(
+        session_store
+            .get_state_key(session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
+            .ok()
+            .flatten(),
+    )?;
+    let spec = session_store
+        .get_agent_spec_by_id(&active_agent_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            session_store
+                .get_agent_spec_by_name(&active_agent_id)
+                .ok()
+                .flatten()
+        })?;
+    let policy = parse_agent_spec_policy(&spec.config_json);
+    let has_policy = policy.tools.is_some() || policy.skills.is_some();
+    if has_policy {
+        Some(policy)
+    } else {
+        None
+    }
 }
 
 fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> String {
@@ -396,6 +590,222 @@ async fn handle_slash_command(
                 .await;
             }
         },
+        SlashCommand::Agents => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                let specs = session_store
+                    .list_agent_specs(COMMAND_LIST_LIMIT)
+                    .unwrap_or_default();
+                let active_id = session_store
+                    .get_state_key(&session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| {
+                        serde_json::from_str::<String>(&raw)
+                            .ok()
+                            .or_else(|| (!raw.is_empty()).then(|| raw))
+                    });
+                let mut text = String::new();
+                let _ = writeln!(text, "Agents (session `{}`)", short_session_id(&session_id));
+                let _ = writeln!(
+                    text,
+                    "Active: {}",
+                    active_id.as_deref().unwrap_or("(default)")
+                );
+                for spec in specs.iter().take(10) {
+                    let marker = if active_id.as_deref() == Some(spec.agent_id.as_str()) {
+                        "* "
+                    } else {
+                        "- "
+                    };
+                    let _ = writeln!(text, "{marker}{} — {}", spec.name, spec.agent_id);
+                }
+                let _ = writeln!(text, "Use /agent <id|name> to switch.");
+                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to resolve session for /agents ({}): {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to list agents.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::AgentSwitch { id_or_name } => {
+            if id_or_name.is_empty() {
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "Usage: /agent <agent_id|agent_name>. Use /agents to list.".to_string(),
+                )
+                .await;
+                return true;
+            }
+            match session_store.get_or_create_active(session_key) {
+                Ok(session_id) => {
+                    let spec = session_store
+                        .get_agent_spec_by_id(id_or_name.trim())
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            session_store
+                                .get_agent_spec_by_name(id_or_name.trim())
+                                .ok()
+                                .flatten()
+                        });
+                    match spec {
+                        Some(agent_spec) => {
+                            let value_json = serde_json::to_string(&agent_spec.agent_id)
+                                .unwrap_or_else(|_| format!("\"{}\"", agent_spec.agent_id));
+                            if let Err(e) = session_store.set_state_key(
+                                &session_id,
+                                SessionStore::ACTIVE_AGENT_ID_KEY,
+                                &value_json,
+                            ) {
+                                tracing::error!("Failed to set active_agent_id: {e}");
+                                send_command_response(
+                                    target_channel,
+                                    &msg.reply_target,
+                                    "⚠️ Failed to switch agent.".to_string(),
+                                )
+                                .await;
+                                return true;
+                            }
+                            send_command_response(
+                                target_channel,
+                                &msg.reply_target,
+                                format!(
+                                    "Switched to agent `{}` ({}) for this session.",
+                                    agent_spec.name,
+                                    &agent_spec.agent_id[..agent_spec.agent_id.len().min(8)]
+                                ),
+                            )
+                            .await;
+                        }
+                        None => {
+                            send_command_response(
+                                target_channel,
+                                &msg.reply_target,
+                                format!(
+                                    "No agent found for `{id_or_name}`. Use /agents to list (match by id or name)."
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to resolve session for /agent ({}): {error}",
+                        session_key.as_str()
+                    );
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        "⚠️ Failed to switch agent.".to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
+        SlashCommand::Models => match session_store.get_or_create_active(session_key) {
+            Ok(session_id) => {
+                let override_val = session_store
+                    .get_state_key(&session_id, SessionStore::MODEL_OVERRIDE_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| {
+                        serde_json::from_str::<String>(&raw)
+                            .ok()
+                            .or_else(|| (!raw.is_empty()).then(|| raw))
+                    });
+                let mut text = String::new();
+                let _ = writeln!(
+                    text,
+                    "Model for session `{}`",
+                    short_session_id(&session_id)
+                );
+                let _ = writeln!(
+                    text,
+                    "Override: {}",
+                    override_val
+                        .as_deref()
+                        .unwrap_or("(none — use agent/default)")
+                );
+                let _ = writeln!(text, "Use /model <provider>/<model> to set override (e.g. openrouter/anthropic/claude-sonnet-4).");
+                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to resolve session for /models ({}): {error}",
+                    session_key.as_str()
+                );
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "⚠️ Failed to show model.".to_string(),
+                )
+                .await;
+            }
+        },
+        SlashCommand::Model { provider_model } => {
+            if provider_model.is_empty() {
+                send_command_response(
+                    target_channel,
+                    &msg.reply_target,
+                    "Usage: /model <provider>/<model>. Use /models to see current.".to_string(),
+                )
+                .await;
+                return true;
+            }
+            match session_store.get_or_create_active(session_key) {
+                Ok(session_id) => {
+                    let value_json = serde_json::to_string(&provider_model.trim())
+                        .unwrap_or_else(|_| format!("\"{}\"", provider_model.trim()));
+                    if let Err(e) = session_store.set_state_key(
+                        &session_id,
+                        SessionStore::MODEL_OVERRIDE_KEY,
+                        &value_json,
+                    ) {
+                        tracing::error!("Failed to set model_override: {e}");
+                        send_command_response(
+                            target_channel,
+                            &msg.reply_target,
+                            "⚠️ Failed to set model override.".to_string(),
+                        )
+                        .await;
+                        return true;
+                    }
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        format!(
+                            "Model override set to `{}` for this session.",
+                            provider_model.trim()
+                        ),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to resolve session for /model ({}): {error}",
+                        session_key.as_str()
+                    );
+                    send_command_response(
+                        target_channel,
+                        &msg.reply_target,
+                        "⚠️ Failed to set model.".to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     true
@@ -571,119 +981,93 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
-    println!(
-        "  💬 [{}] from {}: {}",
-        msg.channel,
-        msg.sender,
-        truncate_with_ellipsis(&msg.content, 80)
-    );
+/// Returns false when the session is bound to INTERNAL_MESSAGE_CHANNEL (no external delivery). Used for M4 child sessions.
+fn should_deliver_to_external_channel(
+    session_store: Option<&Arc<SessionStore>>,
+    active_session: Option<&SessionId>,
+) -> bool {
+    let (Some(store), Some(session_id)) = (session_store, active_session) else {
+        return true;
+    };
+    !matches!(
+        store.load_route_metadata(session_id),
+        Ok(Some(meta)) if meta.channel == INTERNAL_MESSAGE_CHANNEL
+    )
+}
 
+/// M4: Build ephemeral context from recent announce messages (meta_json with source/result). Not persisted.
+fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
+    const MAX_RESULT_PREVIEW: usize = 120;
+    let mut lines: Vec<String> = Vec::new();
+    for msg in messages {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let Some(meta_str) = msg.meta_json.as_deref() else {
+            continue;
+        };
+        let meta: serde_json::Value = match serde_json::from_str(meta_str) {
+            Ok(m) => m,
+            _ => continue,
+        };
+        let source = match meta.get("source").and_then(|s| s.as_object()) {
+            Some(s) => s,
+            _ => continue,
+        };
+        let agent_id = source
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let result_preview = meta
+            .get("result")
+            .and_then(|r| r.as_str())
+            .map(|s| {
+                let t = s.trim();
+                if t.len() <= MAX_RESULT_PREVIEW {
+                    t.to_string()
+                } else {
+                    format!("{}…", &t[..MAX_RESULT_PREVIEW])
+                }
+            })
+            .unwrap_or_else(|| "(no result)".to_string());
+        lines.push(format!(
+            "- @{}: {}",
+            agent_id,
+            result_preview.replace('\n', " ")
+        ));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("[Subagent results]\n{}", lines.join("\n"))
+    }
+}
+
+/// Core session turn: build history, run tool loop, deliver response. Used by the agent loop (with
+/// steer_at_checkpoint + agent_resume_queue) and by the non-session path (steer_at_checkpoint=None, queue=None).
+async fn run_session_turn(
+    ctx: Arc<ChannelRuntimeContext>,
+    active_session: Option<&SessionId>,
+    msg: traits::ChannelMessage,
+    #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
+        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
+    >,
+    agent_queue: Option<&mut AgentQueue>,
+) -> Result<()> {
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     let merged_system_prompt = build_merged_system_prompt(
         ctx.system_prompt.as_str(),
         channel_delivery_instructions(&msg.channel),
     );
-    let mut active_session: Option<SessionId> = None;
-    let mut session_turn_guard: Option<SessionTurnGuard> = None;
-    let parsed_command = parse_slash_command(&msg.content);
-
-    if ctx.session_enabled {
-        let session_context = normalize_session_context(&msg);
-        let session_key = ctx.session_resolver.resolve(&session_context);
-
-        if let Some(command) = parsed_command {
-            let handled = handle_slash_command(
-                &ctx,
-                target_channel.as_ref(),
-                &msg,
-                &session_key,
-                command,
-                &merged_system_prompt,
-            )
-            .await;
-            if handled {
-                return;
-            }
-        }
-
-        if let Some(session_store) = ctx.session_store.as_ref() {
-            match session_store.get_or_create_active(&session_key) {
-                Ok(session_id) => {
-                    if let Err(error) = session_store
-                        .upsert_route_metadata(&session_id, &build_route_metadata(&msg))
-                    {
-                        tracing::warn!(
-                            "Failed to persist route metadata for session {}: {error}",
-                            session_id.as_str()
-                        );
-                    }
-                    active_session = Some(session_id);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        "Failed to get active session for key {}: {error}",
-                        session_key
-                    );
-                }
-            }
-        }
-
-        if let Some(session_id) = active_session.as_ref() {
-            let session_key = session_id.as_str().to_string();
-            if let Some(guard) = SessionTurnGuard::acquire(session_key.clone()) {
-                session_turn_guard = Some(guard);
-            } else {
-                crate::session::backlog::enqueue(&session_key, msg.content.clone());
-                tracing::info!(
-                    session_id = %session_id.as_str(),
-                    "Session busy; queued message in backlog"
-                );
-                let queue_mode = ctx
-                    .session_store
-                    .as_ref()
-                    .map(|store| current_queue_mode(store, session_id))
-                    .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string());
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = channel
-                        .send(&SendMessage::new(
-                            format!(
-                                "⏳ Session is busy. Your message was queued with mode `{queue_mode}` and will be applied as steering context shortly."
-                            ),
-                            &msg.reply_target,
-                        ))
-                        .await;
-                }
-                return;
-            }
-        }
-    } else if let Some(command) = parsed_command {
-        let session_context = normalize_session_context(&msg);
-        let session_key = ctx.session_resolver.resolve(&session_context);
-        let handled = handle_slash_command(
-            &ctx,
-            target_channel.as_ref(),
-            &msg,
-            &session_key,
-            command,
-            &merged_system_prompt,
-        )
-        .await;
-        if handled {
-            return;
-        }
-    }
-
     let enriched_message = if ctx.session_enabled {
         msg.content.clone()
     } else {
         let memory_context = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
-            active_session.as_ref().map(SessionId::as_str),
+            active_session.map(SessionId::as_str),
         )
         .await;
-
         if ctx.auto_save_memory {
             let autosave_key = conversation_memory_key(&msg);
             let _ = ctx
@@ -692,11 +1076,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     &autosave_key,
                     &msg.content,
                     crate::memory::MemoryCategory::Conversation,
-                    active_session.as_ref().map(SessionId::as_str),
+                    active_session.map(SessionId::as_str),
                 )
                 .await;
         }
-
         if memory_context.is_empty() {
             msg.content.clone()
         } else {
@@ -713,11 +1096,66 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![ChatMessage::system(merged_system_prompt.clone())];
+    let (effective_system_prompt, tool_allow_list) =
+        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
+            if let Some(policy) = resolve_agent_spec_policy(store, session_id) {
+                let allowed_tools = policy.tools.clone();
+                let allowed_skills = policy.skills.clone();
+                let tool_entries: Vec<(&str, &str)> = ctx
+                    .tools_registry
+                    .iter()
+                    .filter(|t| {
+                        allowed_tools
+                            .as_ref()
+                            .map(|allow| allow.iter().any(|n| n == t.name()))
+                            .unwrap_or(true)
+                    })
+                    .map(|t| (t.name(), t.description()))
+                    .collect();
+                let filtered_skills_vec: Vec<crate::skills::Skill> =
+                    if let Some(ref allow) = allowed_skills {
+                        ctx.all_skills
+                            .iter()
+                            .filter(|s| allow.iter().any(|n| n == &s.name))
+                            .cloned()
+                            .collect()
+                    } else {
+                        ctx.all_skills.to_vec()
+                    };
+                let bootstrap_max_chars = if ctx.config.agent.compact_context {
+                    Some(6000)
+                } else {
+                    None
+                };
+                let mut base_prompt = build_system_prompt(
+                    &ctx.config.workspace_dir,
+                    ctx.model.as_str(),
+                    &tool_entries,
+                    &filtered_skills_vec,
+                    Some(&ctx.config.identity),
+                    bootstrap_max_chars,
+                );
+                base_prompt.push_str(&build_tool_instructions(
+                    ctx.tools_registry.as_ref(),
+                    allowed_tools.as_deref(),
+                ));
+                let merged = build_merged_system_prompt(
+                    &base_prompt,
+                    channel_delivery_instructions(&msg.channel),
+                );
+                (merged, allowed_tools)
+            } else {
+                (merged_system_prompt.clone(), None)
+            }
+        } else {
+            (merged_system_prompt.clone(), None)
+        };
+
+    let mut history = vec![ChatMessage::system(effective_system_prompt.as_str())];
 
     if ctx.session_enabled {
         if let (Some(session_store), Some(session_id)) =
-            (ctx.session_store.as_ref(), active_session.as_ref())
+            (ctx.session_store.as_ref(), active_session)
         {
             let mut compaction_state = match load_compaction_state(session_store, session_id) {
                 Ok(state) => state,
@@ -726,7 +1164,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         "Failed to load compaction state for session {}: {error}",
                         session_id.as_str()
                     );
-                    Default::default()
+                    CompactionState::default()
                 }
             };
 
@@ -749,13 +1187,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             for message in tail_messages.iter().cloned() {
                 match SessionMessageRole::from_str(message.role.as_str()) {
                     Some(SessionMessageRole::User) => {
-                        history.push(ChatMessage::user(message.content))
+                        history.push(ChatMessage::user(message.content));
                     }
                     Some(SessionMessageRole::Assistant) => {
-                        history.push(ChatMessage::assistant(message.content))
+                        history.push(ChatMessage::assistant(message.content));
                     }
                     Some(SessionMessageRole::Tool) => {
-                        history.push(ChatMessage::tool(message.content))
+                        history.push(ChatMessage::tool(message.content));
                     }
                     None => {
                         tracing::warn!(
@@ -767,7 +1205,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 }
             }
 
-            history.push(ChatMessage::user(&enriched_message));
+            let ephemeral = build_ephemeral_announce_context(&tail_messages);
+            let user_content = if ephemeral.is_empty() {
+                enriched_message.clone()
+            } else {
+                format!("{ephemeral}\n\n{enriched_message}")
+            };
+            history.push(ChatMessage::user(&user_content));
             if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
                 let keep_recent = usize::try_from(ctx.session_history_limit)
                     .ok()
@@ -779,7 +1223,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     session_id,
                     ctx.provider.as_ref(),
                     ctx.model.as_str(),
-                    &merged_system_prompt,
+                    &effective_system_prompt,
                     keep_recent,
                 )
                 .await
@@ -790,20 +1234,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         tail_messages = session_store
                             .load_messages_after_id(session_id, compaction_state.after_message_id)
                             .unwrap_or_default();
-                        history = vec![ChatMessage::system(merged_system_prompt)];
+                        history = vec![ChatMessage::system(effective_system_prompt.clone())];
                         if let Some(summary) = compaction_state.summary.as_deref() {
                             history.push(build_compaction_summary_message(summary));
                         }
                         for message in tail_messages {
                             match SessionMessageRole::from_str(message.role.as_str()) {
                                 Some(SessionMessageRole::User) => {
-                                    history.push(ChatMessage::user(message.content))
+                                    history.push(ChatMessage::user(message.content));
                                 }
                                 Some(SessionMessageRole::Assistant) => {
-                                    history.push(ChatMessage::assistant(message.content))
+                                    history.push(ChatMessage::assistant(message.content));
                                 }
                                 Some(SessionMessageRole::Tool) => {
-                                    history.push(ChatMessage::tool(message.content))
+                                    history.push(ChatMessage::tool(message.content));
                                 }
                                 None => {}
                             }
@@ -826,29 +1270,83 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         history.push(ChatMessage::user(&enriched_message));
     }
 
+    let (provider_override, model_override, temperature_override) =
+        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
+            let (eff_provider, eff_model, eff_temp) =
+                resolve_effective_provider_model(store, session_id, &ctx.config);
+            let default_provider = ctx
+                .config
+                .default_provider
+                .as_deref()
+                .unwrap_or("openrouter");
+            let default_model = ctx
+                .config
+                .default_model
+                .as_deref()
+                .unwrap_or("anthropic/claude-sonnet-4");
+            let default_temperature = ctx.config.default_temperature;
+            if eff_provider != default_provider
+                || eff_model != default_model
+                || (eff_temp - default_temperature).abs() > 1e-9
+            {
+                match providers::create_routed_provider(
+                    &eff_provider,
+                    ctx.config.api_key.as_deref(),
+                    ctx.config.api_url.as_deref(),
+                    &ctx.config.reliability,
+                    &ctx.config.model_routes,
+                    &eff_model,
+                ) {
+                    Ok(provider) => (Some(Arc::from(provider)), Some(eff_model), Some(eff_temp)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create routed provider for session agent: {e}; using default"
+                        );
+                        (None, None, None)
+                    }
+                }
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
+
+    let provider_ref = provider_override
+        .as_deref()
+        .unwrap_or_else(|| ctx.provider.as_ref());
+    let model_str = model_override
+        .as_deref()
+        .unwrap_or_else(|| ctx.model.as_str());
+    let temp = temperature_override.unwrap_or(ctx.temperature);
+
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
         run_tool_call_loop(
-            ctx.provider.as_ref(),
+            provider_ref,
             &mut history,
             ctx.tools_registry.as_ref(),
+            tool_allow_list.as_deref(),
             ctx.observer.as_ref(),
             "channel-runtime",
-            ctx.model.as_str(),
-            ctx.temperature,
-            true, // silent — channels don't write to stdout
+            model_str,
+            temp,
+            true,
             None,
             msg.channel.as_str(),
-            active_session.as_ref().map(SessionId::as_str),
+            active_session.map(SessionId::as_str),
+            steer_at_checkpoint,
+            agent_queue,
         ),
     )
     .await;
 
-    drop(session_turn_guard);
-
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.stop_typing(&msg.reply_target).await {
-            tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
+    let deliver = should_deliver_to_external_channel(ctx.session_store.as_ref(), active_session);
+    if deliver {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(e) = channel.stop_typing(&msg.reply_target).await {
+                tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
+            }
         }
     }
 
@@ -859,21 +1357,31 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&response, 80)
             );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel
-                    .send(&SendMessage::new(&response, &msg.reply_target))
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+            if deliver {
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Err(e) = channel
+                        .send(&SendMessage::new(&response, &msg.reply_target))
+                        .await
+                    {
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    }
                 }
             }
 
             if ctx.session_enabled {
                 if let (Some(session_store), Some(session_id)) =
-                    (ctx.session_store.as_ref(), active_session.as_ref())
+                    (ctx.session_store.as_ref(), active_session)
                 {
+                    // Persist the user message we actually replied to (may differ from msg.content
+                    // when steer-backlog injected merged content).
+                    let user_content = history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user" && !m.content.starts_with("[Tool results]"))
+                        .map(|m| m.content.as_str())
+                        .unwrap_or(msg.content.as_str());
                     if let Err(error) =
-                        session_store.append_message(session_id, "user", &msg.content, None)
+                        session_store.append_message(session_id, "user", user_content, None)
                     {
                         tracing::warn!(
                             "Failed to persist user session message {}: {error}",
@@ -896,13 +1404,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
             );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(
-                        format!("⚠️ Error: {e}"),
-                        &msg.reply_target,
-                    ))
-                    .await;
+            if deliver {
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(&SendMessage::new(
+                            format!("⚠️ Error: {e}"),
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
             }
         }
         Err(_) => {
@@ -915,16 +1425,202 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 timeout_msg,
                 started_at.elapsed().as_millis()
             );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(
-                        "⚠️ Request timed out while waiting for the model. Please try again.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+            if deliver {
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(&SendMessage::new(
+                            "⚠️ Request timed out while waiting for the model. Please try again.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
             }
         }
     }
+
+    Ok(())
+}
+
+async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
+    println!(
+        "  💬 [{}] from {}: {}",
+        msg.channel,
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 80)
+    );
+
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let merged_system_prompt = build_merged_system_prompt(
+        ctx.system_prompt.as_str(),
+        channel_delivery_instructions(&msg.channel),
+    );
+    let parsed_command = parse_slash_command(&msg.content);
+    let session_context = normalize_session_context(&msg);
+    let session_key = ctx.session_resolver.resolve(&session_context);
+
+    if let Some(command) = parsed_command {
+        let handled = handle_slash_command(
+            &ctx,
+            target_channel.as_ref(),
+            &msg,
+            &session_key,
+            command,
+            &merged_system_prompt,
+        )
+        .await;
+        if handled {
+            return;
+        }
+    }
+
+    if ctx.session_enabled {
+        // Enqueue to agent's internal queue only; agent loop consumes and runs the turn.
+        let work = AgentWorkItem::from_message(&msg);
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_key.clone());
+        if tx.send(work).await.is_err() {
+            tracing::debug!(session_key = %session_key, "Agent queue closed");
+        }
+        return;
+    }
+
+    // Non-session path: run one turn directly (no agent queue).
+    let active_session = ctx
+        .session_store
+        .as_ref()
+        .and_then(|store| store.get_or_create_active(&session_key).ok());
+    if let Err(e) =
+        run_session_turn(ctx.clone(), active_session.as_ref(), msg, None, None).await
+    {
+        tracing::error!("Session turn failed: {e}");
+    }
+}
+
+/// Returns a sender to the agent's queue. Caller enqueues work; agent loop is the only consumer.
+fn get_or_create_agent(
+    ctx: Arc<ChannelRuntimeContext>,
+    session_key: SessionKey,
+) -> mpsc::Sender<AgentWorkItem> {
+    let key_str = session_key.to_string();
+    let registry = agent_registry();
+    let mut guard = registry.lock();
+    if let Some(handle) = guard.get(&key_str) {
+        return handle.tx.clone();
+    }
+    let (tx, rx) = mpsc::channel(64);
+    let handle = AgentHandle { tx: tx.clone() };
+    guard.insert(key_str.clone(), handle);
+    drop(guard);
+    let runner_ctx = Arc::clone(&ctx);
+    let agent_queue: AgentQueue = VecDeque::new();
+    tokio::spawn(agent_loop(
+        registry,
+        key_str,
+        session_key,
+        rx,
+        agent_queue,
+        runner_ctx,
+    ));
+    tx
+}
+
+/// Drain receiver without blocking; merge all into one work item (content joined, metadata from last).
+fn drain_agent_queue(rx: &mut mpsc::Receiver<AgentWorkItem>) -> Option<AgentWorkItem> {
+    let mut batch: Vec<AgentWorkItem> = Vec::new();
+    while let Ok(w) = rx.try_recv() {
+        batch.push(w);
+    }
+    if batch.is_empty() {
+        return None;
+    }
+    let merged_content = batch
+        .iter()
+        .map(|w| w.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let last = batch.into_iter().last().unwrap();
+    Some(AgentWorkItem {
+        content: merged_content,
+        ..last
+    })
+}
+
+/// Agent run loop: sole consumer of this agent's queue. Runs one turn per work item; at checkpoints
+/// drains queue for steer-backlog (merge new messages, push current to queue). Unregisters on exit.
+/// The agent's single queue is created at agent creation (get_or_create_agent) and passed in here.
+async fn agent_loop(
+    registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
+    key_str: String,
+    session_key: SessionKey,
+    mut rx: mpsc::Receiver<AgentWorkItem>,
+    mut agent_queue: AgentQueue,
+    ctx: Arc<ChannelRuntimeContext>,
+) {
+    let tx = {
+        let guard = registry.lock();
+        guard.get(&key_str).map(|h| h.tx.clone())
+    };
+    let Some(tx) = tx else {
+        return;
+    };
+    let mut backlog: VecDeque<AgentWorkItem> = VecDeque::new();
+    loop {
+        let work = backlog.pop_front().or_else(|| drain_agent_queue(&mut rx));
+        let work = match work {
+            Some(w) => w,
+            None => match rx.recv().await {
+                Some(w) => w,
+                None => break,
+            },
+        };
+        // Merge any further immediately-available messages
+        let work = match drain_agent_queue(&mut rx) {
+            None => work,
+            Some(d) => AgentWorkItem {
+                content: format!("{}\n\n{}", work.content, d.content),
+                ..d
+            },
+        };
+        let session_store = match ctx.session_store.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        let session_id = match session_store.get_or_create_active(&session_key) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(session_key = %session_key, "Agent get_or_create_active failed: {e}");
+                continue;
+            }
+        };
+        let msg = work.to_channel_message();
+        if let Err(e) =
+            session_store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
+        {
+            tracing::warn!(
+                session_id = %session_id.as_str(),
+                "Failed to persist route metadata: {e}"
+            );
+        }
+        let mut steer_fn = |current_user_content: &str| {
+            let merged = drain_agent_queue(&mut rx)?;
+            let _ = tx.try_send(AgentWorkItem {
+                content: current_user_content.to_string(),
+                ..work.clone()
+            });
+            Some(merged.content)
+        };
+        if let Err(e) = run_session_turn(
+            ctx.clone(),
+            Some(&session_id),
+            msg,
+            Some(&mut steer_fn),
+            Some(&mut agent_queue),
+        )
+        .await
+        {
+            tracing::error!(session_key = %session_key, "Agent turn error: {e}");
+        }
+    }
+    registry.lock().remove(&key_str);
 }
 
 async fn run_message_dispatch_loop(
@@ -932,6 +1628,10 @@ async fn run_message_dispatch_loop(
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
 ) {
+    if ctx.session_enabled {
+        run_message_dispatch_loop_session(rx, ctx).await;
+        return;
+    }
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
 
@@ -954,6 +1654,22 @@ async fn run_message_dispatch_loop(
 
     while let Some(result) = workers.join_next().await {
         log_worker_join_result(result);
+    }
+}
+
+/// Session-enabled dispatch: resolve session_key, get or create agent, enqueue to agent's queue only.
+async fn run_message_dispatch_loop_session(
+    mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
+    ctx: Arc<ChannelRuntimeContext>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let session_context = normalize_session_context(&msg);
+        let session_key = ctx.session_resolver.resolve(&session_context);
+        let work = AgentWorkItem::from_message(&msg);
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_key.clone());
+        if tx.send(work).await.is_err() {
+            tracing::debug!(session_key = %session_key, "Agent queue closed");
+        }
     }
 }
 
@@ -1655,8 +2371,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.browser,
         &config.http_request,
         &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
         &config,
     ));
 
@@ -1680,7 +2394,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref(), None));
 
     if !skills.is_empty() {
         println!(
@@ -1876,6 +2590,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         session_history_limit: config.session.history_limit,
         session_store,
         session_resolver: SessionResolver::new(),
+        config: Arc::new(config.clone()),
+        all_skills: Arc::new(skills),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1892,6 +2608,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::channels::traits::ChatType;
+    use crate::config::Config;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatRequest, ChatResponse, Provider};
@@ -2122,6 +2839,8 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         })
     }
 
@@ -2150,6 +2869,20 @@ mod tests {
             parse_slash_command("/sessions"),
             Some(SlashCommand::Sessions)
         );
+        assert_eq!(parse_slash_command("/agents"), Some(SlashCommand::Agents));
+        assert_eq!(
+            parse_slash_command("/agent coder"),
+            Some(SlashCommand::AgentSwitch {
+                id_or_name: "coder".to_string()
+            })
+        );
+        assert_eq!(parse_slash_command("/models"), Some(SlashCommand::Models));
+        assert_eq!(
+            parse_slash_command("/model openrouter/anthropic/claude-sonnet-4"),
+            Some(SlashCommand::Model {
+                provider_model: "openrouter/anthropic/claude-sonnet-4".to_string()
+            })
+        );
     }
 
     #[test]
@@ -2158,6 +2891,235 @@ mod tests {
         assert_eq!(parse_slash_command("/new-session"), None);
         assert_eq!(parse_slash_command("/sessionss"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
+    }
+
+    #[test]
+    fn should_deliver_to_external_channel_returns_true_when_no_store_or_session() {
+        assert!(should_deliver_to_external_channel(None, None));
+    }
+
+    #[test]
+    fn should_deliver_to_external_channel_returns_false_when_session_channel_is_internal() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let session_key = crate::session::SessionKey::new("group:test:internal");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+        store
+            .upsert_route_metadata(
+                &session_id,
+                &SessionRouteMetadata {
+                    agent_id: None,
+                    channel: INTERNAL_MESSAGE_CHANNEL.to_string(),
+                    account_id: None,
+                    chat_type: "direct".to_string(),
+                    chat_id: "chat-internal".to_string(),
+                    route_id: None,
+                    sender_id: "zeroclaw_user".to_string(),
+                    title: None,
+                },
+            )
+            .unwrap();
+        assert!(!should_deliver_to_external_channel(
+            Some(&store),
+            Some(&session_id)
+        ));
+    }
+
+    #[test]
+    fn should_deliver_to_external_channel_returns_true_when_session_channel_is_telegram() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let session_key = crate::session::SessionKey::new("group:telegram:deliver");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+        store
+            .upsert_route_metadata(
+                &session_id,
+                &SessionRouteMetadata {
+                    agent_id: None,
+                    channel: "telegram".to_string(),
+                    account_id: None,
+                    chat_type: "direct".to_string(),
+                    chat_id: "chat-123".to_string(),
+                    route_id: None,
+                    sender_id: "zeroclaw_user".to_string(),
+                    title: None,
+                },
+            )
+            .unwrap();
+        assert!(should_deliver_to_external_channel(
+            Some(&store),
+            Some(&session_id)
+        ));
+    }
+
+    #[test]
+    fn build_ephemeral_announce_context_returns_empty_for_empty_messages() {
+        let messages: Vec<SessionMessage> = vec![];
+        assert!(build_ephemeral_announce_context(&messages).is_empty());
+    }
+
+    #[test]
+    fn build_ephemeral_announce_context_returns_empty_when_no_announce_meta() {
+        let messages = vec![
+            SessionMessage {
+                id: 1,
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                meta_json: None,
+            },
+            SessionMessage {
+                id: 2,
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                meta_json: None,
+            },
+        ];
+        assert!(build_ephemeral_announce_context(&messages).is_empty());
+    }
+
+    #[test]
+    fn build_ephemeral_announce_context_formats_announce_messages() {
+        let messages = vec![SessionMessage {
+            id: 1,
+            role: "assistant".to_string(),
+            content: "[@agent:runner#spec-1] finish".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            meta_json: Some(r#"{"source":{"agent_id":"spec-1"},"result":"done"}"#.to_string()),
+        }];
+        let out = build_ephemeral_announce_context(&messages);
+        assert!(out.contains("[Subagent results]"));
+        assert!(out.contains("@spec-1:"));
+        assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn parse_agent_spec_defaults_parses_provider_model_temperature() {
+        let defaults = parse_agent_spec_defaults(
+            r#"{"defaults":{"provider":"openrouter","model":"anthropic/claude-3","temperature":0.2}}"#,
+        );
+        assert_eq!(defaults.provider, Some("openrouter".to_string()));
+        assert_eq!(defaults.model, Some("anthropic/claude-3".to_string()));
+        assert_eq!(defaults.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn parse_agent_spec_defaults_returns_default_for_invalid_json() {
+        let defaults = parse_agent_spec_defaults("not json");
+        assert!(defaults.provider.is_none());
+        assert!(defaults.model.is_none());
+    }
+
+    #[test]
+    fn parse_agent_spec_policy_parses_tools_and_skills_allow_lists() {
+        let policy = parse_agent_spec_policy(
+            r#"{"policy":{"tools":["shell","file_read"],"skills":["search"]}}"#,
+        );
+        assert_eq!(
+            policy.tools,
+            Some(vec!["shell".to_string(), "file_read".to_string()])
+        );
+        assert_eq!(policy.skills, Some(vec!["search".to_string()]));
+    }
+
+    #[test]
+    fn parse_agent_spec_policy_returns_default_for_invalid_json() {
+        let policy = parse_agent_spec_policy("not json");
+        assert!(policy.tools.is_none());
+        assert!(policy.skills.is_none());
+    }
+
+    #[test]
+    fn agent_work_item_from_message_preserves_content_and_reply_target() {
+        let msg = traits::ChannelMessage {
+            id: "id-1".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "alice".to_string(),
+            reply_target: "chat-99".to_string(),
+            content: "hello world".to_string(),
+            channel: "telegram".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-99".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        };
+        let work = AgentWorkItem::from_message(&msg);
+        let back = work.to_channel_message();
+        assert_eq!(back.content, "hello world");
+        assert_eq!(back.reply_target, "chat-99");
+        assert_eq!(back.channel, "telegram");
+        assert_eq!(back.sender, "alice");
+    }
+
+    #[tokio::test]
+    async fn drain_agent_queue_merges_items_and_keeps_last_metadata() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let msg1 = traits::ChannelMessage {
+            id: "i1".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "u1".to_string(),
+            reply_target: "r1".to_string(),
+            content: "one".to_string(),
+            channel: "ch".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "c1".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "i2".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "u2".to_string(),
+            reply_target: "r2".to_string(),
+            content: "two".to_string(),
+            channel: "ch".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "c2".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        };
+        let msg3 = traits::ChannelMessage {
+            id: "i3".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "u3".to_string(),
+            reply_target: "target-last".to_string(),
+            content: "three".to_string(),
+            channel: "ch".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "c3".to_string(),
+            thread_id: None,
+            timestamp: 3,
+        };
+        let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
+        let _ = tx.send(AgentWorkItem::from_message(&msg2)).await;
+        let _ = tx.send(AgentWorkItem::from_message(&msg3)).await;
+        drop(tx);
+
+        let merged = drain_agent_queue(&mut rx);
+        let m = merged.expect("drain should return one merged item");
+        assert_eq!(m.content, "one\n\ntwo\n\nthree");
+        assert_eq!(m.reply_target, "target-last");
+        assert_eq!(m.sender, "u3");
+    }
+
+    #[tokio::test]
+    async fn drain_agent_queue_returns_none_when_empty() {
+        let (_tx, mut rx) = mpsc::channel::<AgentWorkItem>(2);
+        let merged = drain_agent_queue(&mut rx);
+        assert!(merged.is_none());
     }
 
     #[tokio::test]
@@ -2319,6 +3281,8 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         process_channel_message(
@@ -2371,6 +3335,8 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         process_channel_message(
@@ -2549,6 +3515,296 @@ mod tests {
         }
     }
 
+    /// Provider for steer-backlog test: first call delays then returns tool call; later calls
+    /// return text based on last user message (steered vs backlog).
+    struct SteerTestProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for SteerTestProvider {
+        fn default() -> Self {
+            Self {
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SteerTestProvider {
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let last_user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            let has_tool_results = last_user.contains("[Tool results]");
+
+            if n == 0 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(ChatResponse {
+                    text: Some(tool_call_payload()),
+                    tool_calls: vec![],
+                })
+            } else if has_tool_results {
+                Ok(ChatResponse {
+                    text: Some("reply to new priority".to_string()),
+                    tool_calls: vec![],
+                })
+            } else if last_user.contains("trigger tool") {
+                Ok(ChatResponse {
+                    text: Some("reply to trigger tool".to_string()),
+                    tool_calls: vec![],
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("reply to new priority".to_string()),
+                    tool_calls: vec![],
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_get_or_create_agent_same_key_uses_same_agent_queue() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let provider = Arc::new(HistoryCaptureProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider.clone(),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test".to_string()),
+            model: Arc::new("test".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store),
+            session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
+        });
+
+        let msg1 = traits::ChannelMessage {
+            id: "i1".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_same_agent".to_string(),
+            reply_target: "chat-same".to_string(),
+            content: "first".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-same".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "i2".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_same_agent".to_string(),
+            reply_target: "chat-same".to_string(),
+            content: "second".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-same".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        };
+
+        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let tx2 = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
+        let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
+        drop(tx1);
+        drop(tx2);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let history = provider.captured_history.lock().await;
+        let user_contents: Vec<&str> = history
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, c)| c.as_str())
+            .collect();
+        let has_first = user_contents.iter().any(|c| c.contains("first"));
+        let has_second = user_contents.iter().any(|c| c.contains("second"));
+        assert!(
+            has_first && has_second,
+            "same agent should process both messages (possibly merged); got user messages: {:?}",
+            user_contents
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_agent_unregisters_when_queue_sender_dropped() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = session_runtime_ctx(session_store, channel.clone());
+
+        let msg1 = traits::ChannelMessage {
+            id: "u1".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_unreg".to_string(),
+            reply_target: "chat-unreg".to_string(),
+            content: "first".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-unreg".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "u2".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_unreg".to_string(),
+            reply_target: "chat-unreg".to_string(),
+            content: "second".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-unreg".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        };
+
+        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(tx1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let tx2 = get_or_create_agent(ctx, key);
+        let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            2,
+            "after unregister, new agent should process second message; got {} replies",
+            sent.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_steer_backlog_interrupts_current_and_processes_new_then_backlog() {
+        let temp = TempDir::new().unwrap();
+        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
+        let provider = Arc::new(SteerTestProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel.clone());
+
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test".to_string()),
+            model: Arc::new("test".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store),
+            session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
+        });
+
+        let msg1 = traits::ChannelMessage {
+            id: "steer-1".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_steer".to_string(),
+            reply_target: "chat-steer".to_string(),
+            content: "trigger tool".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-steer".to_string(),
+            thread_id: None,
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "steer-2".to_string(),
+            agent_id: None,
+            account_id: None,
+            sender: "zeroclaw_user_steer".to_string(),
+            reply_target: "chat-steer".to_string(),
+            content: "new priority".to_string(),
+            channel: "test-channel".to_string(),
+            title: None,
+            chat_type: ChatType::Direct,
+            raw_chat_type: None,
+            chat_id: "chat-steer".to_string(),
+            thread_id: None,
+            timestamp: 2,
+        };
+
+        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let tx = get_or_create_agent(Arc::clone(&ctx), key.clone());
+        let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
+        tokio::task::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(AgentWorkItem::from_message(&msg2)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.len() >= 2,
+            "steer should deliver reply to new priority then reply to trigger tool; got {}",
+            sent.len()
+        );
+        let first_reply = sent.first().map(String::as_str).unwrap_or("");
+        let second_reply = sent.get(1).map(String::as_str).unwrap_or("");
+        assert!(
+            first_reply.contains("reply to new priority"),
+            "first reply should be to steered message; got: {}",
+            first_reply
+        );
+        assert!(
+            second_reply.contains("reply to trigger tool"),
+            "second reply should be to backlog (original) message; got: {}",
+            second_reply
+        );
+    }
+
     #[tokio::test]
     async fn process_channel_message_session_mode_skips_memory_context_and_conversation_autosave() {
         let temp = TempDir::new().unwrap();
@@ -2562,14 +3818,14 @@ mod tests {
             id: "msg-3".to_string(),
             agent_id: None,
             account_id: None,
-            sender: "zeroclaw_user".to_string(),
-            reply_target: "chat-168".to_string(),
+            sender: "zeroclaw_user_skip_memory".to_string(),
+            reply_target: "chat-skip-mem".to_string(),
             content: "current question".to_string(),
             channel: "test-channel".to_string(),
             title: None,
             chat_type: ChatType::Direct,
             raw_chat_type: None,
-            chat_id: "chat-168".to_string(),
+            chat_id: "chat-skip-mem".to_string(),
             thread_id: None,
             timestamp: 3,
         };
@@ -2601,9 +3857,13 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         process_channel_message(runtime_ctx, msg).await;
+        // Agent loop runs in a spawned task; give it time to process the enqueued message.
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
         assert_eq!(memory.conversation_store_calls.load(Ordering::Relaxed), 0);
@@ -2637,7 +3897,7 @@ mod tests {
             id: "msg-4".to_string(),
             agent_id: None,
             account_id: None,
-            sender: "zeroclaw_user".to_string(),
+            sender: "zeroclaw_user_compaction_tail".to_string(),
             reply_target: "chat-200".to_string(),
             content: "latest question".to_string(),
             channel: "test-channel".to_string(),
@@ -2701,9 +3961,12 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         process_channel_message(runtime_ctx, msg).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(memory.recall_calls.load(Ordering::Relaxed), 0);
 
@@ -2750,6 +4013,8 @@ mod tests {
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         process_channel_message(
@@ -2771,6 +4036,7 @@ mod tests {
             },
         )
         .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let candidates = session_store
             .find_chat_candidates_by_title("alpha", 10)
@@ -2806,6 +4072,8 @@ mod tests {
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

@@ -1,10 +1,20 @@
 # Zeroclaw Multi‑Agent System Design (RFC)
 
-Status: **Design proposal** (no implementation yet)
+Status: **Done** ? Milestones 0?6 implemented.
 
 Owner: @wqyjh + contributors
 
-Last updated: 2026-02-19
+Last updated: 2026-02-20
+
+### Implementation status
+
+- **Milestone 0** (sqlite-only memory): Done ? unknown backend falls back to sqlite; default is sqlite.
+- **Milestone 1** (AgentSpec registry + session switching): Done ? `agent_specs` table, `/agents`, `/agent`, `/models`, `/model`, turn resolution for provider/model/temperature.
+- **Milestone 2** (Skills & tools filtering): Done ? AgentSpec `policy.tools` and `policy.skills` allow-lists; per-turn filtered system prompt and tool allow-list in channel processing; disallowed tool calls return a policy message.
+- **Milestone 3** (steer-backlog correctness): Done ? safe boundary after each tool round; backlog drained and saved as resume token when non-empty; final response after steer restores state and original task continues.
+- **Milestone 4** (subagents as child sessions + announce meta payload): Done ? `INTERNAL_MESSAGE_CHANNEL` and deliver gating; subagent run completion appends minimal announce message to parent session with `meta_json` (task, result, source); `parent_session_id` injected into subagent tools via session meta; parent next turn consumes announce meta as ephemeral context (no transcript bloat).
+- **Milestone 5** (hardening): Done ? deterministic idempotency key per announce (`run_id`) in `announce_idempotency` table (no duplicate announces); `hop` and `trace_id` in announce `meta_json`; self-send loop prevention; TTL/hop enforced (MAX_ANNOUNCE_HOP=0); tracing for steer-backlog (drain at boundary, resume after steered response).
+- **Milestone 6** (cleanup): Done ? legacy delegate mappings removed: `config.agents` and `DelegateAgentConfig` removed; sync and `agents`/`fallback_api_key` params removed from tool registry; `subagent_spawn_oneshot` tool removed; doctor no longer checks `config.agents`. Session + AgentSpec + TurnJob remain as core primitives.
 
 ---
 
@@ -161,6 +171,8 @@ Agent differences must be real (not just prompt text).
 - `policy.tools`: allow/deny tool names
 - `policy.skills`: allow/deny skill names (controls prompt injection)
 - `context_policy`: memory recall on/off + budgets/filters (memory is global)
+
+**Implemented `config_json` shape (Milestones 1?2):** Stored in `agent_specs.config_json`. Parsed as: `defaults` (optional `provider`, `model`, `temperature`), `policy` (optional `tools`: array of allowed tool names, `skills`: array of allowed skill names). When `policy.tools` or `policy.skills` is present, only those are exposed to the model for that session; when absent, no filtering (all tools/skills).
 
 ### 5.2 Session switching
 

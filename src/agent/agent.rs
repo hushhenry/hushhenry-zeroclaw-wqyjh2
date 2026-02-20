@@ -235,9 +235,7 @@ impl Agent {
             &config.browser,
             &config.http_request,
             &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            config,
+            &config,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
