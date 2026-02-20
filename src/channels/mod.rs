@@ -1131,15 +1131,16 @@ fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
     }
 }
 
-/// Core session turn: build history, run tool loop, deliver response. Used by the agent loop (with
-/// steer_at_checkpoint + agent_resume_queue) and by the non-session path (steer_at_checkpoint=None, queue=None).
-async fn run_session_turn(
+/// Core turn execution: build history, run tool loop, deliver response.
+/// `use_session_history` controls whether session history compaction/persistence logic is enabled.
+async fn run_turn_core(
     ctx: Arc<ChannelRuntimeContext>,
     active_session: Option<&SessionId>,
     msg: traits::ChannelMessage,
     #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
         &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
     >,
+    use_session_history: bool,
 ) -> Result<()> {
     let mut delivery_channel_name = msg.channel.clone();
     let mut delivery_reply_target = msg.reply_target.clone();
@@ -1159,7 +1160,7 @@ async fn run_session_turn(
         ctx.system_prompt.as_str(),
         channel_delivery_instructions(&delivery_channel_name),
     );
-    let enriched_message = if ctx.session_enabled {
+    let enriched_message = if use_session_history {
         msg.content.clone()
     } else {
         let memory_context = build_memory_context(
@@ -1253,7 +1254,7 @@ async fn run_session_turn(
 
     let mut history = vec![ChatMessage::system(effective_system_prompt.as_str())];
 
-    if ctx.session_enabled {
+    if use_session_history {
         if let (Some(session_store), Some(session_id)) =
             (ctx.session_store.as_ref(), active_session)
         {
@@ -1469,7 +1470,7 @@ async fn run_session_turn(
                 }
             }
 
-            if ctx.session_enabled {
+            if use_session_history {
                 if let (Some(session_store), Some(session_id)) =
                     (ctx.session_store.as_ref(), active_session)
                 {
@@ -1552,6 +1553,27 @@ async fn run_session_turn(
     Ok(())
 }
 
+/// Session turn entrypoint. Used by the per-session agent loop.
+async fn run_session_turn(
+    ctx: Arc<ChannelRuntimeContext>,
+    session_id: &SessionId,
+    msg: traits::ChannelMessage,
+    #[allow(clippy::type_complexity)] steer_at_checkpoint: Option<
+        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
+    >,
+) -> Result<()> {
+    run_turn_core(ctx, Some(session_id), msg, steer_at_checkpoint, true).await
+}
+
+/// Non-session turn entrypoint. Used by direct dispatch path when session mode is disabled.
+async fn run_memory_turn(
+    ctx: Arc<ChannelRuntimeContext>,
+    active_session: Option<&SessionId>,
+    msg: traits::ChannelMessage,
+) -> Result<()> {
+    run_turn_core(ctx, active_session, msg, None, false).await
+}
+
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
     println!(
         "  💬 [{}] from {}: {}",
@@ -1615,7 +1637,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         .session_store
         .as_ref()
         .and_then(|store| store.get_or_create_active(&session_key).ok());
-    if let Err(e) = run_session_turn(ctx.clone(), active_session.as_ref(), msg, None).await {
+    if let Err(e) = run_memory_turn(ctx.clone(), active_session.as_ref(), msg).await {
         tracing::error!("Session turn failed: {e}");
     }
 }
@@ -1726,9 +1748,7 @@ async fn agent_loop(
                 Some(build_steer_merge_message(current_user_content, pending))
             }
         };
-        if let Err(e) =
-            run_session_turn(ctx.clone(), Some(&session_id), msg, Some(&mut steer_fn)).await
-        {
+        if let Err(e) = run_session_turn(ctx.clone(), &session_id, msg, Some(&mut steer_fn)).await {
             tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
         }
     }
