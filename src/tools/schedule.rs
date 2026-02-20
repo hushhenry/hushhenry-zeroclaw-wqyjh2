@@ -63,6 +63,10 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "description": "Optional source session binding for compat delivery routing."
                 },
+                "delivery_session_id": {
+                    "type": "string",
+                    "description": "Session to deliver results/reminders to; default is creator (source_session_id). Route from session store."
+                },
             },
             "required": ["action"]
         })
@@ -237,6 +241,10 @@ impl ScheduleTool {
             .get("source_session_id")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        let delivery_session_id = args
+            .get("delivery_session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
         match action {
             "add" => {
@@ -283,7 +291,7 @@ impl ScheduleTool {
         }
 
         if let Some(value) = expression {
-            let job = cron::add_shell_job_with_source(
+            let job = cron::add_shell_job_with_delivery(
                 &self.config,
                 None,
                 crate::cron::Schedule::Cron {
@@ -292,6 +300,7 @@ impl ScheduleTool {
                 },
                 command,
                 source_session_id.clone(),
+                delivery_session_id.clone(),
             )?;
             return Ok(ToolResult {
                 success: true,
@@ -307,11 +316,12 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = cron::add_once_with_source(
+            let job = cron::add_once_with_delivery(
                 &self.config,
                 value,
                 command,
                 source_session_id.clone(),
+                delivery_session_id.clone(),
             )?;
             return Ok(ToolResult {
                 success: true,
@@ -330,8 +340,13 @@ impl ScheduleTool {
             .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
             .with_timezone(&Utc);
 
-        let job =
-            cron::add_once_at_with_source(&self.config, run_at_parsed, command, source_session_id)?;
+        let job = cron::add_once_at_with_delivery(
+            &self.config,
+            run_at_parsed,
+            command,
+            source_session_id,
+            delivery_session_id,
+        )?;
         Ok(ToolResult {
             success: true,
             output: format!(

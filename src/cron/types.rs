@@ -108,6 +108,9 @@ pub struct CronJob {
     pub enabled: bool,
     pub delivery: DeliveryConfig,
     pub source_session_id: Option<String>,
+    /// Session to deliver results/reminders to; route (channel + chat) is resolved from session store.
+    /// When absent, delivery uses source_session_id (creator session).
+    pub delivery_session_id: Option<String>,
     pub delete_after_run: bool,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
@@ -136,6 +139,7 @@ pub struct CronJobPatch {
     pub enabled: Option<bool>,
     pub delivery: Option<DeliveryConfig>,
     pub source_session_id: Option<String>,
+    pub delivery_session_id: Option<String>,
     pub model: Option<String>,
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,

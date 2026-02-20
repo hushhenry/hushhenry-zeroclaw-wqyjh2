@@ -1,6 +1,7 @@
 use crate::channels::{
     build_internal_channel_message, dispatch_internal_message, Channel, DiscordChannel,
     LarkChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -266,16 +267,31 @@ struct DeliveryRoute {
     target: String,
 }
 
+/// Resolve delivery target from session store. Delivery is always by session_id; channel + chat
+/// come from the session's route metadata.
 fn resolve_delivery_route(
     config: &Config,
     job: &CronJob,
     delivery: &DeliveryConfig,
 ) -> Result<DeliveryRoute> {
-    if let Some(source_session_id) = job.source_session_id.as_deref() {
+    let effective_session_id = job
+        .delivery_session_id
+        .as_deref()
+        .or(job.source_session_id.as_deref());
+
+    if let Some(session_id) = effective_session_id {
         let store = SessionStore::new(&config.workspace_dir)?;
-        match store.load_route_metadata(&SessionId::from_string(source_session_id)) {
+        match store.load_route_metadata(&SessionId::from_string(session_id)) {
             Ok(Some(metadata)) => {
-                let target = metadata.route_id.unwrap_or(metadata.chat_id);
+                let target = if metadata.channel == INTERNAL_MESSAGE_CHANNEL {
+                    metadata
+                        .chat_id
+                        .strip_prefix("session:")
+                        .unwrap_or(metadata.chat_id.as_str())
+                        .to_string()
+                } else {
+                    metadata.route_id.unwrap_or(metadata.chat_id)
+                };
                 return Ok(DeliveryRoute {
                     channel: metadata.channel,
                     target,
@@ -283,27 +299,33 @@ fn resolve_delivery_route(
             }
             Ok(None) => {
                 tracing::warn!(
-                    "Cron source_session_id route lookup returned no metadata: {}",
-                    source_session_id
+                    "Cron delivery session_id route lookup returned no metadata: {}",
+                    session_id
                 );
             }
             Err(error) => {
                 tracing::warn!(
-                    "Cron source_session_id route lookup failed for {}: {error}",
-                    source_session_id
+                    "Cron delivery session_id route lookup failed for {}: {error}",
+                    session_id
                 );
             }
         }
     }
 
+    // Legacy: fallback to delivery.channel + delivery.to when no session route is available
     let channel = delivery
         .channel
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "delivery requires either a session (delivery_session_id or source_session_id with \
+                 route in session store) or delivery.channel + delivery.to"
+            )
+        })?;
     let target = delivery
         .to
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("delivery.to is required when using delivery.channel"))?;
     Ok(DeliveryRoute {
         channel: channel.to_string(),
         target: target.to_string(),
@@ -316,6 +338,11 @@ async fn send_via_channel(
     target: &str,
     output: &str,
 ) -> Result<()> {
+    if channel == INTERNAL_MESSAGE_CHANNEL {
+        let msg = build_internal_channel_message("zeroclaw_scheduler", target, output, None);
+        return dispatch_internal_message(msg).await;
+    }
+
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config

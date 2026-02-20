@@ -86,6 +86,12 @@ impl Tool for CronUpdateTool {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
         }
+        if patch.delivery_session_id.is_none() {
+            patch.delivery_session_id = args
+                .get("delivery_session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
 
         if let Some(command) = &patch.command {
             if !self.security.is_command_allowed(command) {
