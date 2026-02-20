@@ -115,9 +115,9 @@ enum Commands {
         memory: Option<String>,
     },
 
-    /// Start the AI agent loop
+    /// Start the AI agent (single message)
     Agent {
-        /// Single message mode (don't enter interactive mode)
+        /// Message to send (required)
         #[arg(short, long)]
         message: Option<String>,
 

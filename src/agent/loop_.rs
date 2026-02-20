@@ -795,6 +795,41 @@ pub(crate) fn build_tool_instructions(
     instructions
 }
 
+/// One-turn agent loop for tests: builds history and runs run_tool_call_loop with injected provider.
+/// Returns (response_text, final_history) so tests can assert on history when needed.
+#[cfg(test)]
+pub(crate) async fn run_one_turn_for_test(
+    provider: &dyn Provider,
+    system_prompt: &str,
+    user_message: &str,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    model: &str,
+    temperature: f64,
+) -> Result<(String, Vec<ChatMessage>)> {
+    let mut history = vec![
+        ChatMessage::system(system_prompt),
+        ChatMessage::user(user_message),
+    ];
+    let response = run_tool_call_loop(
+        provider,
+        &mut history,
+        tools_registry,
+        None,
+        observer,
+        "test",
+        model,
+        temperature,
+        true,
+        None,
+        "test",
+        None,
+        None,
+    )
+    .await?;
+    Ok((response, history))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: Config,
@@ -899,160 +934,62 @@ pub async fn run(
 
     let mut final_output = String::new();
 
-    if let Some(msg) = message {
-        // Auto-save user message to memory
-        if config.memory.auto_save {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Inject memory context into user message
-        let mem_context = build_context(mem.as_ref(), &msg).await;
-        let context = mem_context;
-        let enriched = if context.is_empty() {
-            msg.clone()
-        } else {
-            format!("{context}{msg}")
-        };
-
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
-
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            None,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            Some(&approval_manager),
-            "cli",
-            None,
-            None,
+    let msg = message.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Message required. Use -m/--message to send a single message. For multi-turn, use \
+             channels (e.g. zeroclaw channel start)."
         )
-        .await?;
-        final_output = response.clone();
-        println!("{response}");
-        observer.record_event(&ObserverEvent::TurnComplete);
+    })?;
 
-        // Auto-save assistant response to daily log
-        if config.memory.auto_save {
-            let summary = truncate_with_ellipsis(&response, 100);
-            let response_key = autosave_memory_key("assistant_resp");
-            let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily, None)
-                .await;
-        }
+    // Auto-save user message to memory
+    if config.memory.auto_save {
+        let user_key = autosave_memory_key("user_msg");
+        let _ = mem
+            .store(&user_key, &msg, MemoryCategory::Conversation, None)
+            .await;
+    }
+
+    // Inject memory context into user message
+    let mem_context = build_context(mem.as_ref(), &msg).await;
+    let context = mem_context;
+    let enriched = if context.is_empty() {
+        msg.clone()
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /quit to exit.\n");
-        let cli = crate::channels::CliChannel::new();
+        format!("{context}{msg}")
+    };
 
-        // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+    let mut history = vec![
+        ChatMessage::system(&system_prompt),
+        ChatMessage::user(&enriched),
+    ];
 
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
+    let response = run_tool_call_loop(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        None,
+        observer.as_ref(),
+        provider_name,
+        model_name,
+        temperature,
+        false,
+        Some(&approval_manager),
+        "cli",
+        None,
+        None,
+    )
+    .await?;
+    final_output = response.clone();
+    println!("{response}");
+    observer.record_event(&ObserverEvent::TurnComplete);
 
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
-                    break;
-                }
-            }
-
-            let user_input = input.trim().to_string();
-            if user_input.is_empty() {
-                continue;
-            }
-            if user_input == "/quit" || user_input == "/exit" {
-                break;
-            }
-
-            // Auto-save conversation turns
-            if config.memory.auto_save {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
-                    .await;
-            }
-
-            // Inject memory context into user message
-            let mem_context = build_context(mem.as_ref(), &user_input).await;
-            let context = mem_context;
-            let enriched = if context.is_empty() {
-                user_input.clone()
-            } else {
-                format!("{context}{user_input}")
-            };
-
-            history.push(ChatMessage::user(&enriched));
-
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                None,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                Some(&approval_manager),
-                "cli",
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
-                }
-            };
-            final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
-                &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-            )
-            .await
-            {
-                eprintln!("\nError sending CLI response: {e}\n");
-            }
-            observer.record_event(&ObserverEvent::TurnComplete);
-
-            // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) =
-                auto_compact_history(&mut history, provider.as_ref(), model_name).await
-            {
-                if compacted {
-                    println!("🧹 Auto-compaction complete");
-                }
-            }
-
-            // Hard cap as a safety net.
-            trim_history(&mut history);
-
-            if config.memory.auto_save {
-                let summary = truncate_with_ellipsis(&response, 100);
-                let response_key = autosave_memory_key("assistant_resp");
-                let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily, None)
-                    .await;
-            }
-        }
+    // Auto-save assistant response to daily log
+    if config.memory.auto_save {
+        let summary = truncate_with_ellipsis(&response, 100);
+        let response_key = autosave_memory_key("assistant_resp");
+        let _ = mem
+            .store(&response_key, &summary, MemoryCategory::Daily, None)
+            .await;
     }
 
     let duration = start.elapsed();

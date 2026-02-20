@@ -30,7 +30,7 @@ ZeroClaw supports a rich set of Slash Commands (`/`) to manage sessions, sub-age
 
 ## 4. General Commands
 
-- **`/quit` / `/exit`**: (CLI only) Safely exits the interactive mode.
+- **`/quit` / `/exit`**: (CLI channel only, when running via e.g. `zeroclaw channel start`) Safely exits the CLI channel session.
 
 ## 5. Implementation Notes
 - **Channel Support**: Commands are intercepted at the channel layer (`src/channels/mod.rs`) before reaching the agent.

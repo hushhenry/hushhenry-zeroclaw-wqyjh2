@@ -1,20 +1,17 @@
 use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
+    NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher,
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::prompt::SystemPromptBuilder;
 use crate::config::Config;
-use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::memory::{self, Memory};
+use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use std::io::Write as IoWrite;
 use std::sync::Arc;
-use std::time::Instant;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -281,233 +278,6 @@ impl Agent {
             .build()
     }
 
-    fn trim_history(&mut self) {
-        let max = self.config.max_history_messages;
-        if self.history.len() <= max {
-            return;
-        }
-
-        let mut system_messages = Vec::new();
-        let mut other_messages = Vec::new();
-
-        for msg in self.history.drain(..) {
-            match &msg {
-                ConversationMessage::Chat(chat) if chat.role == "system" => {
-                    system_messages.push(msg);
-                }
-                _ => other_messages.push(msg),
-            }
-        }
-
-        if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
-            other_messages.drain(0..drop_count);
-        }
-
-        self.history = system_messages;
-        self.history.extend(other_messages);
-    }
-
-    fn build_system_prompt(&self) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
-        let ctx = PromptContext {
-            workspace_dir: &self.workspace_dir,
-            model_name: &self.model_name,
-            tools: &self.tools,
-            skills: &self.skills,
-            identity_config: Some(&self.identity_config),
-            dispatcher_instructions: &instructions,
-        };
-        self.prompt_builder.build(&ctx)
-    }
-
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
-        let start = Instant::now();
-
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
-                }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
-
-        ToolExecutionResult {
-            name: call.name.clone(),
-            output: result,
-            success: true,
-            tool_call_id: call.tool_call_id.clone(),
-        }
-    }
-
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call).await);
-            }
-            return results;
-        }
-
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
-        }
-        results
-    }
-
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
-        }
-
-        if self.auto_save {
-            let _ = self
-                .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        let context = self
-            .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
-            .await
-            .unwrap_or_default();
-
-        let enriched = if context.is_empty() {
-            user_message.to_string()
-        } else {
-            format!("{context}{user_message}")
-        };
-
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let response = match self
-                .provider
-                .chat(
-                    ChatRequest {
-                        messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
-                    },
-                    &self.model_name,
-                    self.temperature,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
-            };
-
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
-                self.trim_history();
-
-                if self.auto_save {
-                    let summary = truncate_with_ellipsis(&final_text, 100);
-                    let _ = self
-                        .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
-                        .await;
-                }
-
-                return Ok(final_text);
-            }
-
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-            });
-
-            let results = self.execute_tools(&calls).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
-        }
-
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
-    }
-
-    pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
-    }
-
-    pub async fn run_interactive(&mut self) -> Result<()> {
-        println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /quit to exit.\n");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::channels::CliChannel::new();
-
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx).await;
-        });
-
-        while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
-                }
-            };
-            println!("\n{response}\n");
-        }
-
-        listen_handle.abort();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -582,27 +352,19 @@ mod tests {
                 tool_calls: vec![],
             }]),
         });
-
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
-        );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .unwrap();
-
-        let response = agent.turn("hi").await.unwrap();
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(MockTool)];
+        let observer = crate::observability::NoopObserver;
+        let (response, _history) = crate::agent::loop_::run_one_turn_for_test(
+            provider.as_ref(),
+            "You are a helpful assistant.",
+            "hi",
+            &tools,
+            &observer,
+            "test",
+            0.7,
+        )
+        .await
+        .unwrap();
         assert_eq!(response, "hello");
     }
 
@@ -624,31 +386,22 @@ mod tests {
                 },
             ]),
         });
-
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
-        );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .unwrap();
-
-        let response = agent.turn("hi").await.unwrap();
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(MockTool)];
+        let observer = crate::observability::NoopObserver;
+        let (response, history) = crate::agent::loop_::run_one_turn_for_test(
+            provider.as_ref(),
+            "You are a helpful assistant.",
+            "hi",
+            &tools,
+            &observer,
+            "test",
+            0.7,
+        )
+        .await
+        .unwrap();
         assert_eq!(response, "done");
-        assert!(agent
-            .history()
+        assert!(history
             .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+            .any(|m| m.role == "user" && m.content.contains("[Tool results]")));
     }
 }
