@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::channels::{build_internal_channel_message, dispatch_internal_message};
 use crate::session::{SessionId, SessionStore};
 use async_trait::async_trait;
 use serde_json::json;
@@ -21,7 +22,7 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Append a message to a specific session_id in memory/sessions.db"
+        "Send a message to a session (by session_id from sessions_list). The session will process and respond."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,12 +35,7 @@ impl Tool for SessionsSendTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Message content to append"
-                },
-                "role": {
-                    "type": "string",
-                    "enum": ["user", "assistant", "tool"],
-                    "description": "Message role (default: user)"
+                    "description": "Message content to send"
                 }
             },
             "required": ["session_id", "content"]
@@ -79,26 +75,6 @@ impl Tool for SessionsSendTool {
             }
         };
 
-        let role = match args
-            .get("role")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("user")
-        {
-            "user" | "assistant" | "tool" => args
-                .get("role")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("user"),
-            invalid => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Invalid 'role': {invalid}. Expected one of: user, assistant, tool"
-                    )),
-                });
-            }
-        };
-
         let store = SessionStore::new(&self.workspace_dir)?;
         if !store.session_exists(&session_id)? {
             return Ok(ToolResult {
@@ -108,17 +84,29 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        store.append_message(&session_id, role, content, None)?;
-
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "session_id": session_id.as_str(),
-                "role": role,
-                "status": "appended"
-            }))?,
-            error: None,
-        })
+        // Deliver only via internal channel; session is scheduled and will respond. No session DB write.
+        let msg = build_internal_channel_message(
+            "sessions_send",
+            session_id.as_str(),
+            content,
+            None::<&str>,
+        );
+        match dispatch_internal_message(msg).await {
+            Ok(()) => Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "session_id": session_id.as_str(),
+                    "status": "dispatched",
+                    "delivery": "internal_channel"
+                }))?,
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
     }
 }
 
@@ -129,7 +117,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn sessions_send_appends_message_to_existing_session() {
+    async fn sessions_send_requires_dispatcher_running() {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
         let session_id = store
@@ -137,40 +125,36 @@ mod tests {
             .unwrap();
 
         let tool = SessionsSendTool::new(workspace.path().to_path_buf());
+        // No channel dispatcher in unit test: dispatch fails, tool returns error.
         let result = tool
             .execute(json!({
                 "session_id": session_id.as_str(),
-                "content": "tool-inserted",
-                "role": "assistant"
-            }))
-            .await
-            .unwrap();
-        assert!(result.success);
-
-        let messages = store.load_recent_messages(&session_id, 10).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "tool-inserted");
-        assert_eq!(messages[0].role, "assistant");
-    }
-
-    #[tokio::test]
-    async fn sessions_send_rejects_unknown_role() {
-        let workspace = TempDir::new().unwrap();
-        let store = SessionStore::new(workspace.path()).unwrap();
-        let session_id = store
-            .get_or_create_active(&SessionKey::new("group:discord:chan-2"))
-            .unwrap();
-
-        let tool = SessionsSendTool::new(workspace.path().to_path_buf());
-        let result = tool
-            .execute(json!({
-                "session_id": session_id.as_str(),
-                "content": "bad-role",
-                "role": "system"
+                "content": "hello"
             }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Invalid 'role'"));
+        assert!(
+            result.error.as_ref().unwrap_or(&String::new()).contains("dispatcher")
+                || result.error.as_ref().unwrap_or(&String::new()).contains("channel"),
+            "expected error about dispatcher/channel, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_send_rejects_nonexistent_session() {
+        let workspace = TempDir::new().unwrap();
+
+        let tool = SessionsSendTool::new(workspace.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "session_id": "nonexistent-session-id",
+                "content": "hello"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("Session not found"));
     }
 }
