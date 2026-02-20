@@ -53,20 +53,15 @@ pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use shell::ShellTool;
-pub use subagent_poll::SubagentPollTool;
 pub use subagent_spawn::SubagentSpawnTool;
-pub use subagent_stop::SubagentStopTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 
-use crate::config::{Config, DelegateAgentConfig};
+use crate::config::Config;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use crate::session::SessionStore;
-use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Create the default tool registry

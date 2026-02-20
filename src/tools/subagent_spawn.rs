@@ -95,6 +95,7 @@ impl Tool for SubagentSpawnTool {
             deliver: false,
             hop: parent_hop + 1,
             trace_id: parent_trace_id,
+            parent_session_id: parent_session_id.map(|s| s.to_string()),
         };
         store.upsert_route_metadata(&child_session_id, &metadata)?;
 

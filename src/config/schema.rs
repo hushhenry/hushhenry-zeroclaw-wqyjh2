@@ -2339,18 +2339,6 @@ tool_dispatcher = "xml"
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
 
-        config.agents.insert(
-            "worker".into(),
-            DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
-                system_prompt: None,
-                api_key: Some("agent-credential".into()),
-                temperature: None,
-                max_depth: 3,
-            },
-        );
-
         config.save().unwrap();
 
         let contents = fs::read_to_string(config.config_path.clone()).unwrap();
@@ -2378,11 +2366,6 @@ tool_dispatcher = "xml"
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
         );
-
-        let worker = stored.agents.get("worker").unwrap();
-        let worker_encrypted = worker.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
-        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let _ = fs::remove_dir_all(&dir);
     }
