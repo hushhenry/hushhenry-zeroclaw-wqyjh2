@@ -229,6 +229,7 @@ impl Agent {
     }
 
     /// Entry point: run session_context_loop or memory_context_loop.
+    /// Registry entry for this key is removed here when the loop returns (single place).
     pub(crate) async fn run(
         mut self,
         registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
@@ -243,10 +244,13 @@ impl Agent {
                     return;
                 }
             };
-            self.session_context_loop(registry, key_str, sid).await;
+            self.session_context_loop(Arc::clone(&registry), key_str.clone(), sid)
+                .await;
         } else {
-            self.memory_context_loop(registry, key_str).await;
+            self.memory_context_loop(Arc::clone(&registry), key_str.clone())
+                .await;
         }
+        registry.lock().remove(&key_str);
     }
 
     /// Spawned task: consumes DeliverMessage, routes assistant (and optionally tool) to send_delivery_message.
@@ -325,10 +329,7 @@ impl Agent {
     ) {
         let session_store = match self.ctx.session_store.as_ref() {
             Some(s) => Arc::clone(s),
-            None => {
-                registry.lock().remove(&key_str);
-                return;
-            }
+            None => return,
         };
 
         while let Some(first) = self.message_rx.recv().await {
@@ -366,7 +367,6 @@ impl Agent {
                 tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
             }
         }
-        registry.lock().remove(&key_str);
     }
 
     /// Tool call loop for session mode: on_message, mid-tool steer, context_exceeded retry.
@@ -594,7 +594,6 @@ impl Agent {
                 }
             });
         }
-        registry.lock().remove(&key_str);
     }
 }
 
