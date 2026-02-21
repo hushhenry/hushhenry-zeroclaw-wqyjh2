@@ -1,5 +1,6 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
+pub mod command;
 pub mod dispatcher;
 pub mod loop_;
 pub mod prompt;
