@@ -138,12 +138,51 @@ struct CandidateContent {
     parts: Vec<ResponsePart>,
 }
 
+impl CandidateContent {
+    /// Extract effective text, skipping thinking and thought-signature-only parts.
+    ///
+    /// Prefers non-thinking text; falls back to the first thinking segment when no
+    /// non-thinking content is present (so thinking-only responses still yield text).
+    fn effective_text(&self) -> Option<String> {
+        let mut answer_parts: Vec<&str> = Vec::new();
+        let mut first_thinking: Option<&str> = None;
+
+        for part in &self.parts {
+            let Some(ref text) = part.text else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            if !part.thought.unwrap_or(false) {
+                answer_parts.push(text);
+            } else if first_thinking.is_none() {
+                first_thinking = Some(text);
+            }
+        }
+
+        if answer_parts.is_empty() {
+            first_thinking.map(String::from)
+        } else {
+            Some(answer_parts.join(""))
+        }
+    }
+}
+
+/// Part of a Gemini candidate content.
+/// Thinking models (e.g. gemini-2.5-flash) can return:
+/// - `{"thought": true, "text": "reasoning..."}` — internal reasoning
+/// - `{"text": "actual answer"}` — the response
+/// - `{"thoughtSignature": "..."}` — opaque signature (no text); deserialized and skipped for display
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResponsePart {
     text: Option<String>,
     #[serde(default)]
     thought: Option<bool>,
+    /// Opaque thought signature from Gemini thinking models; accepted and skipped when building effective text.
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
     function_call: Option<FunctionCallResponse>,
 }
 
@@ -509,15 +548,10 @@ impl Provider for GeminiProvider {
             .and_then(|c| c.into_iter().next())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
 
-        let mut text_buf = String::new();
+        let text = candidate.content.effective_text();
         let mut tool_calls = Vec::new();
 
         for part in candidate.content.parts {
-            if let Some(t) = part.text {
-                if !part.thought.unwrap_or(false) {
-                    text_buf.push_str(&t);
-                }
-            }
             if let Some(fc) = part.function_call {
                 let counter = TOOL_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let id = format!("{}_{}", fc.name, counter);
@@ -532,12 +566,6 @@ impl Provider for GeminiProvider {
                 });
             }
         }
-
-        let text = if text_buf.is_empty() {
-            None
-        } else {
-            Some(text_buf)
-        };
 
         Ok(ProviderChatResponse { text, tool_calls })
     }
@@ -805,6 +833,64 @@ mod tests {
                 .and_then(|a| a.get("command").and_then(|v| v.as_str())),
             Some("date")
         );
+    }
+
+    #[test]
+    fn response_deserialization_with_thought_signature() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "reasoning step"},
+                        {"text": "Final answer."},
+                        {"thoughtSignature": "opaque-sig-abc123"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let content = &response.candidates.as_ref().unwrap()[0].content;
+        assert_eq!(content.parts.len(), 3);
+        assert_eq!(
+            content.parts[2].thought_signature.as_deref(),
+            Some("opaque-sig-abc123")
+        );
+        assert_eq!(content.effective_text().as_deref(), Some("Final answer."));
+    }
+
+    #[test]
+    fn effective_text_falls_back_to_thinking_when_no_answer_parts() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "only reasoning"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let content = &response.candidates.as_ref().unwrap()[0].content;
+        assert_eq!(content.effective_text().as_deref(), Some("only reasoning"));
+    }
+
+    #[test]
+    fn effective_text_skips_signature_only_parts() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thoughtSignature": "sig-only"}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let content = &response.candidates.as_ref().unwrap()[0].content;
+        assert_eq!(content.effective_text(), None);
     }
 
     #[test]

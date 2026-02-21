@@ -258,6 +258,7 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
+        // Provider returns user-facing text only (e.g. Gemini strips thought/thought_signature via effective_text).
         let text = resp.text_or_empty().to_string();
         let tool_calls = resp.tool_calls.clone();
 

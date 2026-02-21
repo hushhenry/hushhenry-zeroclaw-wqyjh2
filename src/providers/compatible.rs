@@ -223,12 +223,60 @@ struct Choice {
     message: ResponseMessage,
 }
 
+/// Remove <think>…</think> blocks from model output.
+/// Some reasoning models (e.g. MiniMax) embed chain-of-thought inline in `content`;
+/// the resulting think tags must be stripped before returning to the user.
+fn strip_think_tags(s: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = concat!("</", "think>");
+
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find(OPEN) {
+            result.push_str(&rest[..start]);
+            if let Some(close_pos) = rest[start..].find(CLOSE) {
+                rest = &rest[start + close_pos + CLOSE.len()..];
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return output in `reasoning_content`; used as fallback.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ApiToolCall>>,
+}
+
+impl ResponseMessage {
+    /// Extract text: prefer `content` (with think tags stripped), fallback to `reasoning_content` (also stripped).
+    fn effective_content(&self) -> String {
+        self.effective_content_optional().unwrap_or_default()
+    }
+
+    fn effective_content_optional(&self) -> Option<String> {
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+            let stripped = strip_think_tags(content);
+            if !stripped.is_empty() {
+                return Some(stripped);
+            }
+        }
+        self.reasoning_content
+            .as_ref()
+            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -590,6 +638,7 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+        let text = message.effective_content_optional();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -606,10 +655,7 @@ impl OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse {
-            text: message.content,
-            tool_calls,
-        }
+        ProviderChatResponse { text, tool_calls }
     }
 }
 
@@ -782,6 +828,37 @@ mod tests {
             resp.choices[0].message.content,
             Some("Hello from Venice!".to_string())
         );
+    }
+
+    #[test]
+    fn strip_think_tags_removes_think_blocks() {
+        let open = "<think>";
+        let close = concat!("</", "think>");
+        let input = format!("Hello {open}internal reasoning{close} world");
+        assert_eq!(super::strip_think_tags(&input), "Hello  world");
+    }
+
+    #[test]
+    fn effective_content_strips_think_tags() {
+        let open = "<think>";
+        let close = concat!("</", "think>");
+        let content = format!("Answer: 42 {open}reasoning{close} done");
+        let msg = super::ResponseMessage {
+            content: Some(content),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        assert_eq!(msg.effective_content(), "Answer: 42  done");
+    }
+
+    #[test]
+    fn effective_content_fallback_to_reasoning_content() {
+        let msg = super::ResponseMessage {
+            content: None,
+            reasoning_content: Some("From reasoning".to_string()),
+            tool_calls: None,
+        };
+        assert_eq!(msg.effective_content(), "From reasoning");
     }
 
     #[test]

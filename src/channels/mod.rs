@@ -184,6 +184,43 @@ pub(crate) async fn send_delivery_message(
         .await
 }
 
+/// Normalize cached channel turns so that alternating user/assistant is preserved;
+/// consecutive same-role messages (e.g. from interrupted turns) are merged.
+///
+/// Expects roles "user" and "assistant"; other roles are skipped. Use when compacting
+/// or rebuilding history from a list of user/assistant turns.
+pub(crate) fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut normalized = Vec::with_capacity(turns.len());
+    let mut expecting_user = true;
+
+    for turn in turns {
+        match (expecting_user, turn.role.as_str()) {
+            (true, "user") => {
+                normalized.push(turn);
+                expecting_user = false;
+            }
+            (false, "assistant") => {
+                normalized.push(turn);
+                expecting_user = true;
+            }
+            // Interrupted channel turns can produce consecutive user or assistant messages; merge.
+            (false, "user") | (true, "assistant") => {
+                if let Some(last_turn) = normalized.last_mut() {
+                    if !turn.content.is_empty() {
+                        if !last_turn.content.is_empty() {
+                            last_turn.content.push_str("\n\n");
+                        }
+                        last_turn.content.push_str(&turn.content);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    normalized
+}
+
 pub(crate) fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
@@ -1397,13 +1434,54 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
     use crate::providers::{
-        ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait, ToolCall,
+        ChatMessage, ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait,
+        ToolCall,
     };
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn normalize_cached_channel_turns_alternating() {
+        let turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("u2"),
+        ];
+        let out = normalize_cached_channel_turns(turns);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].content, "u1");
+        assert_eq!(out[1].content, "a1");
+        assert_eq!(out[2].content, "u2");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_merges_consecutive_user() {
+        let turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a1"),
+        ];
+        let out = normalize_cached_channel_turns(turns);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "u1\n\nu2");
+        assert_eq!(out[1].content, "a1");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_merges_consecutive_assistant() {
+        let turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::assistant("a2"),
+        ];
+        let out = normalize_cached_channel_turns(turns);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "u1");
+        assert_eq!(out[1].content, "a1\n\na2");
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
