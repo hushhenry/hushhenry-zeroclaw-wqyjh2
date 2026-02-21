@@ -243,56 +243,6 @@ impl Provider for OpenRouterProvider {
         Ok(())
     }
 
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
-
-        let api_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-        };
-
-        let response = self
-            .client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/zeroclaw",
-            )
-            .header("X-Title", "ZeroClaw")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let chat_response: ApiChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
-    }
-
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -343,90 +293,6 @@ impl Provider for OpenRouterProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
-    }
-
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[serde_json::Value],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
-            )
-        })?;
-
-        // Convert tool JSON values to NativeToolSpec
-        let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
-            None
-        } else {
-            let specs: Vec<NativeToolSpec> = tools
-                .iter()
-                .filter_map(|t| {
-                    let func = t.get("function")?;
-                    Some(NativeToolSpec {
-                        kind: "function".to_string(),
-                        function: NativeToolFunctionSpec {
-                            name: func.get("name")?.as_str()?.to_string(),
-                            description: func
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            parameters: func
-                                .get("parameters")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({})),
-                        },
-                    })
-                })
-                .collect();
-            if specs.is_empty() {
-                None
-            } else {
-                Some(specs)
-            }
-        };
-
-        // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
-        // when history contains native tool-call metadata.
-        let native_messages = Self::convert_messages(messages);
-
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: native_messages,
-            temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
-            tools: native_tools,
-        };
-
-        let response = self
-            .client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header(
-                "HTTP-Referer",
-                "https://github.com/theonlyhennygod/zeroclaw",
-            )
-            .header("X-Title", "ZeroClaw")
-            .json(&native_request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
     }
 }
 
@@ -579,22 +445,28 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
+        use crate::tools::ToolSpec;
+
         let provider = OpenRouterProvider::new(None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
         }];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "shell",
-                "description": "Run a shell command",
-                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
-            }
-        })];
+        let tool_specs: Vec<ToolSpec> = vec![ToolSpec {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
 
         let result = provider
-            .chat_with_tools(&messages, &tools, "deepseek/deepseek-chat", 0.5)
+            .chat(
+                crate::providers::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tool_specs),
+                },
+                "deepseek/deepseek-chat",
+                0.5,
+            )
             .await;
 
         assert!(result.is_err());

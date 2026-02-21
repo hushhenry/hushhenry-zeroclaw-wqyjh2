@@ -584,18 +584,6 @@ async fn write_file_secure(path: &Path, content: &str) {
 
 #[async_trait]
 impl Provider for CopilotProvider {
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let response = self
-            .send_chat_request(Self::convert_messages(messages), None, model, temperature)
-            .await?;
-        Ok(response.text.unwrap_or_default())
-    }
-
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,

@@ -311,27 +311,6 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
-    /// Chat with tool definitions for native function calling support.
-    /// Compatibility wrapper retained for older call sites.
-    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        _tools: &[serde_json::Value],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
-        self.chat(
-            ChatRequest {
-                messages,
-                tools: None,
-            },
-            model,
-            temperature,
-        )
-        .await
-    }
-
     /// Whether provider supports streaming responses.
     /// Default implementation returns false.
     fn supports_streaming(&self) -> bool {

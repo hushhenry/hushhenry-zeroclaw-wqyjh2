@@ -1,10 +1,12 @@
 use crate::providers::traits::{
-    with_prompt_guided_tools, ChatRequest as ProviderChatRequest,
-    ChatResponse as ProviderChatResponse, Provider,
+    ChatMessage, ChatRequest as ProviderChatRequest,
+    ChatResponse as ProviderChatResponse, Provider, ToolCall as ProviderToolCall,
 };
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub struct OllamaProvider {
     base_url: String,
@@ -20,12 +22,45 @@ struct ChatRequest {
     messages: Vec<Message>,
     stream: bool,
     options: Options,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OllamaToolSpec>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OllamaToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaToolFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OutgoingToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutgoingToolCall {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OutgoingFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OutgoingFunction {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,19 +152,124 @@ impl OllamaProvider {
         Ok((normalized_model, should_auth))
     }
 
-    /// Send a request to Ollama and get the parsed response
+    fn convert_tools_to_ollama(tools: Option<&[ToolSpec]>) -> Option<Vec<OllamaToolSpec>> {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
+            items
+                .iter()
+                .map(|t| OllamaToolSpec {
+                    kind: "function".to_string(),
+                    function: OllamaToolFunctionSpec {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.parameters.clone(),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    /// Convert ChatMessage history to Ollama Message format.
+    /// run_tool_call_loop stores assistant/tool entries as JSON in ChatMessage.content;
+    /// we decode those so follow-up requests send structured tool_calls and tool_name.
+    fn convert_messages(messages: &[ChatMessage]) -> Vec<Message> {
+        let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
+
+        messages
+            .iter()
+            .map(|m| {
+                if m.role == "assistant" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                        if let Some(tool_calls_value) = value.get("tool_calls") {
+                            if let Ok(parsed_calls) =
+                                serde_json::from_value::<Vec<ProviderToolCall>>(
+                                    tool_calls_value.clone(),
+                                )
+                            {
+                                let outgoing_calls: Vec<OutgoingToolCall> = parsed_calls
+                                    .iter()
+                                    .map(|call| {
+                                        tool_name_by_id
+                                            .insert(call.id.clone(), call.name.clone());
+                                        let args: serde_json::Value = serde_json::from_str(
+                                            &call.arguments,
+                                        )
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                        OutgoingToolCall {
+                                            kind: "function".to_string(),
+                                            function: OutgoingFunction {
+                                                name: call.name.clone(),
+                                                arguments: args,
+                                            },
+                                        }
+                                    })
+                                    .collect();
+                                let content = value
+                                    .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(String::from)
+                                    .unwrap_or_default();
+                                return Message {
+                                    role: "assistant".to_string(),
+                                    content,
+                                    tool_calls: Some(outgoing_calls),
+                                    tool_name: None,
+                                };
+                            }
+                        }
+                    }
+                }
+
+                if m.role == "tool" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                        let tool_name = value
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|id| tool_name_by_id.get(id))
+                            .cloned();
+                        let content = value
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                            .unwrap_or_else(|| m.content.clone());
+                        return Message {
+                            role: "tool".to_string(),
+                            content,
+                            tool_calls: None,
+                            tool_name,
+                        };
+                    }
+                }
+
+                Message {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_name: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Send a request to Ollama and get the parsed response.
+    /// Pass tools to enable native function-calling for models that support it.
     async fn send_request(
         &self,
         messages: Vec<Message>,
         model: &str,
         temperature: f64,
         should_auth: bool,
+        tools: Option<Vec<OllamaToolSpec>>,
     ) -> anyhow::Result<ApiChatResponse> {
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             stream: false,
             options: Options { temperature },
+            tools,
         };
 
         let url = format!("{}/api/chat", self.base_url);
@@ -262,34 +402,55 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            ..Default::default()
+        }
+    }
+
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let messages = with_prompt_guided_tools(self, request)?;
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
-        let api_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
+        let api_messages = Self::convert_messages(request.messages);
+        let api_tools = Self::convert_tools_to_ollama(request.tools);
 
         let response = self
-            .send_request(api_messages, &normalized_model, temperature, should_auth)
+            .send_request(api_messages, &normalized_model, temperature, should_auth, api_tools)
             .await?;
 
         if !response.message.tool_calls.is_empty() {
             tracing::debug!(
-                "Ollama returned {} tool call(s), formatting for loop parser",
+                "Ollama returned {} tool call(s)",
                 response.message.tool_calls.len()
             );
+            let tool_calls: Vec<ProviderToolCall> = response
+                .message
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let (name, args) = self.extract_tool_name_and_args(tc);
+                    ProviderToolCall {
+                        id: tc.id
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        name,
+                        arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+                    }
+                })
+                .collect();
+            let text = if response.message.content.is_empty() {
+                None
+            } else {
+                Some(response.message.content.clone())
+            };
             return Ok(ProviderChatResponse {
-                text: Some(self.format_tool_calls_for_loop(&response.message.tool_calls)),
-                tool_calls: vec![],
+                text,
+                tool_calls,
             });
         }
 
@@ -317,63 +478,8 @@ impl Provider for OllamaProvider {
         })
     }
 
-    async fn chat_with_history(
-        &self,
-        messages: &[crate::providers::ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
-
-        let api_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
-
-        let response = self
-            .send_request(api_messages, &normalized_model, temperature, should_auth)
-            .await?;
-
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
-        if !response.message.tool_calls.is_empty() {
-            tracing::debug!(
-                "Ollama returned {} tool call(s), formatting for loop parser",
-                response.message.tool_calls.len()
-            );
-            return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
-        }
-
-        // Plain text response
-        let content = response.message.content;
-
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        // This is a model quirk - it stopped after reasoning without producing output
-        if content.is_empty() {
-            if let Some(thinking) = &response.message.thinking {
-                tracing::warn!(
-                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
-                );
-                // Return a message indicating the model's thought process but no action
-                return Ok(format!(
-                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
-                ));
-            }
-            tracing::warn!("Ollama returned empty content with no tool calls");
-        }
-
-        Ok(content)
-    }
-
     fn supports_native_tools(&self) -> bool {
-        // Return false since loop_.rs uses XML-style tool parsing via system prompt
-        // The model may return native tool_calls but we convert them to JSON format
-        // that parse_tool_calls() understands
-        false
+        true
     }
 }
 
@@ -559,5 +665,60 @@ mod tests {
         assert_eq!(func.get("name").unwrap(), "shell");
         // arguments should be a string (JSON-encoded)
         assert!(func.get("arguments").unwrap().is_string());
+    }
+
+    #[test]
+    fn convert_messages_parses_native_assistant_tool_calls() {
+        use crate::providers::traits::ChatMessage;
+
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OllamaProvider::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[0].content, "");
+        let calls = converted[0].tool_calls.as_ref().expect("tool_calls expected");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+        assert_eq!(
+            calls[0].function.arguments.get("command").and_then(|v| v.as_str()),
+            Some("ls")
+        );
+    }
+
+    #[test]
+    fn convert_messages_maps_tool_result_to_tool_name() {
+        use crate::providers::traits::ChatMessage;
+
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: r#"{"content":null,"tool_calls":[{"id":"call_7","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#
+                    .into(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: r#"{"tool_call_id":"call_7","content":"ok"}"#.into(),
+            },
+        ];
+
+        let converted = OllamaProvider::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[1].role, "tool");
+        assert_eq!(converted[1].tool_name.as_deref(), Some("file_read"));
+        assert_eq!(converted[1].content, "ok");
+    }
+
+    #[test]
+    fn capabilities_include_native_tools() {
+        let provider = OllamaProvider::new(None, None);
+        let caps = provider.capabilities();
+        assert!(caps.native_tool_calling);
     }
 }
