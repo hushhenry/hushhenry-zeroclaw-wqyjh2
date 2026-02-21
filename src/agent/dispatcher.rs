@@ -18,10 +18,41 @@ pub struct ToolExecutionResult {
     pub tool_call_id: Option<String>,
 }
 
+/// Result of parsing a provider response; includes text to display, parsed tool calls, and the string to store as assistant content in history.
+#[derive(Debug, Clone)]
+pub struct ParseResponseResult {
+    pub text: String,
+    pub tool_calls: Vec<ParsedToolCall>,
+    pub assistant_content_for_history: String,
+}
+
+/// Convert a single ConversationMessage (e.g. from format_results) into ChatMessage(s) to append to history.
+pub fn conversation_message_to_chat_messages(msg: ConversationMessage) -> Vec<ChatMessage> {
+    match msg {
+        ConversationMessage::Chat(chat) => vec![chat],
+        ConversationMessage::AssistantToolCalls { .. } => {
+            unreachable!("format_results does not produce AssistantToolCalls")
+        }
+        ConversationMessage::ToolResults(results) => results
+            .iter()
+            .map(|r| {
+                ChatMessage::tool(
+                    serde_json::json!({
+                        "tool_call_id": r.tool_call_id,
+                        "content": r.content,
+                    })
+                    .to_string(),
+                )
+            })
+            .collect(),
+    }
+}
+
 pub trait ToolDispatcher: Send + Sync {
-    fn parse_response(&self, response: &ChatResponse) -> (String, Vec<ParsedToolCall>);
+    fn parse_response(&self, response: &ChatResponse) -> ParseResponseResult;
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage;
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String;
+    fn prompt_instructions(&self, specs: &[ToolSpec]) -> String;
+
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage>;
     fn should_send_tool_specs(&self) -> bool;
 }
@@ -30,6 +61,7 @@ pub trait ToolDispatcher: Send + Sync {
 pub struct XmlToolDispatcher;
 
 impl XmlToolDispatcher {
+    /// Parse only `<tool_call>...</tool_call>` tags; inner content as single JSON object with "name" and "arguments".
     fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
@@ -49,20 +81,19 @@ impl XmlToolDispatcher {
                             .get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("")
+                            .trim()
                             .to_string();
-                        if name.is_empty() {
-                            remaining = &remaining[start + end + 12..];
-                            continue;
+                        if !name.is_empty() {
+                            let arguments = parsed
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                            calls.push(ParsedToolCall {
+                                name,
+                                arguments,
+                                tool_call_id: None,
+                            });
                         }
-                        let arguments = parsed
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                        calls.push(ParsedToolCall {
-                            name,
-                            arguments,
-                            tool_call_id: None,
-                        });
                     }
                     Err(e) => {
                         tracing::warn!("Malformed <tool_call> JSON: {e}");
@@ -87,9 +118,14 @@ impl XmlToolDispatcher {
 }
 
 impl ToolDispatcher for XmlToolDispatcher {
-    fn parse_response(&self, response: &ChatResponse) -> (String, Vec<ParsedToolCall>) {
+    fn parse_response(&self, response: &ChatResponse) -> ParseResponseResult {
         let text = response.text_or_empty();
-        Self::parse_xml_tool_calls(text)
+        let (text, tool_calls) = Self::parse_xml_tool_calls(text);
+        ParseResponseResult {
+            assistant_content_for_history: text.clone(),
+            text,
+            tool_calls,
+        }
     }
 
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
@@ -105,7 +141,7 @@ impl ToolDispatcher for XmlToolDispatcher {
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
+    fn prompt_instructions(&self, specs: &[ToolSpec]) -> String {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
         instructions
@@ -114,17 +150,17 @@ impl ToolDispatcher for XmlToolDispatcher {
             "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
         );
         instructions.push_str("### Available Tools\n\n");
-
-        for tool in tools {
+        for spec in specs {
+            let parameters =
+                serde_json::to_string(&spec.parameters).unwrap_or_else(|_| "{}".to_string());
             let _ = writeln!(
                 instructions,
                 "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
+                spec.name,
+                spec.description,
+                parameters
             );
         }
-
         instructions
     }
 
@@ -158,10 +194,30 @@ impl ToolDispatcher for XmlToolDispatcher {
 
 pub struct NativeToolDispatcher;
 
+impl NativeToolDispatcher {
+    fn build_assistant_content_for_history(text: &str, parsed_calls: &[ParsedToolCall]) -> String {
+        let tool_calls: Vec<serde_json::Value> = parsed_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.tool_call_id.as_deref().unwrap_or(""),
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "content": text,
+            "tool_calls": tool_calls,
+        })
+        .to_string()
+    }
+}
+
 impl ToolDispatcher for NativeToolDispatcher {
-    fn parse_response(&self, response: &ChatResponse) -> (String, Vec<ParsedToolCall>) {
+    fn parse_response(&self, response: &ChatResponse) -> ParseResponseResult {
         let text = response.text.clone().unwrap_or_default();
-        let calls = response
+        let tool_calls: Vec<ParsedToolCall> = response
             .tool_calls
             .iter()
             .map(|tc| ParsedToolCall {
@@ -171,7 +227,13 @@ impl ToolDispatcher for NativeToolDispatcher {
                 tool_call_id: Some(tc.id.clone()),
             })
             .collect();
-        (text, calls)
+        let assistant_content_for_history =
+            Self::build_assistant_content_for_history(&text, &tool_calls);
+        ParseResponseResult {
+            text,
+            tool_calls,
+            assistant_content_for_history,
+        }
     }
 
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
@@ -188,7 +250,7 @@ impl ToolDispatcher for NativeToolDispatcher {
         ConversationMessage::ToolResults(messages)
     }
 
-    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
+    fn prompt_instructions(&self, _specs: &[ToolSpec]) -> String {
         String::new()
     }
 
@@ -239,9 +301,9 @@ mod tests {
             tool_calls: vec![],
         };
         let dispatcher = XmlToolDispatcher;
-        let (_, calls) = dispatcher.parse_response(&response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        let result = dispatcher.parse_response(&response);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "shell");
     }
 
     #[test]
@@ -255,9 +317,9 @@ mod tests {
             }],
         };
         let dispatcher = NativeToolDispatcher;
-        let (_, calls) = dispatcher.parse_response(&response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool_call_id.as_deref(), Some("tc1"));
+        let result = dispatcher.parse_response(&response);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].tool_call_id.as_deref(), Some("tc1"));
 
         let msg = dispatcher.format_results(&[ToolExecutionResult {
             name: "file_read".into(),

@@ -35,6 +35,7 @@ use crate::providers::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
     ToolResultMessage,
 };
+use crate::providers::traits::ProviderCapabilities;
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,8 +49,10 @@ use std::sync::{Arc, Mutex};
 /// When the queue is exhausted it returns a simple "done" text response.
 struct ScriptedProvider {
     responses: Mutex<Vec<ChatResponse>>,
-    /// Records every request for assertion.
     requests: Mutex<Vec<Vec<ChatMessage>>>,
+    /// When true, loop uses NativeToolDispatcher (reads resp.tool_calls).
+    /// When false, loop uses XmlToolDispatcher (parses tool calls from resp.text).
+    native_tools: bool,
 }
 
 impl ScriptedProvider {
@@ -57,6 +60,16 @@ impl ScriptedProvider {
         Self {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
+            native_tools: true,
+        }
+    }
+
+    /// Scripted provider that reports prompt-guided (no native tools) so the loop uses XmlToolDispatcher.
+    fn new_prompt_guided(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+            native_tools: false,
         }
     }
 
@@ -67,6 +80,12 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: self.native_tools,
+        }
+    }
+
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -420,10 +439,10 @@ async fn turn_handles_unknown_tool_gracefully() {
     assert_eq!(response, "I couldn't find that tool");
     let has_tool_result = history
         .iter()
-        .any(|m| m.role == "user" && m.content.contains("Unknown tool"));
+        .any(|m| m.content.contains("Unknown tool"));
     assert!(
         has_tool_result,
-        "Expected tool result with 'Unknown tool' message"
+        "Expected tool result with 'Unknown tool' message (user or tool role)"
     );
 }
 
@@ -492,7 +511,7 @@ async fn turn_propagates_provider_error() {
 
 #[tokio::test]
 async fn xml_dispatcher_parses_and_loops() {
-    let provider = Arc::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new_prompt_guided(vec![
         xml_tool_response("echo", r#"{"message": "xml-test"}"#),
         text_response("XML tool completed"),
     ]));
@@ -662,15 +681,19 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     assert_eq!(history[0].role, "system");
     assert_eq!(history[1].role, "user");
     assert!(history[1].content.contains("test"));
-    let tool_results_msg = history
-        .iter()
-        .find(|m| m.role == "user" && m.content.contains("[Tool results]"));
+    let has_tool_results = history.iter().any(|m| {
+        (m.role == "user" && m.content.contains("[Tool results]"))
+            || (m.role == "tool" && m.content.contains("tool-out"))
+    });
     assert!(
-        tool_results_msg.is_some(),
-        "Should have [Tool results] user message"
+        has_tool_results,
+        "Should have tool results in history (user [Tool results] or tool-role message)"
     );
     let last_assistant = history.iter().rev().find(|m| m.role == "assistant");
-    assert_eq!(last_assistant.unwrap().content, "final answer");
+    assert!(
+        last_assistant.unwrap().content.contains("final answer"),
+        "Last assistant message should contain final answer (plain or in JSON for native)"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -706,11 +729,16 @@ async fn native_dispatcher_handles_stringified_arguments() {
         }],
     };
 
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "echo");
+    let result = dispatcher.parse_response(&response);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].name, "echo");
     assert_eq!(
-        calls[0].arguments.get("message").unwrap().as_str().unwrap(),
+        result.tool_calls[0]
+            .arguments
+            .get("message")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "hello"
     );
 }
@@ -732,11 +760,16 @@ fn xml_dispatcher_handles_nested_json() {
     };
 
     let dispatcher = XmlToolDispatcher;
-    let (_, calls) = dispatcher.parse_response(&response);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "file_write");
+    let result = dispatcher.parse_response(&response);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].name, "file_write");
     assert_eq!(
-        calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+        result.tool_calls[0]
+            .arguments
+            .get("path")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "test.json"
     );
 }
@@ -749,9 +782,9 @@ fn xml_dispatcher_handles_empty_tool_call_tag() {
     };
 
     let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
-    assert!(calls.is_empty());
-    assert!(text.contains("Some text"));
+    let result = dispatcher.parse_response(&response);
+    assert!(result.tool_calls.is_empty());
+    assert!(result.text.contains("Some text"));
 }
 
 #[test]
@@ -762,10 +795,10 @@ fn xml_dispatcher_handles_unclosed_tool_call() {
     };
 
     let dispatcher = XmlToolDispatcher;
-    let (text, calls) = dispatcher.parse_response(&response);
+    let result = dispatcher.parse_response(&response);
     // Should not panic — just treat as text
-    assert!(calls.is_empty());
-    assert!(text.contains("Before"));
+    assert!(result.tool_calls.is_empty());
+    assert!(result.text.contains("Before"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -949,8 +982,9 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
 #[test]
 fn xml_dispatcher_generates_tool_instructions() {
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let specs: Vec<crate::tools::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
     let dispatcher = XmlToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
+    let instructions = dispatcher.prompt_instructions(&specs);
 
     assert!(instructions.contains("## Tool Use Protocol"));
     assert!(instructions.contains("<tool_call>"));
@@ -961,8 +995,9 @@ fn xml_dispatcher_generates_tool_instructions() {
 #[test]
 fn native_dispatcher_returns_empty_instructions() {
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let specs: Vec<crate::tools::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
     let dispatcher = NativeToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
+    let instructions = dispatcher.prompt_instructions(&specs);
     assert!(instructions.is_empty());
 }
 
