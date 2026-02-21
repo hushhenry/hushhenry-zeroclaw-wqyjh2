@@ -21,10 +21,8 @@
 //!  16. ConversationMessage serialization round-trip
 //!  17. Tool call with stringified JSON arguments
 //!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
-//!  20. Idempotent system prompt insertion
+//!  19. Idempotent system prompt insertion
 
-use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -253,7 +251,7 @@ fn make_observer() -> Arc<dyn Observer> {
     Arc::from(NoopObserver {})
 }
 
-/// Run one turn via loop_ (replaces Agent::turn for tests).
+/// Run one turn via loop_ for tests.
 async fn run_turn(
     provider: &dyn Provider,
     user_message: &str,
@@ -668,24 +666,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 16. Builder validation
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn builder_fails_without_provider() {
-    let result = Agent::builder()
-        .tools(vec![])
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
-        .build();
-
-    assert!(result.is_err(), "Building without provider should fail");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 17. Multi-turn conversation maintains context
+// 16. Multi-turn conversation maintains context
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -702,7 +683,7 @@ async fn multi_turn_maintains_growing_history() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 18. Tool call with stringified JSON arguments (common LLM pattern)
+// 17. Tool call with stringified JSON arguments (common LLM pattern)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -727,7 +708,7 @@ async fn native_dispatcher_handles_stringified_arguments() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 19. XML dispatcher edge cases
+// 18. XML dispatcher edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -780,7 +761,7 @@ fn xml_dispatcher_handles_unclosed_tool_call() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 20. ConversationMessage serialization round-trip
+// 19. ConversationMessage serialization round-trip
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -835,7 +816,7 @@ fn conversation_message_serialization_roundtrip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 21. Tool dispatcher format_results
+// 20. Tool dispatcher format_results
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -901,7 +882,7 @@ fn native_format_results_maps_tool_call_ids() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 22. to_provider_messages conversion
+// 21. to_provider_messages conversion
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -954,7 +935,7 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 23. XML tool instructions generation
+// 22. XML tool instructions generation
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -978,9 +959,5 @@ fn native_dispatcher_returns_empty_instructions() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 24. Clear history — Agent.clear_history() retained for API; multi-turn removed
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 25. run_single removed; use run_turn (loop_) for single message
+// 23. run_single removed; use run_turn (loop_) for single message
 // ═══════════════════════════════════════════════════════════════════════════
