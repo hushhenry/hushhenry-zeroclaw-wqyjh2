@@ -26,6 +26,10 @@ use tokio::time::timeout as timeout_future;
 
 /// Core turn execution: build history, run tool loop, deliver response.
 /// `use_session_history` controls whether session history compaction/persistence logic is enabled.
+#[deprecated(
+    since = "0.1.0",
+    note = "Replaced by Agent in agent/agent.rs; use Agent::tool_call_loop_session for session mode."
+)]
 pub(crate) async fn run_turn_core(
     ctx: Arc<ChannelRuntimeContext>,
     active_session: Option<&SessionId>,
@@ -318,7 +322,11 @@ pub(crate) async fn run_turn_core(
     Ok(())
 }
 
-/// Session turn entrypoint. Used by the per-session agent loop.
+/// Session turn entrypoint. Replaced by Agent::session_context_loop + tool_call_loop_session.
+#[deprecated(
+    since = "0.1.0",
+    note = "Session mode now uses Agent in agent/agent.rs."
+)]
 pub(crate) async fn run_session_turn(
     ctx: Arc<ChannelRuntimeContext>,
     session_id: &SessionId,
@@ -330,7 +338,7 @@ pub(crate) async fn run_session_turn(
     run_turn_core(ctx, Some(session_id), msg, steer_at_checkpoint, true).await
 }
 
-/// Non-session turn entrypoint. Used by direct dispatch path when session mode is disabled.
+/// Non-session turn entrypoint. Used by Agent::memory_context_loop (spawned per message).
 pub(crate) async fn run_memory_turn(
     ctx: Arc<ChannelRuntimeContext>,
     active_session: Option<&SessionId>,

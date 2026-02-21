@@ -9,7 +9,30 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+pub(crate) const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Maximum characters for a single tool result before truncation (pseudo-code THRESHOLD).
+const TOOL_OUTPUT_TRUNCATE_CHARS: usize = 16_384;
+
+/// Plan constant for agent.rs: max chars before truncation with floor_char_boundary.
+pub(crate) const TOOL_OUTPUT_MAX_CHARS: usize = 32_000;
+
+/// Truncate tool output to TOOL_OUTPUT_MAX_CHARS (characters), appending "... N chars truncated".
+pub(crate) fn maybe_truncate_tool_output(output: &str) -> String {
+    let char_count = output.chars().count();
+    if char_count <= TOOL_OUTPUT_MAX_CHARS {
+        return output.to_string();
+    }
+    let boundary = output
+        .char_indices()
+        .take(TOOL_OUTPUT_MAX_CHARS)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let truncated = &output[..boundary];
+    let remainder = char_count.saturating_sub(TOOL_OUTPUT_MAX_CHARS);
+    format!("{}\n\n... {} chars truncated", truncated, remainder)
+}
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -31,7 +54,7 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
-fn scrub_credentials(input: &str) -> String {
+pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
@@ -87,11 +110,11 @@ fn autosave_memory_key(prefix: &str) -> String {
 }
 
 /// Find a tool by name in the registry.
-fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
+pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
-fn maybe_bind_source_session_id(
+pub(crate) fn maybe_bind_source_session_id(
     tool_name: &str,
     arguments: serde_json::Value,
     source_session_id: Option<&str>,
@@ -127,7 +150,7 @@ pub struct ToolExecutionResult {
 }
 
 /// Build the assistant message content (native JSON) to store in history after a tool round.
-fn build_assistant_content_native(text: &str, tool_calls: &[ToolCall]) -> String {
+pub(crate) fn build_assistant_content_native(text: &str, tool_calls: &[ToolCall]) -> String {
     let tool_calls_value: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
@@ -146,7 +169,7 @@ fn build_assistant_content_native(text: &str, tool_calls: &[ToolCall]) -> String
 }
 
 /// Convert tool execution results to tool-role ChatMessages for history.
-fn tool_results_to_chat_messages(results: &[ToolExecutionResult]) -> Vec<ChatMessage> {
+pub(crate) fn tool_results_to_chat_messages(results: &[ToolExecutionResult]) -> Vec<ChatMessage> {
     results
         .iter()
         .map(|r| {
@@ -283,7 +306,21 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
-                            (scrub_credentials(&r.output), true)
+                            let scrubbed = scrub_credentials(&r.output);
+                            let output = if scrubbed.chars().count() > TOOL_OUTPUT_TRUNCATE_CHARS {
+                                let n = scrubbed.chars().count();
+                                format!(
+                                    "{}\n\n... {} chars truncated",
+                                    scrubbed
+                                        .chars()
+                                        .take(TOOL_OUTPUT_TRUNCATE_CHARS)
+                                        .collect::<String>(),
+                                    n.saturating_sub(TOOL_OUTPUT_TRUNCATE_CHARS)
+                                )
+                            } else {
+                                scrubbed
+                            };
+                            (output, true)
                         } else {
                             (
                                 format!("Error: {}", r.error.unwrap_or_else(|| r.output)),
