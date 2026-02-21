@@ -377,38 +377,6 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-/// When `silent` is true, suppresses stdout (for channel use).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn agent_turn(
-    provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: f64,
-    silent: bool,
-) -> Result<String> {
-    run_tool_call_loop(
-        provider,
-        history,
-        tools_registry,
-        None,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        None,
-        "channel",
-        None,
-        None,
-    )
-    .await
-}
-
 /// Steer callback: at a tool-call checkpoint, called with the current user message content.
 /// If the implementation has new messages (e.g. drained from a queue), it returns
 /// Some(merged_content) to steer the next LLM call.
