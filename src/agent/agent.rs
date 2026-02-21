@@ -4,26 +4,34 @@
 use crate::agent::command::build_route_metadata;
 use crate::agent::loop_::{
     build_assistant_content_native, find_tool, maybe_bind_source_session_id,
-    maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
+    maybe_truncate_tool_output, scrub_credentials, tool_results_to_chat_messages, tools_to_specs,
+    ToolExecutionResult, MAX_TOOL_ITERATIONS,
 };
 use crate::channels::traits;
 use crate::channels::{
-    build_session_turn_history_with_tail, normalize_tail_messages, send_delivery_message,
-    should_deliver_to_external_channel, ChannelRuntimeContext, INTERNAL_MESSAGE_CHANNEL,
+    build_memory_context, build_session_turn_history_with_tail, conversation_memory_key,
+    normalize_tail_messages, resolve_turn_provider_model_temperature, send_delivery_message,
+    should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
+    INTERNAL_MESSAGE_CHANNEL,
 };
-use crate::observability::{Observer, ObserverEvent};
-use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
+use crate::memory::MemoryCategory;
+use crate::observability::ObserverEvent;
+use crate::providers::{ChatMessage, ChatRequest, ToolCall};
 use crate::session::compaction::{
     compact_in_memory_history, estimate_tokens, load_compaction_state, resolve_keep_recent_messages,
     SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::{SessionId, SessionKey, SessionStore};
-use crate::tools::Tool;
+use crate::tools::ToolSpec;
+use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
+use std::convert::AsRef;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time::timeout as timeout_future;
 use uuid::Uuid;
 
 // --- Moved types (from channels/mod.rs) ---
@@ -172,6 +180,8 @@ pub(crate) struct Agent {
     session_id: Option<SessionId>,
     system_prompt: String,
     tool_allow_list: Option<Vec<String>>,
+    /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
+    tool_specs: Vec<ToolSpec>,
     message_rx: mpsc::Receiver<AgentWorkItem>,
     deliver_tx: mpsc::Sender<DeliverMessage>,
     history: Vec<ChatMessage>,
@@ -201,6 +211,7 @@ impl Agent {
                 session_id.as_ref(),
                 "", // channel name resolved per-turn in session_context_loop
             );
+        let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
 
         let (history, history_message_ids) = if use_session_history {
             if let (Some(store), Some(ref sid)) = (ctx.session_store.as_ref(), &session_id) {
@@ -229,6 +240,7 @@ impl Agent {
             session_id,
             system_prompt,
             tool_allow_list,
+            tool_specs,
             message_rx,
             deliver_tx,
             history,
@@ -362,17 +374,8 @@ impl Agent {
                 }
             }
 
-            let delivery_channel_name = resolve_delivery_target(&self.ctx, &session_id, &msg).0;
-            let delivery_reply_target = resolve_delivery_target(&self.ctx, &session_id, &msg).1;
-
             if let Err(e) = self
-                .tool_call_loop_session(
-                    &session_id,
-                    &session_store,
-                    &msg,
-                    &delivery_channel_name,
-                    &delivery_reply_target,
-                )
+                .tool_call_loop_session(&session_id, &session_store, &msg)
                 .await
             {
                 tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
@@ -381,15 +384,15 @@ impl Agent {
     }
 
     /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user; persist user at start, assistant at end only.
-    #[allow(clippy::too_many_arguments)]
     async fn tool_call_loop_session(
         &mut self,
         session_id: &SessionId,
         session_store: &SessionStore,
         msg: &traits::ChannelMessage,
-        delivery_channel_name: &str,
-        delivery_reply_target: &str,
     ) -> Result<()> {
+        let (delivery_channel_name, delivery_reply_target) =
+            resolve_delivery_target(&self.ctx, Some(session_id), msg);
+
         let new_content = msg.content.clone();
         let (user_content, persist_user_content, merged_into_orphan) = {
             let last_is_user = self
@@ -425,15 +428,6 @@ impl Agent {
 
         let provider_ctx =
             crate::channels::resolve_turn_provider_model_temperature(&self.ctx, Some(session_id));
-        let tool_specs = tools_to_specs(
-            self.ctx.tools_registry.as_ref(),
-            self.tool_allow_list.as_deref(),
-        );
-        let tool_slice = if tool_specs.is_empty() {
-            None
-        } else {
-            Some(tool_specs.as_slice())
-        };
 
         let provider_name = "agent";
         for _iter in 0..MAX_TOOL_ITERATIONS {
@@ -448,7 +442,7 @@ impl Agent {
                 .chat(
                     ChatRequest {
                         messages: self.history.as_slice(),
-                        tools: tool_slice,
+                        tools: self.tool_slice(),
                     },
                     &provider_ctx.model,
                     provider_ctx.temperature,
@@ -472,7 +466,7 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 self.history.push(ChatMessage::assistant(text.clone()));
-                self.on_message(&text, false, delivery_channel_name, delivery_reply_target)?;
+                self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
                 if should_deliver_to_external_channel(
                     self.ctx.session_store.as_ref(),
                     Some(session_id),
@@ -489,7 +483,7 @@ impl Agent {
             }
 
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
-            self.on_message(&text, false, delivery_channel_name, delivery_reply_target)?;
+            self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
             self.history.push(ChatMessage::assistant(assistant_content));
             self.history_message_ids.push(None);
 
@@ -509,8 +503,8 @@ impl Agent {
                         self.on_message(
                             skip_msg,
                             true,
-                            delivery_channel_name,
-                            delivery_reply_target,
+                            &delivery_channel_name,
+                            &delivery_reply_target,
                         )?;
                     }
                     let merged = build_steer_merge_message(&user_content, steer);
@@ -533,7 +527,7 @@ impl Agent {
                     .to_string(),
                 ));
                 self.history_message_ids.push(None);
-                self.on_message(&output, true, delivery_channel_name, delivery_reply_target)?;
+                self.on_message(&output, true, &delivery_channel_name, &delivery_reply_target)?;
             }
         }
 
@@ -608,34 +602,204 @@ impl Agent {
         }
     }
 
-    /// Memory context loop: spawn one memory_context_turn per message.
+    /// Slice of tool specs for chat requests; None if empty (avoids per-turn allocation).
+    fn tool_slice(&self) -> Option<&[ToolSpec]> {
+        if self.tool_specs.is_empty() {
+            None
+        } else {
+            Some(self.tool_specs.as_slice())
+        }
+    }
+
+    /// Inner loop for memory mode: LLM + tool calls until final text. Returns response or error.
+    async fn tool_call_loop_memory_inner(
+        &self,
+        provider_ctx: &crate::providers::ProviderCtx,
+        history: &mut Vec<ChatMessage>,
+        source_session_id: Option<&str>,
+    ) -> Result<String> {
+        let provider_name = "channel-runtime";
+
+        for _iter in 0..MAX_TOOL_ITERATIONS {
+            self.ctx.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: provider_name.to_string(),
+                model: provider_ctx.model.clone(),
+                messages_count: history.len(),
+            });
+
+            let resp = provider_ctx
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: history.as_slice(),
+                        tools: self.tool_slice(),
+                    },
+                    &provider_ctx.model,
+                    provider_ctx.temperature,
+                )
+                .await?;
+
+            let text = resp.text_or_empty().to_string();
+            let tool_calls = resp.tool_calls;
+
+            if tool_calls.is_empty() {
+                history.push(ChatMessage::assistant(text.clone()));
+                return Ok(text);
+            }
+
+            let assistant_content = build_assistant_content_native(&text, &tool_calls);
+            let mut execution_results: Vec<ToolExecutionResult> = Vec::with_capacity(tool_calls.len());
+            for call in &tool_calls {
+                let args = serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                let tool_args =
+                    maybe_bind_source_session_id(&call.name, args, source_session_id);
+                let (output, success) = self.execute_single_tool(call, tool_args).await;
+                let output = maybe_truncate_tool_output(&output);
+                execution_results.push(ToolExecutionResult {
+                    name: call.name.clone(),
+                    output,
+                    success,
+                    tool_call_id: Some(call.id.clone()),
+                });
+            }
+            history.push(ChatMessage::assistant(assistant_content));
+            for m in tool_results_to_chat_messages(&execution_results) {
+                history.push(m);
+            }
+        }
+
+        anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+    }
+
+    /// Memory-mode turn: build memory context, run tool call loop, deliver response.
+    /// No session history; one turn per message. Uses system_prompt and tool_allow_list from Agent::new.
+    async fn tool_call_loop_memory(&mut self, msg: &traits::ChannelMessage) -> Result<()> {
+        let active_session = self.session_id.as_ref();
+        let (delivery_channel_name, delivery_reply_target) =
+            resolve_delivery_target(&self.ctx, active_session, msg);
+
+        let memory_context = build_memory_context(
+            self.ctx.memory.as_ref(),
+            &msg.content,
+            active_session.map(SessionId::as_str),
+        )
+        .await;
+        if self.ctx.auto_save_memory {
+            let autosave_key = conversation_memory_key(msg);
+            let _ = self.ctx.memory.store(
+                &autosave_key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                active_session.map(SessionId::as_str),
+            ).await;
+        }
+        let enriched_message = if memory_context.is_empty() {
+            msg.content.clone()
+        } else {
+            format!("{memory_context}{}", msg.content)
+        };
+
+        println!("  ⏳ Processing message...");
+        let started_at = Instant::now();
+
+        let mut history = vec![
+            ChatMessage::system(AsRef::<str>::as_ref(&self.system_prompt)),
+            ChatMessage::user(&enriched_message),
+        ];
+
+        let resolved =
+            resolve_turn_provider_model_temperature(self.ctx.as_ref(), active_session);
+
+        let llm_result = timeout_future(
+            Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+            self.tool_call_loop_memory_inner(
+                &resolved,
+                &mut history,
+                active_session.map(SessionId::as_str),
+            ),
+        )
+        .await;
+
+        let deliver =
+            should_deliver_to_external_channel(self.ctx.session_store.as_ref(), active_session);
+
+        match llm_result {
+            Ok(Ok(response)) => {
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    truncate_with_ellipsis(&response, 80)
+                );
+                if deliver {
+                    let _ = self.on_message(
+                        &response,
+                        false,
+                        &delivery_channel_name,
+                        &delivery_reply_target,
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
+                if deliver {
+                    let _ = self.on_message(
+                        &format!("⚠️ Error: {e}"),
+                        false,
+                        &delivery_channel_name,
+                        &delivery_reply_target,
+                    );
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "  ❌ LLM response timed out after {}s (elapsed: {}ms)",
+                    CHANNEL_MESSAGE_TIMEOUT_SECS,
+                    started_at.elapsed().as_millis()
+                );
+                if deliver {
+                    let _ = self.on_message(
+                        "⚠️ Request timed out while waiting for the model. Please try again.",
+                        false,
+                        &delivery_channel_name,
+                        &delivery_reply_target,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Memory context loop: one tool_call_loop_memory per message (sequential).
     async fn memory_context_loop(
         mut self,
-        registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
-        key_str: String,
+        _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
+        _key_str: String,
     ) {
         while let Some(work) = self.message_rx.recv().await {
             let msg = work.to_channel_message();
-            let worker_ctx = Arc::clone(&self.ctx);
-            tokio::spawn(async move {
-                if let Err(e) = crate::agent::turn::run_memory_turn(worker_ctx, None, msg).await {
-                    tracing::error!("Memory turn error: {e}");
-                }
-            });
+            if let Err(e) = self.tool_call_loop_memory(&msg).await {
+                tracing::error!("Memory turn error: {e}");
+            }
         }
     }
 }
 
+/// Resolve delivery channel and reply target from message; use route metadata when on internal channel and session is present.
 fn resolve_delivery_target(
     ctx: &ChannelRuntimeContext,
-    session_id: &SessionId,
+    active_session: Option<&SessionId>,
     msg: &traits::ChannelMessage,
 ) -> (String, String) {
     let mut ch = msg.channel.clone();
     let mut rt = msg.reply_target.clone();
     if msg.channel == INTERNAL_MESSAGE_CHANNEL {
-        if let (Some(store), Some(sid)) = (ctx.session_store.as_ref(), Some(session_id)) {
-            if let Ok(Some(meta)) = store.load_route_metadata(sid) {
+        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
+            if let Ok(Some(meta)) = store.load_route_metadata(session_id) {
                 if meta.channel != INTERNAL_MESSAGE_CHANNEL {
                     rt = meta.route_id.unwrap_or(meta.chat_id);
                     ch = meta.channel;

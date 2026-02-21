@@ -3,7 +3,6 @@ use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
 use crate::tools::{self, Tool};
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use uuid::Uuid;
@@ -184,47 +183,35 @@ pub(crate) fn tool_results_to_chat_messages(results: &[ToolExecutionResult]) -> 
         .collect()
 }
 
-/// Steer callback: at a tool-call checkpoint, called with the current user message content.
-/// If the implementation has new messages (e.g. drained from a queue), it returns
-/// Some(merged_content) to steer the next LLM call.
-pub type SteerAtCheckpoint = dyn FnMut(&str) -> Option<String> + Send;
-
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-/// When tool_allow_list is Some, only those tools are exposed to the model and executable.
-/// When steer_at_checkpoint is Some, it is used at safe boundaries.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop(
+/// One-turn agent loop for tests: builds history and runs an inline tool-call loop with injected provider context.
+/// Returns (response_text, final_history) so tests can assert on history when needed.
+#[cfg(test)]
+pub(crate) async fn run_one_turn_for_test(
     provider_ctx: &ProviderCtx,
-    history: &mut Vec<ChatMessage>,
+    system_prompt: &str,
+    user_message: &str,
     tools_registry: &[Box<dyn Tool>],
-    tool_allow_list: Option<&[String]>,
     observer: &dyn Observer,
-    provider_name: &str,
-    silent: bool,
-    channel_name: &str,
-    source_session_id: Option<&str>,
-    #[allow(clippy::type_complexity)] mut steer_at_checkpoint: Option<
-        &mut (dyn FnMut(&str) -> Option<String> + Send + '_),
-    >,
-) -> Result<String> {
-    let tool_specs = tools_to_specs(tools_registry, tool_allow_list);
+) -> Result<(String, Vec<ChatMessage>)> {
+    let mut history = vec![
+        ChatMessage::system(system_prompt),
+        ChatMessage::user(user_message),
+    ];
+    let tool_specs = tools_to_specs(tools_registry, None);
     let tool_slice = if tool_specs.is_empty() {
         None
     } else {
         Some(tool_specs.as_slice())
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    for _iter in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
-            provider: provider_name.to_string(),
+            provider: "test".to_string(),
             model: provider_ctx.model.clone(),
             messages_count: history.len(),
         });
 
-        let llm_started_at = Instant::now();
-
-        let resp = match provider_ctx
+        let resp = provider_ctx
             .provider
             .chat(
                 ChatRequest {
@@ -234,71 +221,27 @@ pub(crate) async fn run_tool_call_loop(
                 &provider_ctx.model,
                 provider_ctx.temperature,
             )
-            .await
-        {
-            Ok(r) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: provider_ctx.model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                });
-                r
-            }
-            Err(e) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: provider_ctx.model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                });
-                return Err(e);
-            }
-        };
+            .await?;
 
-        // Provider returns user-facing text only (e.g. Gemini strips thought/thought_signature via effective_text).
         let text = resp.text_or_empty().to_string();
-        let tool_calls = resp.tool_calls.clone();
+        let tool_calls = resp.tool_calls;
 
         if tool_calls.is_empty() {
             history.push(ChatMessage::assistant(text.clone()));
-            return Ok(text);
+            return Ok((text, history));
         }
 
         let assistant_content = build_assistant_content_native(&text, &tool_calls);
-
-        if !silent && !text.is_empty() {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-        }
-
         let mut execution_results: Vec<ToolExecutionResult> = Vec::with_capacity(tool_calls.len());
         for call in &tool_calls {
             let arguments_value = serde_json::from_str(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let tool_args = maybe_bind_source_session_id(
-                &call.name,
-                arguments_value.clone(),
-                source_session_id,
-            );
-            let disallowed =
-                tool_allow_list.map(|allow| !allow.iter().any(|n| n.as_str() == call.name));
-            let (output, success) = if disallowed == Some(true) {
-                (
-                    format!(
-                        "Tool '{}' is not available for this agent (policy restriction).",
-                        call.name
-                    ),
-                    false,
-                )
-            } else if let Some(tool) = find_tool(tools_registry, &call.name) {
+            let tool_args = maybe_bind_source_session_id(&call.name, arguments_value, None);
+            let (output, success) = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(tool_args).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -308,20 +251,8 @@ pub(crate) async fn run_tool_call_loop(
                         });
                         if r.success {
                             let scrubbed = scrub_credentials(&r.output);
-                            let output = if scrubbed.chars().count() > TOOL_OUTPUT_TRUNCATE_CHARS {
-                                let n = scrubbed.chars().count();
-                                format!(
-                                    "{}\n\n... {} chars truncated",
-                                    scrubbed
-                                        .chars()
-                                        .take(TOOL_OUTPUT_TRUNCATE_CHARS)
-                                        .collect::<String>(),
-                                    n.saturating_sub(TOOL_OUTPUT_TRUNCATE_CHARS)
-                                )
-                            } else {
-                                scrubbed
-                            };
-                            (output, true)
+                            let out = maybe_truncate_tool_output(&scrubbed);
+                            (out, true)
                         } else {
                             (
                                 format!("Error: {}", r.error.unwrap_or_else(|| r.output)),
@@ -341,7 +272,6 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 (format!("Unknown tool: {}", call.name), false)
             };
-
             execution_results.push(ToolExecutionResult {
                 name: call.name.clone(),
                 output,
@@ -349,58 +279,13 @@ pub(crate) async fn run_tool_call_loop(
                 tool_call_id: Some(call.id.clone()),
             });
         }
-
         history.push(ChatMessage::assistant(assistant_content));
-        for msg in tool_results_to_chat_messages(&execution_results) {
-            history.push(msg);
-        }
-
-        // Safe boundary (after each tool round): check agent queue and steer to merged content.
-        let current_user_content = history
-            .iter()
-            .rev()
-            .find(|m| m.role == "user" && !m.content.starts_with("[Tool results]"))
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-        let merged = steer_at_checkpoint
-            .as_mut()
-            .and_then(|steer| steer(current_user_content));
-        if let Some(merged_content) = merged {
-            history.push(ChatMessage::user(merged_content));
+        for m in tool_results_to_chat_messages(&execution_results) {
+            history.push(m);
         }
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
-}
-
-/// One-turn agent loop for tests: builds history and runs run_tool_call_loop with injected provider context.
-/// Returns (response_text, final_history) so tests can assert on history when needed.
-#[cfg(test)]
-pub(crate) async fn run_one_turn_for_test(
-    provider_ctx: &ProviderCtx,
-    system_prompt: &str,
-    user_message: &str,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-) -> Result<(String, Vec<ChatMessage>)> {
-    let mut history = vec![
-        ChatMessage::system(system_prompt),
-        ChatMessage::user(user_message),
-    ];
-    let response = run_tool_call_loop(
-        provider_ctx,
-        &mut history,
-        tools_registry,
-        None,
-        observer,
-        "test",
-        true,
-        "test",
-        None,
-        None,
-    )
-    .await?;
-    Ok((response, history))
 }
 
 #[cfg(test)]
