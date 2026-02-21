@@ -5,16 +5,16 @@ use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::traits;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
-    conversation_memory_key, resolve_effective_system_prompt_and_tool_allow_list,
-    resolve_turn_provider_model_temperature, send_delivery_message,
-    should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
-    INTERNAL_MESSAGE_CHANNEL,
+    build_session_turn_history_with_tail, conversation_memory_key, normalize_tail_messages,
+    resolve_effective_system_prompt_and_tool_allow_list, resolve_turn_provider_model_temperature,
+    send_delivery_message, should_deliver_to_external_channel, ChannelRuntimeContext,
+    CHANNEL_MESSAGE_TIMEOUT_SECS, INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
 use crate::session::compaction::{
-    estimate_tokens, load_compaction_state, maybe_compact, resolve_keep_recent_messages,
-    CompactionOutcome, CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+    compact_in_memory_history, load_compaction_state, resolve_keep_recent_messages,
+    CompactionOutcome, CompactionState,
 };
 use crate::session::SessionId;
 use crate::util::truncate_with_ellipsis;
@@ -137,47 +137,8 @@ pub(crate) async fn run_turn_core(
                 &effective_system_prompt,
                 &compaction_state,
                 &tail_messages,
-                &user_content,
+                Some(&user_content),
             );
-
-            if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
-                let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
-                let default_resolved = ctx
-                    .provider_manager
-                    .default_resolved()
-                    .unwrap_or_else(|e| panic!("default_resolved failed: {e}"));
-
-                match maybe_compact(
-                    &*session_store,
-                    session_id,
-                    &default_resolved,
-                    &effective_system_prompt,
-                    keep_recent,
-                )
-                .await
-                {
-                    Ok(outcome) if outcome.compacted => {
-                        compaction_state.summary = outcome.summary;
-                        compaction_state.after_message_id = outcome.after_message_id;
-                        tail_messages = session_store
-                            .load_messages_after_id(session_id, compaction_state.after_message_id)
-                            .unwrap_or_default();
-                        history = build_session_turn_history(
-                            &effective_system_prompt,
-                            &compaction_state,
-                            &tail_messages,
-                            &enriched_message,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            "Auto-compaction failed for session {}: {error}",
-                            session_id.as_str()
-                        );
-                    }
-                }
-            }
         } else {
             history = vec![
                 ChatMessage::system(AsRef::<str>::as_ref(&effective_system_prompt)),
@@ -347,8 +308,8 @@ pub(crate) async fn run_memory_turn(
     run_turn_core(ctx, active_session, msg, None, false).await
 }
 
-/// Run session compaction once (effective system prompt + maybe_compact).
-/// Used by manual /compact and shares the same prompt resolution as the agent turn.
+/// Run session compaction once: load tail from DB, run in-memory compaction, write summary and boundary.
+/// Used by manual /compact.
 pub(crate) async fn run_session_compaction(
     ctx: &ChannelRuntimeContext,
     session_id: &SessionId,
@@ -364,13 +325,38 @@ pub(crate) async fn run_session_compaction(
     let default_resolved = ctx
         .provider_manager
         .default_resolved()
-        .unwrap_or_else(|e| panic!("default_resolved failed: {e}"));
-    maybe_compact(
+        .map_err(anyhow::Error::msg)?;
+
+    let compaction_state = load_compaction_state(session_store.as_ref(), session_id)
+        .unwrap_or_default();
+    let tail_messages = session_store
+        .load_messages_after_id(session_id, compaction_state.after_message_id)
+        .unwrap_or_default();
+    let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
+    let history = build_session_turn_history_with_tail(
+        &effective_system_prompt,
+        &compaction_state,
+        &tail_chat,
+        None,
+    );
+    let n_leading = history.len().saturating_sub(tail_chat.len());
+    let mut history_message_ids = vec![None; n_leading];
+    history_message_ids.extend(tail_ids);
+
+    let (_, _, compacted) = compact_in_memory_history(
+        &history,
+        &history_message_ids,
         session_store.as_ref(),
         session_id,
         &default_resolved,
         &effective_system_prompt,
         keep_recent,
     )
-    .await
+    .await?;
+
+    Ok(CompactionOutcome {
+        compacted,
+        summary: None,
+        after_message_id: None,
+    })
 }

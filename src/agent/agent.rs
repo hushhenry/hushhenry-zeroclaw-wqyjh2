@@ -8,14 +8,14 @@ use crate::agent::loop_::{
 };
 use crate::channels::traits;
 use crate::channels::{
-    build_ephemeral_announce_context, build_session_turn_history, send_delivery_message,
+    build_session_turn_history_with_tail, normalize_tail_messages, send_delivery_message,
     should_deliver_to_external_channel, ChannelRuntimeContext, INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::observability::{Observer, ObserverEvent};
 use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
 use crate::session::compaction::{
-    estimate_tokens, load_compaction_state, maybe_compact, resolve_keep_recent_messages,
-    CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+    compact_in_memory_history, estimate_tokens, load_compaction_state, resolve_keep_recent_messages,
+    SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::{SessionId, SessionKey, SessionStore};
 use crate::tools::Tool;
@@ -175,6 +175,8 @@ pub(crate) struct Agent {
     message_rx: mpsc::Receiver<AgentWorkItem>,
     deliver_tx: mpsc::Sender<DeliverMessage>,
     history: Vec<ChatMessage>,
+    /// DB message id per history entry (Some for persisted user/assistant, None for system/summary/tool).
+    history_message_ids: Vec<Option<i64>>,
     use_session_history: bool,
     ctx: Arc<ChannelRuntimeContext>,
     /// When true, deliver_loop also sends Tool variants (verbose).
@@ -200,19 +202,27 @@ impl Agent {
                 "", // channel name resolved per-turn in session_context_loop
             );
 
-        let history = if use_session_history {
+        let (history, history_message_ids) = if use_session_history {
             if let (Some(store), Some(ref sid)) = (ctx.session_store.as_ref(), &session_id) {
                 let compaction_state = load_compaction_state(store, sid).unwrap_or_default();
-                let _tail = store
+                let tail_messages = store
                     .load_messages_after_id(sid, compaction_state.after_message_id)
                     .unwrap_or_default();
-                // History built per-turn with user content in session_context_loop.
-                vec![]
+                let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
+                let history = build_session_turn_history_with_tail(
+                    &system_prompt,
+                    &compaction_state,
+                    &tail_chat,
+                    None,
+                );
+                let mut ids = vec![None; history.len().saturating_sub(tail_chat.len())];
+                ids.extend(tail_ids);
+                (history, ids)
             } else {
-                vec![]
+                (vec![], vec![])
             }
         } else {
-            vec![]
+            (vec![], vec![])
         };
 
         Ok(Self {
@@ -222,6 +232,7 @@ impl Agent {
             message_rx,
             deliver_tx,
             history,
+            history_message_ids,
             use_session_history,
             ctx,
             verbose_tool_output,
@@ -369,7 +380,7 @@ impl Agent {
         }
     }
 
-    /// Tool call loop for session mode: on_message, mid-tool steer, context_exceeded retry.
+    /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user; persist user at start, assistant at end only.
     #[allow(clippy::too_many_arguments)]
     async fn tool_call_loop_session(
         &mut self,
@@ -379,37 +390,37 @@ impl Agent {
         delivery_channel_name: &str,
         delivery_reply_target: &str,
     ) -> Result<()> {
-        let compaction_state = load_compaction_state(session_store, session_id)?;
-        let tail_messages = session_store
-            .load_messages_after_id(session_id, compaction_state.after_message_id)
-            .unwrap_or_default();
-        let ephemeral = build_ephemeral_announce_context(&tail_messages);
-        let user_content = if ephemeral.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("{ephemeral}\n\n{}", msg.content)
+        let new_content = msg.content.clone();
+        let (user_content, persist_user_content, merged_into_orphan) = {
+            let last_is_user = self
+                .history
+                .last()
+                .map(|m| m.role == "user")
+                .unwrap_or(false);
+            if last_is_user {
+                let last = self.history.last_mut().expect("non-empty");
+                let merged = format!("{}\n\n{}", last.content.trim(), new_content.trim());
+                last.content = merged.clone();
+                (merged, new_content, true)
+            } else {
+                self.history.push(ChatMessage::user(new_content.clone()));
+                self.history_message_ids.push(None);
+                (new_content.clone(), new_content, false)
+            }
         };
 
-        self.history = build_session_turn_history(
-            &self.system_prompt,
-            &compaction_state,
-            &tail_messages,
-            &user_content,
-        );
+        if should_deliver_to_external_channel(self.ctx.session_store.as_ref(), Some(session_id)) {
+            if let Ok(id) = session_store.append_message(session_id, "user", &persist_user_content, None) {
+                if id > 0 && !merged_into_orphan {
+                    if let Some(last) = self.history_message_ids.last_mut() {
+                        *last = Some(id);
+                    }
+                }
+            }
+        }
 
         if estimate_tokens(&self.history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
-            self.compact_history(session_id, session_store, delivery_channel_name)
-                .await?;
-            let compaction_state = load_compaction_state(session_store, session_id)?;
-            let tail_messages = session_store
-                .load_messages_after_id(session_id, compaction_state.after_message_id)
-                .unwrap_or_default();
-            self.history = build_session_turn_history(
-                &self.system_prompt,
-                &compaction_state,
-                &tail_messages,
-                &user_content,
-            );
+            self.run_compact_in_memory(session_id, session_store).await?;
         }
 
         let provider_ctx =
@@ -448,7 +459,7 @@ impl Agent {
                 Err(e) => {
                     let err_str = e.to_string();
                     if is_context_exceeded_error(&err_str) {
-                        self.compact_history(session_id, session_store, delivery_channel_name)
+                        self.run_compact_in_memory(session_id, session_store)
                             .await?;
                         continue;
                     }
@@ -466,8 +477,13 @@ impl Agent {
                     self.ctx.session_store.as_ref(),
                     Some(session_id),
                 ) {
-                    let _ = session_store.append_message(session_id, "user", &user_content, None);
-                    let _ = session_store.append_message(session_id, "assistant", &text, None);
+                    if let Ok(id) = session_store.append_message(session_id, "assistant", &text, None) {
+                        self.history_message_ids.push(if id > 0 { Some(id) } else { None });
+                    } else {
+                        self.history_message_ids.push(None);
+                    }
+                } else {
+                    self.history_message_ids.push(None);
                 }
                 return Ok(());
             }
@@ -475,6 +491,7 @@ impl Agent {
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
             self.on_message(&text, false, delivery_channel_name, delivery_reply_target)?;
             self.history.push(ChatMessage::assistant(assistant_content));
+            self.history_message_ids.push(None);
 
             for (idx, call) in tool_calls.iter().enumerate() {
                 let steer = drain_agent_queue(&mut self.message_rx);
@@ -488,6 +505,7 @@ impl Agent {
                             })
                             .to_string(),
                         ));
+                        self.history_message_ids.push(None);
                         self.on_message(
                             skip_msg,
                             true,
@@ -497,7 +515,7 @@ impl Agent {
                     }
                     let merged = build_steer_merge_message(&user_content, steer);
                     self.history.push(ChatMessage::user(merged));
-                    // Continue the for _iter loop to make another LLM call with merged context.
+                    self.history_message_ids.push(None);
                     break;
                 }
 
@@ -505,7 +523,7 @@ impl Agent {
                     .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
                 let tool_args =
                     maybe_bind_source_session_id(&call.name, args, Some(session_id.as_str()));
-                let (output, success) = self.execute_single_tool(&call, tool_args).await;
+                let (output, _success) = self.execute_single_tool(&call, tool_args).await;
                 let output = maybe_truncate_tool_output(&output);
                 self.history.push(ChatMessage::tool(
                     serde_json::json!({
@@ -514,11 +532,45 @@ impl Agent {
                     })
                     .to_string(),
                 ));
+                self.history_message_ids.push(None);
                 self.on_message(&output, true, delivery_channel_name, delivery_reply_target)?;
             }
         }
 
         anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+    }
+
+    async fn run_compact_in_memory(
+        &mut self,
+        session_id: &SessionId,
+        session_store: &SessionStore,
+    ) -> Result<()> {
+        let keep_recent = resolve_keep_recent_messages(self.ctx.session_history_limit);
+        let default_resolved = self
+            .ctx
+            .provider_manager
+            .default_resolved()
+            .map_err(anyhow::Error::msg)?;
+        match compact_in_memory_history(
+            &self.history,
+            &self.history_message_ids,
+            session_store,
+            session_id,
+            &default_resolved,
+            &self.system_prompt,
+            keep_recent,
+        )
+        .await
+        {
+            Ok((new_history, new_ids, _compacted)) => {
+                self.history = new_history;
+                self.history_message_ids = new_ids;
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %session_id.as_str(), "In-memory compaction failed: {e}");
+            }
+        }
+        Ok(())
     }
 
     async fn execute_single_tool(
@@ -554,29 +606,6 @@ impl Agent {
             }
             Err(e) => (format!("Error executing {}: {e}", call.name), false),
         }
-    }
-
-    async fn compact_history(
-        &mut self,
-        session_id: &SessionId,
-        session_store: &SessionStore,
-        channel_name: &str,
-    ) -> Result<()> {
-        let keep_recent = resolve_keep_recent_messages(self.ctx.session_history_limit);
-        let default_resolved = self
-            .ctx
-            .provider_manager
-            .default_resolved()
-            .map_err(anyhow::Error::msg)?;
-        maybe_compact(
-            session_store,
-            session_id,
-            &default_resolved,
-            &self.system_prompt,
-            keep_recent,
-        )
-        .await?;
-        Ok(())
     }
 
     /// Memory context loop: spawn one memory_context_turn per message.

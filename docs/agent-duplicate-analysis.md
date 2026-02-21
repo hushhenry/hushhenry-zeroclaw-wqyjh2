@@ -60,7 +60,7 @@
 
 ### 2.5 历史压缩（已收敛为存储侧）
 
-**已实施**：压缩与存储结合，不再保留 in-memory 压缩。已从 `agent/loop_.rs` 删除：`trim_history`、`auto_compact_history`、`build_compaction_transcript`、`apply_compaction_summary` 及相关常量和单测。当前仅 `session/compaction.rs` 的持久化压缩（`maybe_compact` 等）在 `turn::run_turn_core` 的 `use_session_history` 路径下使用。
+**已实施**：压缩与存储结合。压缩仅基于内存 history（`compact_in_memory_history`），不再使用基于 DB 的 `maybe_compact`。见 `docs/features/session-persistence-and-compaction.md`。
 
 ---
 

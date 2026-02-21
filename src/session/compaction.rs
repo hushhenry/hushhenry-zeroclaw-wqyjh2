@@ -96,7 +96,8 @@ pub fn load_compaction_state(
     })
 }
 
-fn build_transcript(messages: &[super::store::SessionMessage]) -> String {
+/// Build transcript from in-memory ChatMessages for summarization.
+pub fn build_transcript_from_chat_messages(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
@@ -158,34 +159,62 @@ fn build_compaction_prompt(
     prompt
 }
 
-pub async fn maybe_compact(
+/// Index of the first tail message in history (after system and optional compaction summary).
+fn tail_start_index(history: &[ChatMessage]) -> usize {
+    if history.is_empty() {
+        return 0;
+    }
+    let mut start = 1;
+    if history.len() > 1
+        && history[1]
+            .content
+            .starts_with("[Session Compaction Summary]")
+    {
+        start = 2;
+    }
+    start
+}
+
+/// Compact in-memory history: summarize old tail, keep recent, write summary and boundary to store.
+/// Returns (new_history, new_history_message_ids, compacted).
+pub async fn compact_in_memory_history(
+    history: &[ChatMessage],
+    history_message_ids: &[Option<i64>],
     store: &SessionStore,
     session_id: &SessionId,
     provider_ctx: &crate::providers::ProviderCtx,
     system_prompt: &str,
-    keep_recent_messages: usize,
-) -> Result<CompactionOutcome> {
-    let state = load_compaction_state(store, session_id)?;
-    let tail = store.load_messages_after_id(session_id, state.after_message_id)?;
-    let keep_recent = keep_recent_messages.max(1);
+    keep_recent: usize,
+) -> Result<(Vec<ChatMessage>, Vec<Option<i64>>, bool)> {
+    let keep_recent = keep_recent.max(1);
+    let tail_start = tail_start_index(history);
+    let tail = &history[tail_start..];
+    let mut tail_ids: Vec<Option<i64>> = history_message_ids
+        .get(tail_start..)
+        .map(|s| s.iter().take(tail.len()).copied().collect())
+        .unwrap_or_default();
+    while tail_ids.len() < tail.len() {
+        tail_ids.push(None);
+    }
 
     if tail.len() <= keep_recent {
-        return Ok(CompactionOutcome {
-            compacted: false,
-            summary: state.summary,
-            after_message_id: state.after_message_id,
-        });
+        return Ok((history.to_vec(), history_message_ids.to_vec(), false));
     }
 
     let compact_until = tail.len().saturating_sub(keep_recent);
     let to_compact = &tail[..compact_until];
-    let last_compacted_id = to_compact
-        .last()
-        .map(|message| message.id)
-        .or(state.after_message_id);
+    let kept_tail = &tail[compact_until..];
+    let kept_ids: Vec<Option<i64>> = tail_ids[compact_until..].to_vec();
 
-    let transcript = build_transcript(to_compact);
-    let prompt = build_compaction_prompt(state.summary.as_deref(), &transcript, system_prompt);
+    let existing_summary = load_compaction_state(store, session_id)
+        .ok()
+        .and_then(|s| s.summary);
+    let transcript = build_transcript_from_chat_messages(to_compact);
+    let prompt = build_compaction_prompt(
+        existing_summary.as_deref(),
+        &transcript,
+        system_prompt,
+    );
 
     let summary_messages = vec![
         ChatMessage::system("You are a session compaction engine. Return compact durable context."),
@@ -208,24 +237,33 @@ pub async fn maybe_compact(
         });
     let summary = truncate_with_ellipsis(summary_raw.trim(), SESSION_COMPACTION_MAX_SUMMARY_CHARS);
 
-    if let Some(boundary_id) = last_compacted_id {
-        store.set_state_key(
+    let after_message_id = (0..compact_until)
+        .rev()
+        .find_map(|i| tail_ids.get(i).and_then(|o| *o))
+        .filter(|&id| id > 0);
+
+    if let Some(boundary_id) = after_message_id {
+        let _ = store.set_state_key(
             session_id,
             SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY,
-            &serde_json::to_string(&boundary_id)?,
-        )?;
+            &serde_json::to_string(&boundary_id).unwrap_or_default(),
+        );
     }
-    store.set_state_key(
+    let _ = store.set_state_key(
         session_id,
         SESSION_COMPACTION_SUMMARY_KEY,
-        &serde_json::to_string(&summary)?,
-    )?;
+        &serde_json::to_string(&summary).unwrap_or_default(),
+    );
 
-    Ok(CompactionOutcome {
-        compacted: true,
-        summary: Some(summary),
-        after_message_id: last_compacted_id,
-    })
+    let new_summary_msg = build_compaction_summary_message(&summary);
+    let mut new_history = vec![history[0].clone()];
+    new_history.push(new_summary_msg);
+    new_history.extend(kept_tail.to_vec());
+
+    let mut new_ids = vec![None; 2];
+    new_ids.extend(kept_ids);
+
+    Ok((new_history, new_ids, true))
 }
 
 #[cfg(test)]

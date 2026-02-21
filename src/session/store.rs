@@ -614,20 +614,21 @@ impl SessionStore {
         .context("Failed to query session route metadata")
     }
 
+    /// Appends a message and returns the inserted row id for compaction boundary tracking.
     pub fn append_message(
         &self,
         session_id: &SessionId,
         role: &str,
         content: &str,
         meta_json: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let Some(role) = SessionMessageRole::from_str(role) else {
             tracing::warn!(
                 session_id = %session_id.as_str(),
                 role,
                 "Skipping session message with unsupported role"
             );
-            return Ok(());
+            return Ok(0);
         };
 
         let conn = self.conn.lock();
@@ -640,13 +641,15 @@ impl SessionStore {
         )
         .context("Failed to append session message")?;
 
+        let row_id = conn.last_insert_rowid();
+
         conn.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
             params![now, session_id.as_str()],
         )
         .context("Failed to update session updated_at")?;
 
-        Ok(())
+        Ok(row_id)
     }
 
     pub fn load_recent_messages(

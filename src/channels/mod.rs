@@ -608,38 +608,84 @@ pub(crate) fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> S
     }
 }
 
-/// Build session turn history: system prompt, optional compaction summary, tail messages as chat, and the given user message.
-pub(crate) fn build_session_turn_history(
+/// Merges consecutive same-role messages so the tail is strictly user/assistant alternating.
+/// Returns (normalized ChatMessages, last DB id per logical message for boundary tracking).
+pub(crate) fn normalize_tail_messages(
+    tail_messages: &[SessionMessage],
+) -> (Vec<ChatMessage>, Vec<Option<i64>>) {
+    const SEP: &str = "\n\n";
+    let mut out: Vec<ChatMessage> = Vec::new();
+    let mut ids: Vec<Option<i64>> = Vec::new();
+    let mut i = 0;
+    while i < tail_messages.len() {
+        let msg = &tail_messages[i];
+        let Some(role) = SessionMessageRole::from_str(msg.role.as_str()) else {
+            tracing::warn!(
+                role = msg.role.as_str(),
+                "Skipping unsupported role when normalizing session tail"
+            );
+            i += 1;
+            continue;
+        };
+        let mut content = msg.content.clone();
+        let mut last_id = Some(msg.id);
+        i += 1;
+        while i < tail_messages.len() {
+            let next = &tail_messages[i];
+            let Some(next_role) = SessionMessageRole::from_str(next.role.as_str()) else {
+                break;
+            };
+            if next_role != role {
+                break;
+            }
+            content.push_str(SEP);
+            content.push_str(next.content.trim());
+            last_id = Some(next.id);
+            i += 1;
+        }
+        let chat = match role {
+            SessionMessageRole::User => ChatMessage::user(content),
+            SessionMessageRole::Assistant => ChatMessage::assistant(content),
+            SessionMessageRole::Tool => ChatMessage::tool(content),
+        };
+        out.push(chat);
+        ids.push(last_id);
+    }
+    (out, ids)
+}
+
+/// Build session turn history from normalized tail (no DB ids in output).
+pub(crate) fn build_session_turn_history_with_tail(
     system_prompt: &str,
     compaction_state: &CompactionState,
-    tail_messages: &[SessionMessage],
-    user_content: &str,
+    tail_chat: &[ChatMessage],
+    current_user_content: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut history = vec![ChatMessage::system(system_prompt)];
     if let Some(summary) = compaction_state.summary.as_deref() {
         history.push(build_compaction_summary_message(summary));
     }
-    for message in tail_messages {
-        match SessionMessageRole::from_str(message.role.as_str()) {
-            Some(SessionMessageRole::User) => {
-                history.push(ChatMessage::user(message.content.clone()));
-            }
-            Some(SessionMessageRole::Assistant) => {
-                history.push(ChatMessage::assistant(message.content.clone()));
-            }
-            Some(SessionMessageRole::Tool) => {
-                history.push(ChatMessage::tool(message.content.clone()));
-            }
-            None => {
-                tracing::warn!(
-                    role = message.role.as_str(),
-                    "Skipping unsupported role from stored session history"
-                );
-            }
-        }
+    history.extend(tail_chat.iter().cloned());
+    if let Some(content) = current_user_content {
+        history.push(ChatMessage::user(content));
     }
-    history.push(ChatMessage::user(user_content));
     history
+}
+
+/// Build session turn history: system prompt, optional compaction summary, tail messages (normalized), and optional current user message.
+pub(crate) fn build_session_turn_history(
+    system_prompt: &str,
+    compaction_state: &CompactionState,
+    tail_messages: &[SessionMessage],
+    current_user_content: Option<&str>,
+) -> Vec<ChatMessage> {
+    let (tail_chat, _) = normalize_tail_messages(tail_messages);
+    build_session_turn_history_with_tail(
+        system_prompt,
+        compaction_state,
+        &tail_chat,
+        current_user_content,
+    )
 }
 
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
@@ -1801,6 +1847,44 @@ mod tests {
             Some(&store),
             Some(&session_id)
         ));
+    }
+
+    #[test]
+    fn normalize_tail_messages_merges_consecutive_same_role_and_returns_last_id() {
+        use crate::session::SessionMessage;
+        let tail = vec![
+            SessionMessage {
+                id: 1,
+                role: "user".to_string(),
+                content: "first".to_string(),
+                created_at: String::new(),
+                meta_json: None,
+            },
+            SessionMessage {
+                id: 2,
+                role: "user".to_string(),
+                content: "second".to_string(),
+                created_at: String::new(),
+                meta_json: None,
+            },
+            SessionMessage {
+                id: 3,
+                role: "assistant".to_string(),
+                content: "reply".to_string(),
+                created_at: String::new(),
+                meta_json: None,
+            },
+        ];
+        let (chat, ids) = normalize_tail_messages(&tail);
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].role, "user");
+        assert!(chat[0].content.contains("first"));
+        assert!(chat[0].content.contains("second"));
+        assert_eq!(chat[1].role, "assistant");
+        assert_eq!(chat[1].content, "reply");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], Some(2));
+        assert_eq!(ids[1], Some(3));
     }
 
     #[test]
