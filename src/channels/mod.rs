@@ -1575,7 +1575,8 @@ mod tests {
     use crate::config::Config;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait};
+    use crate::providers::traits::ProviderCapabilities;
+    use crate::providers::{ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait, ToolCall};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1657,22 +1658,14 @@ mod tests {
 
     struct ToolCallingProvider;
 
-    fn tool_call_payload() -> String {
-        r#"<tool_call>
-{"name":"mock_price","arguments":{"symbol":"BTC"}}
-</tool_call>"#
-            .to_string()
-    }
-
-    fn tool_call_payload_with_alias_tag() -> String {
-        r#"<toolcall>
-{"name":"mock_price","arguments":{"symbol":"BTC"}}
-</toolcall>"#
-            .to_string()
-    }
-
     #[async_trait::async_trait]
     impl Provider for ToolCallingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
         async fn chat(
             &self,
             request: ChatRequest<'_>,
@@ -1682,16 +1675,22 @@ mod tests {
             let has_tool_results = request
                 .messages
                 .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
-            let text = if has_tool_results {
-                "BTC is currently around $65,000 based on latest tool output.".to_string()
+                .any(|msg| msg.role == "tool");
+            if has_tool_results {
+                Ok(ChatResponse {
+                    text: Some("BTC is currently around $65,000 based on latest tool output.".to_string()),
+                    tool_calls: vec![],
+                })
             } else {
-                tool_call_payload()
-            };
-            Ok(ChatResponse {
-                text: Some(text),
-                tool_calls: vec![],
-            })
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc-mock-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                    }],
+                })
+            }
         }
     }
 
@@ -1699,6 +1698,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for ToolCallingAliasProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
         async fn chat(
             &self,
             request: ChatRequest<'_>,
@@ -1708,16 +1713,22 @@ mod tests {
             let has_tool_results = request
                 .messages
                 .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
-            let text = if has_tool_results {
-                "BTC alias-tag flow resolved to final text output.".to_string()
+                .any(|msg| msg.role == "tool");
+            if has_tool_results {
+                Ok(ChatResponse {
+                    text: Some("BTC alias-tag flow resolved to final text output.".to_string()),
+                    tool_calls: vec![],
+                })
             } else {
-                tool_call_payload_with_alias_tag()
-            };
-            Ok(ChatResponse {
-                text: Some(text),
-                tool_calls: vec![],
-            })
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc-alias-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                    }],
+                })
+            }
         }
     }
 
@@ -2519,6 +2530,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for SteerTestProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
+        }
+
         async fn chat(
             &self,
             request: ChatRequest<'_>,
@@ -2535,22 +2552,26 @@ mod tests {
                 .find(|m| m.role == "user")
                 .map(|m| m.content.as_str())
                 .unwrap_or("");
-            let has_tool_results = last_user.contains("[Tool results]");
+            let has_tool_results = request.messages.iter().any(|m| m.role == "tool");
 
             if n == 0 {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 Ok(ChatResponse {
-                    text: Some(tool_call_payload()),
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc-steer-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                    }],
+                })
+            } else if last_user.contains("<messages>") {
+                Ok(ChatResponse {
+                    text: Some("reply to steer merge".to_string()),
                     tool_calls: vec![],
                 })
             } else if has_tool_results {
                 Ok(ChatResponse {
                     text: Some("reply to tool results".to_string()),
-                    tool_calls: vec![],
-                })
-            } else if last_user.contains("<messages>") {
-                Ok(ChatResponse {
-                    text: Some("reply to steer merge".to_string()),
                     tool_calls: vec![],
                 })
             } else if last_user.contains("trigger tool") {

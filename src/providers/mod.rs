@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod group;
 pub mod ollama;
 pub mod openai;
+pub mod prompt_guided;
 pub mod openrouter;
 pub mod provider_manager;
 pub mod reliable;

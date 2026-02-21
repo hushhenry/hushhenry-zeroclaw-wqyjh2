@@ -1,17 +1,9 @@
-use crate::agent::dispatcher::{
-    conversation_message_to_chat_messages, NativeToolDispatcher, ToolDispatcher,
-    ToolExecutionResult, XmlToolDispatcher,
-};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
-use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, ChatResponse, ProviderCtx, ToolCall};
-use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::observability::{Observer, ObserverEvent};
+use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
 use crate::tools::{self, Tool};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -126,24 +118,48 @@ fn maybe_bind_source_session_id(
     }
 }
 
-/// Inject dispatcher prompt instructions into a copy of messages (for prompt-guided tool use).
-fn inject_prompt_instructions(
-    messages: &[ChatMessage],
-    instructions: &str,
-) -> Vec<ChatMessage> {
-    if instructions.is_empty() {
-        return messages.to_vec();
-    }
-    let mut out = messages.to_vec();
-    if let Some(system) = out.iter_mut().find(|m| m.role == "system") {
-        if !system.content.is_empty() {
-            system.content.push_str("\n\n");
-        }
-        system.content.push_str(instructions);
-    } else {
-        out.insert(0, ChatMessage::system(instructions.to_string()));
-    }
-    out
+/// Result of executing one tool call; used to build tool-role messages for history.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionResult {
+    pub name: String,
+    pub output: String,
+    pub success: bool,
+    pub tool_call_id: Option<String>,
+}
+
+/// Build the assistant message content (native JSON) to store in history after a tool round.
+fn build_assistant_content_native(text: &str, tool_calls: &[ToolCall]) -> String {
+    let tool_calls_value: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::json!({})),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "content": text,
+        "tool_calls": tool_calls_value,
+    })
+    .to_string()
+}
+
+/// Convert tool execution results to tool-role ChatMessages for history.
+fn tool_results_to_chat_messages(results: &[ToolExecutionResult]) -> Vec<ChatMessage> {
+    results
+        .iter()
+        .map(|r| {
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": r.tool_call_id,
+                    "content": r.output,
+                })
+                .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Steer callback: at a tool-call checkpoint, called with the current user message content.
@@ -178,26 +194,11 @@ pub(crate) async fn run_tool_call_loop(
         Some(tool_specs.as_slice())
     };
 
-    let dispatcher: &dyn ToolDispatcher = if provider_ctx.provider.supports_native_tools() {
-        &NativeToolDispatcher
-    } else {
-        &XmlToolDispatcher
-    };
-
     for _iteration in 0..MAX_TOOL_ITERATIONS {
-        let injected;
-        let (messages_to_send, tools_to_send) = if dispatcher.should_send_tool_specs() {
-            (history.as_slice(), tool_slice)
-        } else {
-            let instructions = dispatcher.prompt_instructions(&tool_specs);
-            injected = inject_prompt_instructions(history, &instructions);
-            (injected.as_slice(), None)
-        };
-
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: provider_ctx.model.clone(),
-            messages_count: messages_to_send.len(),
+            messages_count: history.len(),
         });
 
         let llm_started_at = Instant::now();
@@ -206,8 +207,8 @@ pub(crate) async fn run_tool_call_loop(
             .provider
             .chat(
                 ChatRequest {
-                    messages: messages_to_send,
-                    tools: tools_to_send,
+                    messages: history.as_slice(),
+                    tools: tool_slice,
                 },
                 &provider_ctx.model,
                 provider_ctx.temperature,
@@ -236,39 +237,44 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let result = dispatcher.parse_response(&resp);
+        let text = resp.text_or_empty().to_string();
+        let tool_calls = resp.tool_calls.clone();
 
-        if result.tool_calls.is_empty() {
-            history.push(ChatMessage::assistant(result.assistant_content_for_history));
-            return Ok(result.text);
+        if tool_calls.is_empty() {
+            history.push(ChatMessage::assistant(text.clone()));
+            return Ok(text);
         }
 
-        if !silent && !result.text.is_empty() {
-            print!("{}", result.text);
+        let assistant_content = build_assistant_content_native(&text, &tool_calls);
+
+        if !silent && !text.is_empty() {
+            print!("{text}");
             let _ = std::io::stdout().flush();
         }
 
         let mut execution_results: Vec<ToolExecutionResult> =
-            Vec::with_capacity(result.tool_calls.len());
-        for call in &result.tool_calls {
+            Vec::with_capacity(tool_calls.len());
+        for call in &tool_calls {
+            let arguments_value = serde_json::from_str(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&call.name) {
                     let request = ApprovalRequest {
                         tool_name: call.name.clone(),
-                        arguments: call.arguments.clone(),
+                        arguments: arguments_value.clone(),
                     };
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else {
                         ApprovalResponse::Yes
                     };
-                    mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+                    mgr.record_decision(&call.name, &arguments_value, decision, channel_name);
                     if decision == ApprovalResponse::No {
                         execution_results.push(ToolExecutionResult {
                             name: call.name.clone(),
                             output: "Denied by user.".to_string(),
                             success: false,
-                            tool_call_id: call.tool_call_id.clone(),
+                            tool_call_id: Some(call.id.clone()),
                         });
                         continue;
                     }
@@ -281,7 +287,7 @@ pub(crate) async fn run_tool_call_loop(
             let start = Instant::now();
             let tool_args = maybe_bind_source_session_id(
                 &call.name,
-                call.arguments.clone(),
+                arguments_value.clone(),
                 source_session_id,
             );
             let disallowed =
@@ -328,13 +334,12 @@ pub(crate) async fn run_tool_call_loop(
                 name: call.name.clone(),
                 output,
                 success,
-                tool_call_id: call.tool_call_id.clone(),
+                tool_call_id: Some(call.id.clone()),
             });
         }
 
-        history.push(ChatMessage::assistant(result.assistant_content_for_history));
-        for msg in conversation_message_to_chat_messages(dispatcher.format_results(&execution_results))
-        {
+        history.push(ChatMessage::assistant(assistant_content));
+        for msg in tool_results_to_chat_messages(&execution_results) {
             history.push(msg);
         }
 
@@ -448,105 +453,8 @@ mod tests {
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::providers::prompt_guided;
     use tempfile::TempDir;
-
-    fn parse_tool_calls_via_xml_dispatcher(
-        response: &str,
-    ) -> (String, Vec<crate::agent::dispatcher::ParsedToolCall>) {
-        let resp = ChatResponse {
-            text: Some(response.to_string()),
-            tool_calls: vec![],
-        };
-        let result = XmlToolDispatcher.parse_response(&resp);
-        (result.text, result.tool_calls)
-    }
-
-    #[test]
-    fn parse_tool_calls_extracts_single_call() {
-        let response = r#"Let me check that.
-<tool_call>
-{"name": "shell", "arguments": {"command": "ls -la"}}
-</tool_call>"#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(text, "Let me check that.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "ls -la"
-        );
-    }
-
-    #[test]
-    fn parse_tool_calls_extracts_multiple_calls() {
-        let response = r#"<tool_call>
-{"name": "file_read", "arguments": {"path": "a.txt"}}
-</tool_call>
-<tool_call>
-{"name": "file_read", "arguments": {"path": "b.txt"}}
-</tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "file_read");
-        assert_eq!(calls[1].name, "file_read");
-    }
-
-    #[test]
-    fn parse_tool_calls_returns_text_only_when_no_calls() {
-        let response = "Just a normal response with no tools.";
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(text, "Just a normal response with no tools.");
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_malformed_json() {
-        let response = r#"<tool_call>
-not valid json
-</tool_call>
-Some text after."#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(calls.is_empty());
-        assert!(text.contains("Some text after."));
-    }
-
-    #[test]
-    fn parse_tool_calls_text_before_and_after() {
-        let response = r#"Before text.
-<tool_call>
-{"name": "shell", "arguments": {"command": "echo hi"}}
-</tool_call>
-After text."#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(text.contains("Before text."));
-        assert!(text.contains("After text."));
-        assert_eq!(calls.len(), 1);
-    }
-
-    /// XmlToolDispatcher only parses <tool_call> tags; raw JSON is left as text (no tool_calls).
-    #[test]
-    fn parse_tool_calls_openai_style_json_left_as_text() {
-        let response = r#"{"content": "Let me check.", "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": "{}"}}]}"#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(calls.is_empty(), "XmlToolDispatcher does not parse raw JSON");
-        assert!(text.contains("Let me check"));
-    }
-
-    #[test]
-    fn parse_tool_calls_rejects_raw_tool_json_without_tags() {
-        // SECURITY: Raw JSON without explicit wrappers should NOT be parsed
-        // This prevents prompt injection attacks where malicious content
-        // could include JSON that mimics a tool call.
-        let response = r#"Sure, creating the file now.
-{"name": "file_write", "arguments": {"path": "hello.py", "content": "print('hello')"}}"#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(text.contains("Sure, creating the file now."));
-        assert_eq!(
-            calls.len(),
-            0,
-            "Raw JSON without wrappers should not be parsed"
-        );
-    }
 
     #[test]
     fn tools_to_specs_respects_allow_list() {
@@ -617,50 +525,6 @@ After text."#;
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Recovery Tests - Tool Call Parsing Edge Cases
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn parse_tool_calls_handles_empty_tool_result() {
-        // Recovery: Empty tool_result tag should be handled gracefully
-        let response = r#"I'll run that command.
-<tool_result name="shell">
-
-</tool_result>
-Done."#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(text.contains("Done."));
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_empty_tool_calls_array() {
-        let response = r#"{"content": "Hello", "tool_calls": []}"#;
-        let (text, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(text.contains("Hello"));
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_whitespace_only_name() {
-        let response = r#"<tool_call>
-{"name": "   ", "arguments": {}}
-</tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_empty_string_arguments() {
-        let response = r#"<tool_call>
-{"name": "test", "arguments": ""}
-</tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "test");
-    }
-
     const _: () = {
         assert!(MAX_TOOL_ITERATIONS > 0);
         assert!(MAX_TOOL_ITERATIONS <= 100);
@@ -673,43 +537,32 @@ Done."#;
     }
 
     #[test]
-    fn parse_tool_calls_via_dispatcher_handles_top_level_name() {
-        let response = r#"<tool_call>
-{"name": "test_tool", "arguments": {}}
+    fn ollama_prompt_guided_parse_extracts_single_call() {
+        let response = r#"Let me check.
+<tool_call>
+{"name": "shell", "arguments": {"command": "ls -la"}}
 </tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
+        let (text, calls) = prompt_guided::parse_tool_calls_from_text(response);
+        assert_eq!(text, "Let me check.");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "test_tool");
+        assert_eq!(calls[0].name, "shell");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args.get("command").unwrap().as_str().unwrap(), "ls -la");
     }
 
     #[test]
-    fn parse_tool_calls_via_dispatcher_handles_empty_tool_calls_array() {
-        let response = r#"{"tool_calls": []}"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
+    fn ollama_prompt_guided_parse_returns_text_only_when_no_calls() {
+        let response = "Just a normal response.";
+        let (text, calls) = prompt_guided::parse_tool_calls_from_text(response);
+        assert_eq!(text, "Just a normal response.");
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn parse_tool_calls_via_dispatcher_handles_missing_tool_calls() {
-        let response = r#"<tool_call>
-{"name": "test", "arguments": {}}
-</tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "test");
-    }
-
-    #[test]
-    fn parse_tool_calls_via_dispatcher_handles_multiple_tags() {
-        let response = r#"<tool_call>
-{"name": "tool_a", "arguments": {}}
-</tool_call>
-<tool_call>
-{"name": "tool_b", "arguments": {}}
-</tool_call>"#;
-        let (_, calls) = parse_tool_calls_via_xml_dispatcher(response);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "tool_a");
-        assert_eq!(calls[1].name, "tool_b");
+    fn ollama_prompt_guided_parse_raw_json_left_as_text() {
+        let response = r#"{"content": "Hi.", "tool_calls": []}"#;
+        let (text, calls) = prompt_guided::parse_tool_calls_from_text(response);
+        assert!(calls.is_empty());
+        assert!(text.contains("Hi."));
     }
 }

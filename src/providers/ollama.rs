@@ -1,3 +1,4 @@
+use crate::providers::prompt_guided;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest,
     ChatResponse as ProviderChatResponse, Provider, ToolCall as ProviderToolCall,
@@ -404,7 +405,7 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            native_tool_calling: false,
             ..Default::default()
         }
     }
@@ -416,46 +417,50 @@ impl Provider for OllamaProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
-        let api_messages = Self::convert_messages(request.messages);
-        let api_tools = Self::convert_tools_to_ollama(request.tools);
+
+        let (api_messages, api_tools) = if let Some(specs) = request.tools {
+            if specs.is_empty() {
+                (Self::convert_messages(request.messages), None)
+            } else {
+                let instructions = prompt_guided::build_tool_instructions(specs);
+                let pg =
+                    prompt_guided::convert_messages_to_prompt_guided(request.messages, &instructions);
+                let messages: Vec<Message> = pg
+                    .into_iter()
+                    .map(|m| Message {
+                        role: m.role,
+                        content: m.content,
+                        tool_calls: None,
+                        tool_name: None,
+                    })
+                    .collect();
+                (messages, None)
+            }
+        } else {
+            (Self::convert_messages(request.messages), None)
+        };
 
         let response = self
-            .send_request(api_messages, &normalized_model, temperature, should_auth, api_tools)
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                api_tools,
+            )
             .await?;
 
-        if !response.message.tool_calls.is_empty() {
-            tracing::debug!(
-                "Ollama returned {} tool call(s)",
-                response.message.tool_calls.len()
-            );
-            let tool_calls: Vec<ProviderToolCall> = response
-                .message
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let (name, args) = self.extract_tool_name_and_args(tc);
-                    ProviderToolCall {
-                        id: tc.id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        name,
-                        arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
-                    }
-                })
-                .collect();
-            let text = if response.message.content.is_empty() {
-                None
-            } else {
-                Some(response.message.content.clone())
-            };
+        let raw_content = response.message.content;
+        let (text, tool_calls) = prompt_guided::parse_tool_calls_from_text(&raw_content);
+
+        if !tool_calls.is_empty() {
             return Ok(ProviderChatResponse {
-                text,
+                text: if text.is_empty() { None } else { Some(text) },
                 tool_calls,
             });
         }
 
-        let content = response.message.content;
-        if content.is_empty() {
+        if raw_content.is_empty() {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
@@ -469,17 +474,17 @@ impl Provider for OllamaProvider {
                     tool_calls: vec![],
                 });
             }
-            tracing::warn!("Ollama returned empty content with no tool calls");
+            tracing::warn!("Ollama returned empty content");
         }
 
         Ok(ProviderChatResponse {
-            text: Some(content),
+            text: Some(if text.is_empty() { raw_content } else { text }),
             tool_calls: vec![],
         })
     }
 
     fn supports_native_tools(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -716,9 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_native_tools() {
+    fn capabilities_prompt_guided_tools_only() {
         let provider = OllamaProvider::new(None, None);
         let caps = provider.capabilities();
-        assert!(caps.native_tool_calling);
+        assert!(!caps.native_tool_calling, "Ollama uses prompt-guided tool use, not native API tool_calls");
     }
 }
