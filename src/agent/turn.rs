@@ -1,20 +1,20 @@
 //! Turn execution: build history, run tool loop, deliver response.
 //! Moved from channels so orchestration lives in agent; channels remain transport-only.
 
-use crate::agent::loop_::{run_tool_call_loop, tools_to_specs};
+use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::traits;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
-    build_system_prompt, channel_delivery_instructions, conversation_memory_key,
-    resolve_agent_spec_policy, resolve_effective_provider_model, send_delivery_message,
+    conversation_memory_key, resolve_effective_provider_model,
+    resolve_effective_system_prompt_and_tool_allow_list, send_delivery_message,
     should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
     INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::memory::MemoryCategory;
 use crate::providers::{self, ChatMessage};
 use crate::session::compaction::{
-    build_merged_system_prompt, estimate_tokens, load_compaction_state, maybe_compact,
-    resolve_keep_recent_messages, CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+    estimate_tokens, load_compaction_state, maybe_compact, resolve_keep_recent_messages,
+    CompactionOutcome, CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::SessionId;
 use crate::util::truncate_with_ellipsis;
@@ -49,10 +49,6 @@ pub(crate) async fn run_turn_core(
     }
 
     let target_channel = ctx.channels_by_name.get(&delivery_channel_name).cloned();
-    let merged_system_prompt = build_merged_system_prompt(
-        ctx.system_prompt.as_str(),
-        channel_delivery_instructions(&delivery_channel_name),
-    );
     let enriched_message = if use_session_history {
         msg.content.clone()
     } else {
@@ -91,50 +87,7 @@ pub(crate) async fn run_turn_core(
     let started_at = Instant::now();
 
     let (effective_system_prompt, tool_allow_list) =
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            if let Some(policy) = resolve_agent_spec_policy(store, session_id) {
-                let allowed_tools = policy.tools.clone();
-                let allowed_skills = policy.skills.clone();
-                let filtered_specs =
-                    tools_to_specs(ctx.tools_registry.as_ref(), allowed_tools.as_deref());
-                let tool_entries: Vec<(&str, &str)> = filtered_specs
-                    .iter()
-                    .map(|t| (t.name.as_str(), t.description.as_str()))
-                    .collect();
-                let filtered_skills_vec: Vec<crate::skills::Skill> =
-                    if let Some(ref allow) = allowed_skills {
-                        ctx.all_skills
-                            .iter()
-                            .filter(|s| allow.iter().any(|n| n == &s.name))
-                            .cloned()
-                            .collect()
-                    } else {
-                        ctx.all_skills.to_vec()
-                    };
-                let bootstrap_max_chars = if ctx.config.agent.compact_context {
-                    Some(6000)
-                } else {
-                    None
-                };
-                let base_prompt = build_system_prompt(
-                    &ctx.config.workspace_dir,
-                    ctx.model.as_str(),
-                    &tool_entries,
-                    &filtered_skills_vec,
-                    Some(&ctx.config.identity),
-                    bootstrap_max_chars,
-                );
-                let merged = build_merged_system_prompt(
-                    &base_prompt,
-                    channel_delivery_instructions(&msg.channel),
-                );
-                (merged, allowed_tools)
-            } else {
-                (merged_system_prompt.clone(), None)
-            }
-        } else {
-            (merged_system_prompt.clone(), None)
-        };
+        resolve_effective_system_prompt_and_tool_allow_list(ctx.as_ref(), active_session, &delivery_channel_name);
 
     let mut history: Vec<ChatMessage>;
 
@@ -428,4 +381,29 @@ pub(crate) async fn run_memory_turn(
     msg: traits::ChannelMessage,
 ) -> Result<()> {
     run_turn_core(ctx, active_session, msg, None, false).await
+}
+
+/// Run session compaction once (effective system prompt + maybe_compact).
+/// Used by manual /compact and shares the same prompt resolution as the agent turn.
+pub(crate) async fn run_session_compaction(
+    ctx: &ChannelRuntimeContext,
+    session_id: &SessionId,
+    channel_name: &str,
+) -> Result<CompactionOutcome> {
+    let session_store = ctx
+        .session_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+    let (effective_system_prompt, _) =
+        resolve_effective_system_prompt_and_tool_allow_list(ctx, Some(session_id), channel_name);
+    let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
+    maybe_compact(
+        session_store.as_ref(),
+        session_id,
+        ctx.provider.as_ref(),
+        ctx.model.as_str(),
+        &effective_system_prompt,
+        keep_recent,
+    )
+    .await
 }

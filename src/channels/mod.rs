@@ -40,8 +40,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::{
-        build_compaction_summary_message, build_merged_system_prompt, maybe_compact,
-        resolve_keep_recent_messages, CompactionState,
+        build_compaction_summary_message, build_merged_system_prompt, CompactionState,
     },
     SessionContext, SessionId, SessionKey, SessionMessage, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
@@ -433,6 +432,65 @@ pub(crate) fn resolve_agent_spec_policy(
     } else {
         None
     }
+}
+
+/// Resolve effective system prompt and optional tool allow-list for a session.
+/// Shared by the agent turn (history + compaction + tool loop) and manual /compact.
+/// Returns (prompt, tool_allow_list); when no session/policy, tool_allow_list is None.
+pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
+    ctx: &ChannelRuntimeContext,
+    session_id: Option<&SessionId>,
+    channel_name: &str,
+) -> (String, Option<Vec<String>>) {
+    let default_merged = build_merged_system_prompt(
+        ctx.system_prompt.as_str(),
+        channel_delivery_instructions(channel_name),
+    );
+    let (Some(store), Some(sid)) = (ctx.session_store.as_ref(), session_id) else {
+        return (default_merged, None);
+    };
+    let Some(policy) = resolve_agent_spec_policy(store, sid) else {
+        return (default_merged, None);
+    };
+    let allowed_tools = policy.tools.clone();
+    let allowed_skills = policy.skills;
+    let tool_entries: Vec<(&str, &str)> = ctx
+        .tools_registry
+        .iter()
+        .filter(|tool| match allowed_tools.as_ref() {
+            Some(allow) => allow.iter().any(|name| name == tool.name()),
+            None => true,
+        })
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
+    let filtered_skills_vec: Vec<crate::skills::Skill> =
+        if let Some(ref allow) = allowed_skills {
+            ctx.all_skills
+                .iter()
+                .filter(|skill| allow.iter().any(|name| name == &skill.name))
+                .cloned()
+                .collect()
+        } else {
+            ctx.all_skills.to_vec()
+        };
+    let bootstrap_max_chars = if ctx.config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let base_prompt = build_system_prompt(
+        &ctx.config.workspace_dir,
+        ctx.model.as_str(),
+        &tool_entries,
+        &filtered_skills_vec,
+        Some(&ctx.config.identity),
+        bootstrap_max_chars,
+    );
+    let merged = build_merged_system_prompt(
+        &base_prompt,
+        channel_delivery_instructions(channel_name),
+    );
+    (merged, allowed_tools)
 }
 
 fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> String {
@@ -932,66 +990,7 @@ async fn run_manual_session_compaction(
     session_id: &SessionId,
     msg: &traits::ChannelMessage,
 ) {
-    let Some(session_store) = ctx.session_store.as_ref() else {
-        return;
-    };
-
-    let effective_system_prompt =
-        if let Some(policy) = resolve_agent_spec_policy(session_store, session_id) {
-            let allowed_tools = policy.tools;
-            let allowed_skills = policy.skills;
-            let tool_entries: Vec<(&str, &str)> = ctx
-                .tools_registry
-                .iter()
-                .filter(|tool| match allowed_tools.as_ref() {
-                    Some(allow) => allow.iter().any(|name| name == tool.name()),
-                    None => true,
-                })
-                .map(|tool| (tool.name(), tool.description()))
-                .collect();
-            let filtered_skills_vec: Vec<crate::skills::Skill> =
-                if let Some(ref allow) = allowed_skills {
-                    ctx.all_skills
-                        .iter()
-                        .filter(|skill| allow.iter().any(|name| name == &skill.name))
-                        .cloned()
-                        .collect()
-                } else {
-                    ctx.all_skills.to_vec()
-                };
-            let bootstrap_max_chars = if ctx.config.agent.compact_context {
-                Some(6000)
-            } else {
-                None
-            };
-            let base_prompt = build_system_prompt(
-                &ctx.config.workspace_dir,
-                ctx.model.as_str(),
-                &tool_entries,
-                &filtered_skills_vec,
-                Some(&ctx.config.identity),
-                bootstrap_max_chars,
-            );
-            build_merged_system_prompt(&base_prompt, channel_delivery_instructions(&msg.channel))
-        } else {
-            build_merged_system_prompt(
-                ctx.system_prompt.as_str(),
-                channel_delivery_instructions(&msg.channel),
-            )
-        };
-
-    let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
-
-    match maybe_compact(
-        session_store.as_ref(),
-        session_id,
-        ctx.provider.as_ref(),
-        ctx.model.as_str(),
-        &effective_system_prompt,
-        keep_recent,
-    )
-    .await
-    {
+    match crate::agent::turn::run_session_compaction(ctx, session_id, &msg.channel).await {
         Ok(result) => {
             if let Some(channel) = target_channel {
                 let confirmation = if result.compacted {
