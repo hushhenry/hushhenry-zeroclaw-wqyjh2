@@ -161,8 +161,7 @@ fn build_compaction_prompt(
 pub async fn maybe_compact(
     store: &SessionStore,
     session_id: &SessionId,
-    provider: &dyn Provider,
-    model: &str,
+    provider_ctx: &crate::providers::ProviderCtx,
     system_prompt: &str,
     keep_recent_messages: usize,
 ) -> Result<CompactionOutcome> {
@@ -192,13 +191,14 @@ pub async fn maybe_compact(
         ChatMessage::system("You are a session compaction engine. Return compact durable context."),
         ChatMessage::user(prompt),
     ];
-    let summary_raw = provider
+    let summary_raw = provider_ctx
+        .provider
         .chat(
             ChatRequest {
                 messages: &summary_messages,
                 tools: None,
             },
-            model,
+            &provider_ctx.model,
             0.1,
         )
         .await

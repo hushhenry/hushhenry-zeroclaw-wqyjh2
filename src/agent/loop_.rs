@@ -1,6 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderCtx, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -388,14 +388,12 @@ pub type SteerAtCheckpoint = dyn FnMut(&str) -> Option<String> + Send;
 /// When steer_at_checkpoint is Some, it is used at safe boundaries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
-    provider: &dyn Provider,
+    provider_ctx: &ProviderCtx,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     tool_allow_list: Option<&[String]>,
     observer: &dyn Observer,
     provider_name: &str,
-    model: &str,
-    temperature: f64,
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
@@ -414,27 +412,28 @@ pub(crate) async fn run_tool_call_loop(
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
-            model: model.to_string(),
+            model: provider_ctx.model.clone(),
             messages_count: history.len(),
         });
 
         let llm_started_at = Instant::now();
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content) = match provider
+        let (response_text, parsed_text, tool_calls, assistant_history_content) = match provider_ctx
+            .provider
             .chat(
                 ChatRequest {
                     messages: history,
                     tools: tool_slice,
                 },
-                model,
-                temperature,
+                &provider_ctx.model,
+                provider_ctx.temperature,
             )
             .await
         {
             Ok(resp) => {
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
-                    model: model.to_string(),
+                    model: provider_ctx.model.clone(),
                     duration: llm_started_at.elapsed(),
                     success: true,
                     error_message: None,
@@ -462,7 +461,7 @@ pub(crate) async fn run_tool_call_loop(
             Err(e) => {
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
-                    model: model.to_string(),
+                    model: provider_ctx.model.clone(),
                     duration: llm_started_at.elapsed(),
                     success: false,
                     error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
@@ -589,31 +588,27 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
-/// One-turn agent loop for tests: builds history and runs run_tool_call_loop with injected provider.
+/// One-turn agent loop for tests: builds history and runs run_tool_call_loop with injected provider context.
 /// Returns (response_text, final_history) so tests can assert on history when needed.
 #[cfg(test)]
 pub(crate) async fn run_one_turn_for_test(
-    provider: &dyn Provider,
+    provider_ctx: &ProviderCtx,
     system_prompt: &str,
     user_message: &str,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
-    model: &str,
-    temperature: f64,
 ) -> Result<(String, Vec<ChatMessage>)> {
     let mut history = vec![
         ChatMessage::system(system_prompt),
         ChatMessage::user(user_message),
     ];
     let response = run_tool_call_loop(
-        provider,
+        provider_ctx,
         &mut history,
         tools_registry,
         None,
         observer,
         "test",
-        model,
-        temperature,
         true,
         None,
         "test",

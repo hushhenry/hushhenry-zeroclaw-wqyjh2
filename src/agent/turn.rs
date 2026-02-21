@@ -5,13 +5,13 @@ use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::traits;
 use crate::channels::{
     build_ephemeral_announce_context, build_memory_context, build_session_turn_history,
-    conversation_memory_key, resolve_effective_provider_model,
-    resolve_effective_system_prompt_and_tool_allow_list, send_delivery_message,
+    conversation_memory_key, resolve_effective_system_prompt_and_tool_allow_list,
+    resolve_turn_provider_model_temperature, send_delivery_message,
     should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
     INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::memory::MemoryCategory;
-use crate::providers::{self, ChatMessage};
+use crate::providers::ChatMessage;
 use crate::session::compaction::{
     estimate_tokens, load_compaction_state, maybe_compact, resolve_keep_recent_messages,
     CompactionOutcome, CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
@@ -134,12 +134,15 @@ pub(crate) async fn run_turn_core(
 
             if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
                 let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
+                let default_resolved = ctx
+                    .provider_manager
+                    .default_resolved()
+                    .unwrap_or_else(|e| panic!("default_resolved failed: {e}"));
 
                 match maybe_compact(
                     &*session_store,
                     session_id,
-                    ctx.provider.as_ref(),
-                    ctx.model.as_str(),
+                    &default_resolved,
                     &effective_system_prompt,
                     keep_recent,
                 )
@@ -180,67 +183,18 @@ pub(crate) async fn run_turn_core(
         ];
     }
 
-    let (provider_override, model_override, temperature_override) =
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            let (eff_provider, eff_model, eff_temp) =
-                resolve_effective_provider_model(store, session_id, &ctx.config);
-            let default_provider = ctx
-                .config
-                .default_provider
-                .as_deref()
-                .unwrap_or("openrouter");
-            let default_model = ctx
-                .config
-                .default_model
-                .as_deref()
-                .unwrap_or("anthropic/claude-sonnet-4");
-            let default_temperature = ctx.config.default_temperature;
-            if eff_provider != default_provider
-                || eff_model != default_model
-                || (eff_temp - default_temperature).abs() > 1e-9
-            {
-                match providers::create_routed_provider(
-                    &eff_provider,
-                    ctx.config.api_key.as_deref(),
-                    ctx.config.api_url.as_deref(),
-                    &ctx.config.reliability,
-                    &ctx.config.model_routes,
-                    &eff_model,
-                ) {
-                    Ok(provider) => (Some(Arc::from(provider)), Some(eff_model), Some(eff_temp)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to create routed provider for session agent: {e}; using default"
-                        );
-                        (None, None, None)
-                    }
-                }
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-    let provider_ref = provider_override
-        .as_deref()
-        .unwrap_or_else(|| ctx.provider.as_ref());
-    let model_str = model_override
-        .as_deref()
-        .unwrap_or_else(|| ctx.model.as_str());
-    let temp = temperature_override.unwrap_or(ctx.temperature);
+    let resolved =
+        resolve_turn_provider_model_temperature(ctx.as_ref(), active_session);
 
     let llm_result = timeout_future(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
         run_tool_call_loop(
-            provider_ref,
+            &resolved,
             &mut history,
             ctx.tools_registry.as_ref(),
             tool_allow_list.as_deref(),
             ctx.observer.as_ref(),
             "channel-runtime",
-            model_str,
-            temp,
             true,
             None,
             delivery_channel_name.as_str(),
@@ -397,11 +351,14 @@ pub(crate) async fn run_session_compaction(
     let (effective_system_prompt, _) =
         resolve_effective_system_prompt_and_tool_allow_list(ctx, Some(session_id), channel_name);
     let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
+    let default_resolved = ctx
+        .provider_manager
+        .default_resolved()
+        .unwrap_or_else(|e| panic!("default_resolved failed: {e}"));
     maybe_compact(
         session_store.as_ref(),
         session_id,
-        ctx.provider.as_ref(),
-        ctx.model.as_str(),
+        &default_resolved,
         &effective_system_prompt,
         keep_recent,
     )

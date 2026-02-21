@@ -196,24 +196,18 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    // Model routes validation
-    for route in &config.model_routes {
-        if route.hint.is_empty() {
-            items.push(DiagItem::warn(cat, "model route with empty hint"));
-        }
-        if let Some(reason) = provider_validation_error(&route.provider) {
+    // Provider groups validation
+    for group in &config.provider_groups {
+        if group.name.trim().is_empty() {
             items.push(DiagItem::warn(
                 cat,
-                format!(
-                    "model route \"{}\" uses invalid provider \"{}\": {}",
-                    route.hint, route.provider, reason
-                ),
+                "provider group with empty name",
             ));
         }
-        if route.model.is_empty() {
+        if group.members.is_empty() {
             items.push(DiagItem::warn(
                 cat,
-                format!("model route \"{}\" has empty model", route.hint),
+                format!("provider group \"{}\" has no members", group.name),
             ));
         }
     }
@@ -699,19 +693,18 @@ mod tests {
     }
 
     #[test]
-    fn config_validation_warns_empty_model_route() {
+    fn config_validation_warns_empty_provider_group_members() {
         let mut config = Config::default();
-        config.model_routes = vec![crate::config::ModelRouteConfig {
-            hint: "fast".into(),
-            provider: "groq".into(),
-            model: String::new(),
-            api_key: None,
+        config.provider_groups = vec![crate::config::ProviderGroupConfig {
+            name: "empty_group".into(),
+            strategy: crate::config::ProviderGroupStrategy::RoundRobin,
+            members: vec![],
         }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let route_item = items.iter().find(|i| i.message.contains("empty model"));
-        assert!(route_item.is_some());
-        assert_eq!(route_item.unwrap().severity, Severity::Warn);
+        let group_item = items.iter().find(|i| i.message.contains("no members"));
+        assert!(group_item.is_some());
+        assert_eq!(group_item.unwrap().severity, Severity::Warn);
     }
 
     #[test]

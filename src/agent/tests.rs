@@ -27,6 +27,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::loop_;
+use crate::providers::ProviderCtx;
 use crate::config::MemoryConfig;
 use crate::memory::{self, Memory};
 use crate::observability::{NoopObserver, Observer};
@@ -251,20 +252,27 @@ fn make_observer() -> Arc<dyn Observer> {
     Arc::from(NoopObserver {})
 }
 
+/// Build a test ProviderCtx from an Arc<dyn Provider>.
+fn provider_ctx(provider: Arc<dyn Provider>) -> ProviderCtx {
+    ProviderCtx {
+        provider,
+        model: "test".into(),
+        temperature: 0.7,
+    }
+}
+
 /// Run one turn via loop_ for tests.
 async fn run_turn(
-    provider: &dyn Provider,
+    provider_ctx: &ProviderCtx,
     user_message: &str,
     tools_registry: &[Box<dyn Tool>],
 ) -> Result<(String, Vec<ChatMessage>)> {
     loop_::run_one_turn_for_test(
-        provider,
+        provider_ctx,
         "You are a helpful assistant.",
         user_message,
         tools_registry,
         &NoopObserver,
-        "test",
-        0.7,
     )
     .await
 }
@@ -301,9 +309,9 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("Hello world")]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     assert_eq!(response, "Hello world");
 }
 
@@ -313,7 +321,7 @@ async fn turn_returns_text_when_no_tools_called() {
 
 #[tokio::test]
 async fn turn_executes_single_tool_then_returns() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -322,7 +330,7 @@ async fn turn_executes_single_tool_then_returns() {
         text_response("I ran the tool"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(provider.as_ref(), "run echo", &tools)
+    let (response, _) = run_turn(&provider_ctx(provider), "run echo", &tools)
         .await
         .unwrap();
     assert_eq!(response, "I ran the tool");
@@ -336,7 +344,7 @@ async fn turn_executes_single_tool_then_returns() {
 async fn turn_handles_multi_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -355,7 +363,7 @@ async fn turn_handles_multi_step_tool_chain() {
         text_response("Done after 3 calls"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(counting_tool)];
-    let (response, _) = run_turn(provider.as_ref(), "count 3 times", &tools)
+    let (response, _) = run_turn(&provider_ctx(provider), "count 3 times", &tools)
         .await
         .unwrap();
     assert_eq!(response, "Done after 3 calls");
@@ -379,10 +387,10 @@ async fn turn_bails_out_at_max_iterations() {
         }]));
     }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
+    let provider = Arc::new(ScriptedProvider::new(responses));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
 
-    let result = run_turn(provider.as_ref(), "infinite loop", &tools).await;
+    let result = run_turn(&provider_ctx(provider), "infinite loop", &tools).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -397,7 +405,7 @@ async fn turn_bails_out_at_max_iterations() {
 
 #[tokio::test]
 async fn turn_handles_unknown_tool_gracefully() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
@@ -406,7 +414,7 @@ async fn turn_handles_unknown_tool_gracefully() {
         text_response("I couldn't find that tool"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, history) = run_turn(provider.as_ref(), "use nonexistent", &tools)
+    let (response, history) = run_turn(&provider_ctx(provider), "use nonexistent", &tools)
         .await
         .unwrap();
     assert_eq!(response, "I couldn't find that tool");
@@ -425,7 +433,7 @@ async fn turn_handles_unknown_tool_gracefully() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_failure() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "fail".into(),
@@ -434,7 +442,7 @@ async fn turn_recovers_from_tool_failure() {
         text_response("Tool failed but I recovered"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool)];
-    let (response, _) = run_turn(provider.as_ref(), "try failing tool", &tools)
+    let (response, _) = run_turn(&provider_ctx(provider), "try failing tool", &tools)
         .await
         .unwrap();
     assert_eq!(response, "Tool failed but I recovered");
@@ -442,7 +450,7 @@ async fn turn_recovers_from_tool_failure() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_error() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "panicker".into(),
@@ -451,7 +459,7 @@ async fn turn_recovers_from_tool_error() {
         text_response("I recovered from the error"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(PanickingTool)];
-    let (response, _) = run_turn(provider.as_ref(), "try panicking", &tools)
+    let (response, _) = run_turn(&provider_ctx(provider), "try panicking", &tools)
         .await
         .unwrap();
     assert_eq!(response, "I recovered from the error");
@@ -463,9 +471,9 @@ async fn turn_recovers_from_tool_error() {
 
 #[tokio::test]
 async fn turn_propagates_provider_error() {
-    let provider = Box::new(FailingProvider);
+    let provider = Arc::new(FailingProvider);
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let result = run_turn(provider.as_ref(), "hello", &tools).await;
+    let result = run_turn(&provider_ctx(provider), "hello", &tools).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("provider error"));
 }
@@ -484,12 +492,12 @@ async fn turn_propagates_provider_error() {
 
 #[tokio::test]
 async fn xml_dispatcher_parses_and_loops() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         xml_tool_response("echo", r#"{"message": "xml-test"}"#),
         text_response("XML tool completed"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(provider.as_ref(), "test xml", &tools)
+    let (response, _) = run_turn(&provider_ctx(provider), "test xml", &tools)
         .await
         .unwrap();
     assert_eq!(response, "XML tool completed");
@@ -497,9 +505,9 @@ async fn xml_dispatcher_parses_and_loops() {
 
 #[tokio::test]
 async fn native_dispatcher_sends_tool_specs() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("ok")]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let _ = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let _ = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     let dispatcher = NativeToolDispatcher;
     assert!(dispatcher.should_send_tool_specs());
 }
@@ -516,23 +524,23 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 
 #[tokio::test]
 async fn turn_handles_empty_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+    let provider = Arc::new(ScriptedProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (response, _) = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     assert!(response.is_empty());
 }
 
 #[tokio::test]
 async fn turn_handles_none_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+    let provider = Arc::new(ScriptedProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (response, _) = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     assert!(response.is_empty());
 }
 
@@ -542,7 +550,7 @@ async fn turn_handles_none_text_response() {
 
 #[tokio::test]
 async fn turn_preserves_text_alongside_tool_calls() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         ChatResponse {
             text: Some("Let me check...".into()),
             tool_calls: vec![ToolCall {
@@ -554,7 +562,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
         text_response("Here are the results"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, history) = run_turn(provider.as_ref(), "check something", &tools)
+    let (response, history) = run_turn(&provider_ctx(provider), "check something", &tools)
         .await
         .unwrap();
     assert_eq!(response, "Here are the results");
@@ -572,7 +580,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
 async fn turn_handles_multiple_tools_in_one_response() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -594,7 +602,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
     ]));
 
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(counting_tool)];
-    let (response, _) = run_turn(provider.as_ref(), "batch", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "batch", &tools).await.unwrap();
     assert_eq!(response, "All 3 done");
     assert_eq!(
         *count.lock().unwrap(),
@@ -609,9 +617,9 @@ async fn turn_handles_multiple_tools_in_one_response() {
 
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("ok")]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (_, history) = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     assert!(!history.is_empty(), "History should contain entries");
     assert_eq!(
         history[0].role, "system",
@@ -622,9 +630,9 @@ async fn system_prompt_injected_on_first_turn() {
 #[tokio::test]
 async fn system_prompt_not_duplicated_on_second_turn() {
     // run_one_turn_for_test does a single turn; system appears once in that history.
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("only turn")]));
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("only turn")]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (_, history) = run_turn(provider.as_ref(), "hi", &tools).await.unwrap();
+    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
     let system_count = history.iter().filter(|m| m.role == "system").count();
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
 }
@@ -635,7 +643,7 @@ async fn system_prompt_not_duplicated_on_second_turn() {
 
 #[tokio::test]
 async fn history_contains_all_expected_entries_after_tool_loop() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let provider = Arc::new(ScriptedProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -644,7 +652,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
         text_response("final answer"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, history) = run_turn(provider.as_ref(), "test", &tools).await.unwrap();
+    let (response, history) = run_turn(&provider_ctx(provider), "test", &tools).await.unwrap();
     assert_eq!(response, "final answer");
     assert!(
         history.len() >= 5,
@@ -672,9 +680,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
     // run_turn is single-turn; verify one turn returns expected response.
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("response 1")]));
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("response 1")]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (r1, history) = run_turn(provider.as_ref(), "msg 1", &tools).await.unwrap();
+    let (r1, history) = run_turn(&provider_ctx(provider), "msg 1", &tools).await.unwrap();
     assert_eq!(r1, "response 1");
     assert!(
         history.len() >= 2,

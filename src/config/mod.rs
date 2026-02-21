@@ -5,10 +5,10 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DiscordConfig,
     DockerRuntimeConfig, GatewayConfig, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
-    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, ObservabilityConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SessionConfig, SlackConfig, TelegramConfig,
-    WebhookConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
+    ProviderGroupConfig, ProviderGroupStrategy, ReliabilityConfig, ResourceLimitsConfig,
+    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
+    SessionConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 
 #[cfg(test)]

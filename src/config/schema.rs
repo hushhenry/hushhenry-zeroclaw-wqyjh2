@@ -42,9 +42,9 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
-    /// Model routing rules — route `hint:<name>` to specific provider+model combos.
+    /// Provider groups — model name `group/<name>` routes to a group with strategy.
     #[serde(default)]
-    pub model_routes: Vec<ModelRouteConfig>,
+    pub provider_groups: Vec<ProviderGroupConfig>,
 
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -1001,34 +1001,46 @@ impl Default for SchedulerConfig {
     }
 }
 
-// ── Model routing ────────────────────────────────────────────────
+// ── Provider groups ───────────────────────────────────────────────
 
-/// Route a task hint to a specific provider + model.
+/// Routing strategy for a provider group (model name `group/<group_name>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderGroupStrategy {
+    /// Rotate through members on each request.
+    #[default]
+    RoundRobin,
+    /// Pick a random member per request.
+    Random,
+    /// Use first member; on failure try next, and so on.
+    Fallback,
+}
+
+/// Defines a named group of providers; model name is `group/<name>`.
 ///
 /// ```toml
-/// [[model_routes]]
-/// hint = "reasoning"
-/// provider = "openrouter"
-/// model = "anthropic/claude-opus-4-20250514"
+/// [[provider_groups]]
+/// name = "primary"
+/// strategy = "round_robin"
+/// members = [
+///   "openrouter/anthropic/claude-sonnet-4",
+///   "openrouter/google/gemini-2.0-flash",
+/// ]
 ///
-/// [[model_routes]]
-/// hint = "fast"
-/// provider = "groq"
-/// model = "llama-3.3-70b-versatile"
+/// [[provider_groups]]
+/// name = "resilient"
+/// strategy = "fallback"
+/// members = ["openrouter/anthropic/claude-3.5-sonnet", "ollama/llama3"]
 /// ```
-///
-/// Usage: pass `hint:reasoning` as the model parameter to route the request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelRouteConfig {
-    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
-    pub hint: String,
-    /// Provider to route to (must match a known provider name)
-    pub provider: String,
-    /// Model to use with that provider
-    pub model: String,
-    /// Optional API key override for this route's provider
+pub struct ProviderGroupConfig {
+    /// Group name; use as model `group/<name>`.
+    pub name: String,
+    /// How to select which member handles each request.
     #[serde(default)]
-    pub api_key: Option<String>,
+    pub strategy: ProviderGroupStrategy,
+    /// Fully-qualified model names (e.g. `openrouter/anthropic/claude-sonnet-4`).
+    pub members: Vec<String>,
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────
@@ -1501,7 +1513,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
-            model_routes: Vec::new(),
+            provider_groups: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -2122,7 +2134,7 @@ default_temperature = 0.7
             },
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
-            model_routes: Vec::new(),
+            provider_groups: Vec::new(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -2250,7 +2262,7 @@ tool_dispatcher = "xml"
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
-            model_routes: Vec::new(),
+            provider_groups: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),

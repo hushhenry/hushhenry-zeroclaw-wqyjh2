@@ -36,7 +36,7 @@ use crate::agent::turn::{run_memory_turn, run_session_turn};
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider, ProviderManagerTrait, ProviderCtx};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
@@ -80,13 +80,11 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 #[derive(Clone)]
 pub(crate) struct ChannelRuntimeContext {
     pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
-    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) provider_manager: Arc<dyn ProviderManagerTrait>,
     pub(crate) memory: Arc<dyn Memory>,
     pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
     pub(crate) observer: Arc<dyn Observer>,
     pub(crate) system_prompt: Arc<String>,
-    pub(crate) model: Arc<String>,
-    pub(crate) temperature: f64,
     pub(crate) auto_save_memory: bool,
     pub(crate) session_enabled: bool,
     pub(crate) session_history_limit: u32,
@@ -307,57 +305,92 @@ fn parse_agent_spec_policy(config_json: &str) -> AgentSpecPolicy {
         .unwrap_or_default()
 }
 
-/// Resolve effective provider, model, and temperature for a session (multi-agent turn resolution).
-pub(crate) fn resolve_effective_provider_model(
-    session_store: &SessionStore,
+/// Session (provider, model, temperature). Returns Some only when model_override is set and contains '/' (parsed to provider/model).
+fn get_session_model_temperature(
+    store: &SessionStore,
     session_id: &SessionId,
     config: &Config,
-) -> (String, String, f64) {
-    let default_provider = config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "openrouter".into());
-    let default_model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
-    let default_temperature = config.default_temperature;
-
-    let active_agent_id = decode_session_string_state(
-        session_store
-            .get_state_key(session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
-            .ok()
-            .flatten(),
-    );
-    let model_override = decode_session_string_state(
-        session_store
+) -> Option<(String, String, f64)> {
+    let raw = decode_session_string_state(
+        store
             .get_state_key(session_id, SessionStore::MODEL_OVERRIDE_KEY)
             .ok()
             .flatten(),
-    );
+    )?;
+    let s = raw.trim();
+    let (provider, model) = s.split_once('/').map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))?;
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider, model, config.default_temperature))
+}
 
-    let spec_defaults = active_agent_id
-        .and_then(|id| {
-            session_store
-                .get_agent_spec_by_id(&id)
-                .ok()
-                .flatten()
-                .or_else(|| session_store.get_agent_spec_by_name(&id).ok().flatten())
-        })
-        .map(|spec| parse_agent_spec_defaults(&spec.config_json));
+/// Agent (provider, model, temperature) from active AgentSpec defaults. Returns Some only when all three are set.
+fn get_agent_model_temperature(
+    store: &SessionStore,
+    session_id: &SessionId,
+) -> Option<(String, String, f64)> {
+    let active_agent_id = decode_session_string_state(
+        store
+            .get_state_key(session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
+            .ok()
+            .flatten(),
+    )?;
+    let spec = store
+        .get_agent_spec_by_id(&active_agent_id)
+        .ok()
+        .flatten()
+        .or_else(|| store.get_agent_spec_by_name(&active_agent_id).ok().flatten())?;
+    let d = parse_agent_spec_defaults(&spec.config_json);
+    let p = d.provider?;
+    let m = d.model?;
+    let t = d.temperature?;
+    Some((p, m, t))
+}
 
-    let effective_provider = spec_defaults
-        .as_ref()
-        .and_then(|d| d.provider.clone())
-        .unwrap_or_else(|| default_provider);
-    let effective_model = model_override
-        .or_else(|| spec_defaults.as_ref().and_then(|d| d.model.clone()))
-        .unwrap_or_else(|| default_model);
-    let effective_temperature = spec_defaults
-        .and_then(|d| d.temperature)
-        .unwrap_or(default_temperature);
+/// Config default (provider, model, temperature).
+fn get_config_model_temperature(config: &Config) -> (String, String, f64) {
+    let p = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("openrouter");
+    let m = config
+        .default_model
+        .as_deref()
+        .unwrap_or("anthropic/claude-sonnet-4");
+    (p.to_string(), m.to_string(), config.default_temperature)
+}
 
-    (effective_provider, effective_model, effective_temperature)
+/// Resolve provider + model + temperature for one turn: session → agent → config, then manager.get().
+/// Returns a single [ProviderCtx] so provider and model stay in sync.
+pub(crate) fn resolve_turn_provider_model_temperature(
+    ctx: &ChannelRuntimeContext,
+    active_session: Option<&SessionId>,
+) -> ProviderCtx {
+    let (provider_name, model, temp) = match (ctx.session_store.as_deref(), active_session) {
+        (Some(store), Some(sid)) => {
+            get_session_model_temperature(store, sid, &ctx.config)
+                .or_else(|| get_agent_model_temperature(store, sid))
+                .unwrap_or_else(|| get_config_model_temperature(&ctx.config))
+        }
+        _ => get_config_model_temperature(&ctx.config),
+    };
+
+    let full_model = format!("{}/{}", provider_name, model);
+
+    match ctx.provider_manager.get(&full_model, temp) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "ProviderManager.get({:?}, {}) failed: {e}; using default",
+                full_model,
+                temp
+            );
+            ctx.provider_manager
+                .default_resolved()
+                .unwrap_or_else(|_| panic!("default_resolved() failed after get() fallback"))
+        }
+    }
 }
 
 /// Resolve AgentSpec policy for a session (tools/skills allow-lists). Returns None if no active agent or no policy.
@@ -436,7 +469,7 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
     };
     let base_prompt = build_system_prompt(
         &ctx.config.workspace_dir,
-        ctx.model.as_str(),
+        ctx.provider_manager.default_full_model(),
         &tool_entries,
         &filtered_skills_vec,
         Some(&ctx.config.identity),
@@ -1259,20 +1292,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
-    let provider_name = config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "openrouter".into());
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        &provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-    )?);
-
-    // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
-    // so the first real message doesn't hit a cold-start timeout.
-    if let Err(e) = provider.warmup().await {
+    let manager = providers::ProviderManager::new(&config)?;
+    let default_resolved = manager.default_resolved().map_err(|e| anyhow::anyhow!("Default provider failed: {e}"))?;
+    let default_full_model = manager.default_full_model().to_string();
+    let provider_manager: Arc<dyn ProviderManagerTrait> = Arc::new(manager);
+    if let Err(e) = default_resolved.provider.warmup().await {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
@@ -1284,11 +1308,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
@@ -1336,7 +1355,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     let system_prompt = build_system_prompt(
         &workspace,
-        &model,
+        &default_full_model,
         &tool_prompt_entries,
         &skills,
         Some(&config.identity),
@@ -1468,7 +1487,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     println!("🦀 ZeroClaw Channel Server");
-    println!("  🤖 Model:    {model}");
+    println!("  🤖 Model:    {default_full_model}");
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
         config.memory.backend,
@@ -1524,13 +1543,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
-        provider: Arc::clone(&provider),
+        provider_manager: Arc::clone(&provider_manager),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
         system_prompt: Arc::new(system_prompt),
-        model: Arc::new(model.clone()),
-        temperature,
         auto_save_memory: config.memory.auto_save,
         session_enabled: config.session.enabled,
         session_history_limit: config.session.history_limit,
@@ -1558,7 +1575,7 @@ mod tests {
     use crate::config::Config;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatRequest, ChatResponse, Provider};
+    use crate::providers::{ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1744,6 +1761,41 @@ mod tests {
         }
     }
 
+    /// Test double: returns the same provider for any get() and for default_resolved().
+    struct TestProviderManager(Arc<dyn Provider>, String, f64);
+    impl ProviderManagerTrait for TestProviderManager {
+        fn get(
+            &self,
+            full_model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<ProviderCtx> {
+            let model = full_model
+                .split_once('/')
+                .map(|(_, m)| m.trim().to_string())
+                .unwrap_or_else(|| full_model.to_string());
+            Ok(ProviderCtx {
+                provider: Arc::clone(&self.0),
+                model,
+                temperature,
+            })
+        }
+        fn default_resolved(&self) -> anyhow::Result<ProviderCtx> {
+            let model = self
+                .1
+                .split_once('/')
+                .map(|(_, m)| m.trim().to_string())
+                .unwrap_or_else(|| self.1.clone());
+            Ok(ProviderCtx {
+                provider: Arc::clone(&self.0),
+                model,
+                temperature: self.2,
+            })
+        }
+        fn default_full_model(&self) -> &str {
+            &self.1
+        }
+    }
+
     fn session_test_message(content: &str, id: &str) -> traits::ChannelMessage {
         traits::ChannelMessage {
             id: id.to_string(),
@@ -1769,23 +1821,22 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let config = Config::default();
+        let manager = ProviderManager::new(&config).unwrap();
+        let provider_manager: Arc<dyn ProviderManagerTrait> = Arc::new(manager);
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(SlowProvider {
-                delay: Duration::from_millis(1),
-            }),
+            provider_manager,
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
-            config: Arc::new(Config::default()),
+            config: Arc::new(config),
             all_skills: Arc::new(vec![]),
         })
     }
@@ -2075,17 +2126,20 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let provider = Arc::new(SlowProvider {
+            delay: Duration::from_millis(1),
+        }) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(SlowProvider {
-                delay: Duration::from_millis(1),
-            }),
+            provider_manager: Arc::new(TestProviderManager(
+                provider,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: false,
             session_history_limit: 40,
@@ -2195,15 +2249,18 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let provider = Arc::new(ToolCallingProvider) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(ToolCallingProvider),
+            provider_manager: Arc::new(TestProviderManager(
+                provider,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: false,
             session_history_limit: 40,
@@ -2249,15 +2306,18 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let provider = Arc::new(ToolCallingAliasProvider) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(ToolCallingAliasProvider),
+            provider_manager: Arc::new(TestProviderManager(
+                provider,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: false,
             session_history_limit: 40,
@@ -2512,6 +2572,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let provider = Arc::new(HistoryCaptureProvider::default());
+        let provider_dyn = Arc::clone(&provider) as Arc<dyn Provider>;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -2519,13 +2580,15 @@ mod tests {
 
         let ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: provider.clone(),
+            provider_manager: Arc::new(TestProviderManager(
+                provider_dyn,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test".to_string()),
-            model: Arc::new("test".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: true,
             session_history_limit: 40,
@@ -2603,7 +2666,30 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
-        let ctx = session_runtime_ctx(session_store, channel.clone());
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel.clone());
+        let provider = Arc::new(SlowProvider {
+            delay: Duration::from_millis(1),
+        }) as Arc<dyn Provider>;
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider_manager: Arc::new(TestProviderManager(
+                provider,
+                "test/model".to_string(),
+                0.0,
+            )),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test".to_string()),
+            auto_save_memory: false,
+            session_enabled: true,
+            session_history_limit: 40,
+            session_store: Some(session_store),
+            session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
+        });
 
         let msg1 = traits::ChannelMessage {
             id: "u1".to_string(),
@@ -2666,7 +2752,7 @@ mod tests {
     async fn integration_steer_merge_combines_current_and_pending_messages() {
         let temp = TempDir::new().unwrap();
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let provider = Arc::new(SteerTestProvider::default());
+        let provider = Arc::new(SteerTestProvider::default()) as Arc<dyn Provider>;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -2674,13 +2760,15 @@ mod tests {
 
         let ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider,
+            provider_manager: Arc::new(TestProviderManager(
+                Arc::clone(&provider),
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test".to_string()),
-            model: Arc::new("test".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: true,
             session_history_limit: 40,
@@ -2756,6 +2844,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let memory = Arc::new(TrackingMemory::default());
         let provider = Arc::new(HistoryCaptureProvider::default());
+        let provider_dyn = Arc::clone(&provider) as Arc<dyn Provider>;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -2790,13 +2879,15 @@ mod tests {
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: provider.clone(),
+            provider_manager: Arc::new(TestProviderManager(
+                provider_dyn,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: memory.clone(),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: true,
             session_enabled: true,
             session_history_limit: 40,
@@ -2835,6 +2926,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let memory = Arc::new(TrackingMemory::default());
         let provider = Arc::new(HistoryCaptureProvider::default());
+        let provider_dyn = Arc::clone(&provider) as Arc<dyn Provider>;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -2894,13 +2986,15 @@ mod tests {
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: provider.clone(),
+            provider_manager: Arc::new(TestProviderManager(
+                provider_dyn,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: memory.clone(),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: true,
             session_enabled: true,
             session_history_limit: 40,
@@ -2937,7 +3031,7 @@ mod tests {
     async fn process_channel_message_session_mode_upserts_route_metadata() {
         let temp = TempDir::new().unwrap();
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let provider = Arc::new(HistoryCaptureProvider::default());
+        let provider = Arc::new(HistoryCaptureProvider::default()) as Arc<dyn Provider>;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -2946,13 +3040,15 @@ mod tests {
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider,
+            provider_manager: Arc::new(TestProviderManager(
+                Arc::clone(&provider),
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(TrackingMemory::default()),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: true,
             session_history_limit: 40,
@@ -3001,17 +3097,20 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let provider = Arc::new(SlowProvider {
+            delay: Duration::from_millis(250),
+        }) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(SlowProvider {
-                delay: Duration::from_millis(250),
-            }),
+            provider_manager: Arc::new(TestProviderManager(
+                provider,
+                "test/model".to_string(),
+                0.0,
+            )),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
             auto_save_memory: false,
             session_enabled: false,
             session_history_limit: 40,
