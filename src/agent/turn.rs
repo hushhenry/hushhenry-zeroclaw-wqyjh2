@@ -14,8 +14,7 @@ use crate::memory::MemoryCategory;
 use crate::providers::{self, ChatMessage};
 use crate::session::compaction::{
     build_merged_system_prompt, estimate_tokens, load_compaction_state, maybe_compact,
-    CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
-    SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+    resolve_keep_recent_messages, CompactionState, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::SessionId;
 use crate::util::truncate_with_ellipsis;
@@ -181,10 +180,7 @@ pub(crate) async fn run_turn_core(
             );
 
             if estimate_tokens(&history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
-                let keep_recent = usize::try_from(ctx.session_history_limit)
-                    .ok()
-                    .map(|limit| limit.clamp(1, SESSION_COMPACTION_KEEP_RECENT_MESSAGES))
-                    .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES);
+                let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
 
                 match maybe_compact(
                     &*session_store,

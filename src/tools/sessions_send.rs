@@ -135,8 +135,16 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_ref().unwrap_or(&String::new()).contains("dispatcher")
-                || result.error.as_ref().unwrap_or(&String::new()).contains("channel"),
+            result
+                .error
+                .as_ref()
+                .unwrap_or(&String::new())
+                .contains("dispatcher")
+                || result
+                    .error
+                    .as_ref()
+                    .unwrap_or(&String::new())
+                    .contains("channel"),
             "expected error about dispatcher/channel, got: {:?}",
             result.error
         );
@@ -155,6 +163,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Session not found"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Session not found"));
     }
 }

@@ -51,6 +51,13 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     char_count.div_ceil(4)
 }
 
+pub fn resolve_keep_recent_messages(session_history_limit: u32) -> usize {
+    usize::try_from(session_history_limit)
+        .ok()
+        .map(|limit| limit.clamp(1, SESSION_COMPACTION_KEEP_RECENT_MESSAGES))
+        .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES)
+}
+
 pub fn build_compaction_summary_message(summary: &str) -> ChatMessage {
     ChatMessage::assistant(format!("[Session Compaction Summary]\n{}", summary.trim()))
 }

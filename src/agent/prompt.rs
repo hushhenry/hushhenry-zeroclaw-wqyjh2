@@ -1,21 +1,20 @@
 use crate::config::IdentityConfig;
 use crate::identity;
 use crate::skills::Skill;
-use crate::tools::Tool;
 use anyhow::Result;
 use chrono::Local;
 use std::fmt::Write;
 use std::path::Path;
 
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+pub const DEFAULT_BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub model_name: &'a str,
-    pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
     pub identity_config: Option<&'a IdentityConfig>,
-    pub dispatcher_instructions: &'a str,
+    pub bootstrap_max_chars: Option<usize>,
+    pub include_channel_capabilities: bool,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -32,13 +31,14 @@ impl SystemPromptBuilder {
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
-                Box::new(IdentitySection),
-                Box::new(ToolsSection),
+                Box::new(TaskSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
+                Box::new(IdentitySection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(ChannelCapabilitiesSection),
             ],
         }
     }
@@ -63,12 +63,13 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
-pub struct ToolsSection;
+pub struct TaskSection;
 pub struct SafetySection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct ChannelCapabilitiesSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -79,57 +80,56 @@ impl PromptSection for IdentitySection {
         let mut prompt = String::from("## Project Context\n\n");
         if let Some(config) = ctx.identity_config {
             if identity::is_aieos_configured(config) {
-                if let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir) {
-                    let rendered = identity::aieos_to_system_prompt(&aieos);
-                    if !rendered.is_empty() {
-                        prompt.push_str(&rendered);
+                match identity::load_aieos_identity(config, ctx.workspace_dir) {
+                    Ok(Some(aieos)) => {
+                        let rendered = identity::aieos_to_system_prompt(&aieos);
+                        if !rendered.is_empty() {
+                            prompt.push_str(&rendered);
+                            return Ok(prompt);
+                        }
+                    }
+                    Ok(None) => {
+                        let max_chars = ctx
+                            .bootstrap_max_chars
+                            .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);
+                        load_openclaw_bootstrap_files(&mut prompt, ctx.workspace_dir, max_chars);
+                        return Ok(prompt);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
+                        );
+                        let max_chars = ctx
+                            .bootstrap_max_chars
+                            .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);
+                        load_openclaw_bootstrap_files(&mut prompt, ctx.workspace_dir, max_chars);
                         return Ok(prompt);
                     }
                 }
             }
         }
 
-        prompt.push_str(
-            "The following workspace files define your identity, behavior, and context.\n\n",
-        );
-        for file in [
-            "AGENTS.md",
-            "SOUL.md",
-            "TOOLS.md",
-            "IDENTITY.md",
-            "USER.md",
-            "HEARTBEAT.md",
-            "BOOTSTRAP.md",
-            "MEMORY.md",
-        ] {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
-        }
-
+        let max_chars = ctx
+            .bootstrap_max_chars
+            .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);
+        load_openclaw_bootstrap_files(&mut prompt, ctx.workspace_dir, max_chars);
         Ok(prompt)
     }
 }
 
-impl PromptSection for ToolsSection {
+impl PromptSection for TaskSection {
     fn name(&self) -> &str {
-        "tools"
+        "task"
     }
 
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut out = String::from("## Tools\n\n");
-        for tool in ctx.tools {
-            let _ = writeln!(
-                out,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
-        if !ctx.dispatcher_instructions.is_empty() {
-            out.push('\n');
-            out.push_str(ctx.dispatcher_instructions);
-        }
-        Ok(out)
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(
+            "## Your Task\n\n\
+         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+         Instead: use available tools directly when you need to act. Just do what they ask."
+                .into(),
+        )
     }
 }
 
@@ -139,7 +139,7 @@ impl PromptSection for SafetySection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm` (recoverable beats gone forever).\n- When in doubt, ask before acting externally.".into())
     }
 }
 
@@ -153,7 +153,11 @@ impl PromptSection for SkillsSection {
             return Ok(String::new());
         }
 
-        let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
+        let mut prompt = String::from("## Available Skills\n\n");
+        prompt.push_str(
+            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
+        );
+        prompt.push_str("<available_skills>\n");
         for skill in ctx.skills {
             let location = skill.location.clone().unwrap_or_else(|| {
                 ctx.workspace_dir
@@ -217,7 +221,55 @@ impl PromptSection for DateTimeSection {
     }
 }
 
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
+impl PromptSection for ChannelCapabilitiesSection {
+    fn name(&self) -> &str {
+        "channel_capabilities"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if !ctx.include_channel_capabilities {
+            return Ok(String::new());
+        }
+
+        Ok("## Channel Capabilities\n\n- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n- When someone messages you on Discord, your response is automatically sent back to Discord.\n- You do NOT need to ask permission to respond - just respond directly.\n- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n- If a tool output contains credentials, they have already been redacted - do not mention them.".into())
+    }
+}
+
+fn load_openclaw_bootstrap_files(
+    prompt: &mut String,
+    workspace_dir: &Path,
+    max_chars_per_file: usize,
+) {
+    prompt.push_str(
+        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below-do NOT suggest reading them with file_read.\n\n",
+    );
+
+    let bootstrap_files = [
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "HEARTBEAT.md",
+    ];
+
+    for filename in &bootstrap_files {
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+    }
+
+    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+    if bootstrap_path.exists() {
+        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
+    }
+
+    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+}
+
+fn inject_workspace_file(
+    prompt: &mut String,
+    workspace_dir: &Path,
+    filename: &str,
+    max_chars: usize,
+) {
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -226,22 +278,23 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
                 return;
             }
             let _ = writeln!(prompt, "### {filename}\n");
-            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
+            let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
                     .char_indices()
-                    .nth(BOOTSTRAP_MAX_CHARS)
+                    .nth(max_chars)
                     .map(|(idx, _)| &trimmed[..idx])
                     .unwrap_or(trimmed)
             } else {
                 trimmed
             };
-            prompt.push_str(truncated);
             if truncated.len() < trimmed.len() {
+                prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... truncated at {max_chars} chars - use `read` for full file]\n"
                 );
             } else {
+                prompt.push_str(trimmed);
                 prompt.push_str("\n\n");
             }
         }
@@ -254,51 +307,20 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::traits::Tool;
-    use async_trait::async_trait;
-
-    struct TestTool;
-
-    #[async_trait]
-    impl Tool for TestTool {
-        fn name(&self) -> &str {
-            "test_tool"
-        }
-
-        fn description(&self) -> &str {
-            "tool desc"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "ok".into(),
-                error: None,
-            })
-        }
-    }
 
     #[test]
     fn prompt_builder_assembles_sections() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
-            tools: &tools,
             skills: &[],
             identity_config: None,
-            dispatcher_instructions: "instr",
+            bootstrap_max_chars: None,
+            include_channel_capabilities: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
-        assert!(prompt.contains("## Tools"));
-        assert!(prompt.contains("test_tool"));
-        assert!(prompt.contains("instr"));
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("## Workspace"));
+        assert!(!prompt.contains("## Tools"));
     }
 }

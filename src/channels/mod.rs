@@ -30,9 +30,9 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::turn::{run_memory_turn, run_session_turn};
 use crate::config::Config;
-use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
@@ -41,7 +41,7 @@ use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::{
         build_compaction_summary_message, build_merged_system_prompt, maybe_compact,
-        CompactionState, SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+        resolve_keep_recent_messages, CompactionState,
     },
     SessionContext, SessionId, SessionKey, SessionMessage, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
@@ -55,12 +55,14 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+const BOOTSTRAP_MAX_CHARS: usize = crate::agent::prompt::DEFAULT_BOOTSTRAP_MAX_CHARS;
 const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
 const DEFAULT_QUEUE_MODE: &str = "steer-merge";
 const COMMAND_LIST_LIMIT: u32 = 20;
@@ -464,15 +466,15 @@ async fn handle_slash_command(
     msg: &traits::ChannelMessage,
     session_key: &SessionKey,
     command: SlashCommand,
-    merged_system_prompt: &str,
 ) -> bool {
     if !ctx.session_enabled {
-        send_command_response(
-            target_channel,
-            &msg.reply_target,
-            "Session commands require `session.enabled = true`.".to_string(),
-        )
-        .await;
+        let message = match &command {
+            SlashCommand::Compact => {
+                "`/compact` is only supported in session context. It is not available in memory context.".to_string()
+            }
+            _ => "Session commands require `session.enabled = true`.".to_string(),
+        };
+        send_command_response(target_channel, &msg.reply_target, message).await;
         return true;
     }
 
@@ -528,7 +530,7 @@ async fn handle_slash_command(
                     target_channel,
                     &msg.reply_target,
                     &session_id,
-                    merged_system_prompt,
+                    msg,
                 )
                 .await;
             }
@@ -928,19 +930,65 @@ async fn run_manual_session_compaction(
     target_channel: Option<&Arc<dyn Channel>>,
     reply_target: &str,
     session_id: &SessionId,
-    merged_system_prompt: &str,
+    msg: &traits::ChannelMessage,
 ) {
     let Some(session_store) = ctx.session_store.as_ref() else {
         return;
     };
+
+    let effective_system_prompt =
+        if let Some(policy) = resolve_agent_spec_policy(session_store, session_id) {
+            let allowed_tools = policy.tools;
+            let allowed_skills = policy.skills;
+            let tool_entries: Vec<(&str, &str)> = ctx
+                .tools_registry
+                .iter()
+                .filter(|tool| match allowed_tools.as_ref() {
+                    Some(allow) => allow.iter().any(|name| name == tool.name()),
+                    None => true,
+                })
+                .map(|tool| (tool.name(), tool.description()))
+                .collect();
+            let filtered_skills_vec: Vec<crate::skills::Skill> =
+                if let Some(ref allow) = allowed_skills {
+                    ctx.all_skills
+                        .iter()
+                        .filter(|skill| allow.iter().any(|name| name == &skill.name))
+                        .cloned()
+                        .collect()
+                } else {
+                    ctx.all_skills.to_vec()
+                };
+            let bootstrap_max_chars = if ctx.config.agent.compact_context {
+                Some(6000)
+            } else {
+                None
+            };
+            let base_prompt = build_system_prompt(
+                &ctx.config.workspace_dir,
+                ctx.model.as_str(),
+                &tool_entries,
+                &filtered_skills_vec,
+                Some(&ctx.config.identity),
+                bootstrap_max_chars,
+            );
+            build_merged_system_prompt(&base_prompt, channel_delivery_instructions(&msg.channel))
+        } else {
+            build_merged_system_prompt(
+                ctx.system_prompt.as_str(),
+                channel_delivery_instructions(&msg.channel),
+            )
+        };
+
+    let keep_recent = resolve_keep_recent_messages(ctx.session_history_limit);
 
     match maybe_compact(
         session_store.as_ref(),
         session_id,
         ctx.provider.as_ref(),
         ctx.model.as_str(),
-        merged_system_prompt,
-        SESSION_COMPACTION_KEEP_RECENT_MESSAGES,
+        &effective_system_prompt,
+        keep_recent,
     )
     .await
     {
@@ -1162,24 +1210,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     );
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
-    let merged_system_prompt = build_merged_system_prompt(
-        ctx.system_prompt.as_str(),
-        channel_delivery_instructions(&msg.channel),
-    );
     let parsed_command = parse_slash_command(&msg.content);
     let session_context = normalize_session_context(&msg);
     let session_key = ctx.session_resolver.resolve(&session_context);
 
     if let Some(command) = parsed_command {
-        let handled = handle_slash_command(
-            &ctx,
-            target_channel.as_ref(),
-            &msg,
-            &session_key,
-            command,
-            &merged_system_prompt,
-        )
-        .await;
+        let handled =
+            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &session_key, command).await;
         if handled {
             return;
         }
@@ -1364,39 +1401,6 @@ async fn run_message_dispatch_loop(
     }
 }
 
-/// Load OpenClaw format bootstrap files into the prompt.
-fn load_openclaw_bootstrap_files(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    max_chars_per_file: usize,
-) {
-    prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
-    );
-
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
-    }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
-}
-
 /// Load workspace identity files and build a system prompt.
 ///
 /// Follows the `OpenClaw` framework structure by default:
@@ -1413,221 +1417,35 @@ fn load_openclaw_bootstrap_files(
 ///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
 /// on-demand via `memory_recall` / `memory_search` tools.
-pub fn build_system_prompt(
+pub(crate) fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
-    tools: &[(&str, &str)],
+    _tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
 ) -> String {
-    use std::fmt::Write;
-    let mut prompt = String::with_capacity(8192);
+    let context = PromptContext {
+        workspace_dir,
+        model_name,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        include_channel_capabilities: true,
+    };
 
-    // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
-        prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
-        }
-        prompt.push_str("\n## Tool Use Protocol\n\n");
-        prompt.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-        prompt.push_str("You may use multiple tool calls in a single response. ");
-        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
-        prompt
-            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-    }
-
-    // ── 1b. Hardware (when gpio/arduino tools present) ───────────
-    let has_hardware = tools.iter().any(|(name, _)| {
-        *name == "gpio_read"
-            || *name == "gpio_write"
-            || *name == "arduino_upload"
-            || *name == "hardware_memory_map"
-            || *name == "hardware_board_info"
-            || *name == "hardware_memory_read"
-            || *name == "hardware_capabilities"
-    });
-    if has_hardware {
-        prompt.push_str(
-            "## Hardware Access\n\n\
-             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
-             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
-             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
-             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
-             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n",
-        );
-    }
-
-    // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    prompt.push_str(
-        "## Your Task\n\n\
-         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
-    );
-
-    // ── 2. Safety ───────────────────────────────────────────────
-    prompt.push_str("## Safety\n\n");
-    prompt.push_str(
-        "- Do not exfiltrate private data.\n\
-         - Do not run destructive commands without asking.\n\
-         - Do not bypass oversight or approval mechanisms.\n\
-         - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
-         - When in doubt, ask before acting externally.\n\n",
-    );
-
-    // ── 3. Skills (compact list — load on-demand) ───────────────
-    if !skills.is_empty() {
-        prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
-        );
-        prompt.push_str("<available_skills>\n");
-        for skill in skills {
-            let _ = writeln!(prompt, "  <skill>");
-            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
-            let _ = writeln!(
-                prompt,
-                "    <description>{}</description>",
-                skill.description
-            );
-            let location = skill.location.clone().unwrap_or_else(|| {
-                workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
-            let _ = writeln!(prompt, "  </skill>");
-        }
-        prompt.push_str("</available_skills>\n\n");
-    }
-
-    // ── 4. Workspace ────────────────────────────────────────────
-    let _ = writeln!(
-        prompt,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        workspace_dir.display()
-    );
-
-    // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
-
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
-                    }
-                }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-            }
-        } else {
-            // OpenClaw format
-            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-        }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-    }
-
-    // ── 6. Date & Time ──────────────────────────────────────────
-    let now = chrono::Local::now();
-    let tz = now.format("%Z").to_string();
-    let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
-
-    // ── 7. Runtime ──────────────────────────────────────────────
-    let host =
-        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
-
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str(
-        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
-    );
-    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
-
-    if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
-    } else {
-        prompt
-    }
-}
-
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
-fn inject_workspace_file(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    filename: &str,
-    max_chars: usize,
-) {
-    use std::fmt::Write;
-
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            // Use character-boundary-safe truncation for UTF-8
-            let truncated = if trimmed.chars().count() > max_chars {
-                trimmed
-                    .char_indices()
-                    .nth(max_chars)
-                    .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
+    SystemPromptBuilder::with_defaults()
+        .build(&context)
+        .map(|prompt| {
+            if prompt.trim().is_empty() {
+                "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
             } else {
-                trimmed
-            };
-            if truncated.len() < trimmed.len() {
-                prompt.push_str(truncated);
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str(trimmed);
-                prompt.push_str("\n\n");
+                prompt
             }
-        }
-        Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
-        }
-    }
+        })
+        .unwrap_or_else(|_| {
+            "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
+        })
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -2319,7 +2137,6 @@ mod tests {
             "# Agents\nFollow instructions.",
         )
         .unwrap();
-        std::fs::write(tmp.path().join("TOOLS.md"), "# Tools\nUse shell carefully.").unwrap();
         std::fs::write(
             tmp.path().join("HEARTBEAT.md"),
             "# Heartbeat\nCheck status.",
@@ -2859,6 +2676,44 @@ mod tests {
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("No compaction needed"));
+    }
+
+    #[tokio::test]
+    async fn command_compact_in_memory_context_returns_unsupported_message() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(1),
+            }),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            session_enabled: false,
+            session_history_limit: 40,
+            session_store: None,
+            session_resolver: SessionResolver::new(),
+            config: Arc::new(Config::default()),
+            all_skills: Arc::new(vec![]),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            session_test_message("/compact", "cmd-compact-mem"),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("only supported in session context"));
     }
 
     #[tokio::test]
@@ -3830,11 +3685,9 @@ mod tests {
     #[test]
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
-        let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "test-model", &[], &[], None, None);
 
         // Section headers
-        assert!(prompt.contains("## Tools"), "missing Tools section");
         assert!(prompt.contains("## Safety"), "missing Safety section");
         assert!(prompt.contains("## Workspace"), "missing Workspace section");
         assert!(
@@ -3849,7 +3702,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_injects_tools() {
+    fn prompt_omits_tools_section() {
         let ws = make_workspace();
         let tools = vec![
             ("shell", "Run commands"),
@@ -3857,9 +3710,8 @@ mod tests {
         ];
         let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
-        assert!(prompt.contains("**shell**"));
-        assert!(prompt.contains("Run commands"));
-        assert!(prompt.contains("**memory_recall**"));
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
     }
 
     #[test]
@@ -3886,7 +3738,6 @@ mod tests {
         );
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
-        assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
         assert!(prompt.contains("### HEARTBEAT.md"), "missing HEARTBEAT.md");
         assert!(prompt.contains("### MEMORY.md"), "missing MEMORY.md");
         assert!(prompt.contains("User likes Rust"), "missing MEMORY content");
@@ -4008,13 +3859,13 @@ mod tests {
     #[test]
     fn prompt_empty_files_skipped() {
         let ws = make_workspace();
-        std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
+        std::fs::write(ws.path().join("HEARTBEAT.md"), "").unwrap();
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Empty file should not produce a header
         assert!(
-            !prompt.contains("### TOOLS.md"),
+            !prompt.contains("### HEARTBEAT.md"),
             "empty files should be skipped"
         );
     }
