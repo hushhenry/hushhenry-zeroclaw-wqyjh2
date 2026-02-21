@@ -4,8 +4,8 @@
 //! - Native function calling (tool declarations + function_call / function_response in parts)
 
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest,
-    ChatResponse as ProviderChatResponse, Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -354,9 +354,9 @@ impl GeminiProvider {
             if msg.role == "assistant" {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
                     if let Some(tool_calls_value) = value.get("tool_calls") {
-                        if let Ok(parsed_calls) =
-                            serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
-                        {
+                        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ProviderToolCall>>(
+                            tool_calls_value.clone(),
+                        ) {
                             let mut parts = Vec::new();
                             if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                                 if !content.is_empty() {
@@ -539,10 +539,7 @@ impl Provider for GeminiProvider {
             Some(text_buf)
         };
 
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-        })
+        Ok(ProviderChatResponse { text, tool_calls })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -802,7 +799,12 @@ mod tests {
         assert_eq!(parts[0].text.as_deref(), Some("I'll check."));
         let fc = parts[1].function_call.as_ref().unwrap();
         assert_eq!(fc.name, "shell");
-        assert_eq!(fc.args.as_ref().and_then(|a| a.get("command").and_then(|v| v.as_str())), Some("date"));
+        assert_eq!(
+            fc.args
+                .as_ref()
+                .and_then(|a| a.get("command").and_then(|v| v.as_str())),
+            Some("date")
+        );
     }
 
     #[test]
@@ -848,7 +850,10 @@ mod tests {
         assert_eq!(contents[1].role.as_deref(), Some("user"));
         let fr = contents[1].parts[0].function_response.as_ref().unwrap();
         assert_eq!(fr.name, "file_read");
-        assert_eq!(fr.response.get("result").and_then(|v| v.as_str()), Some("file body"));
+        assert_eq!(
+            fr.response.get("result").and_then(|v| v.as_str()),
+            Some("file body")
+        );
     }
 
     #[test]

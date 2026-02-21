@@ -1,7 +1,7 @@
 use crate::providers::prompt_guided;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest,
-    ChatResponse as ProviderChatResponse, Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -423,8 +423,10 @@ impl Provider for OllamaProvider {
                 (Self::convert_messages(request.messages), None)
             } else {
                 let instructions = prompt_guided::build_tool_instructions(specs);
-                let pg =
-                    prompt_guided::convert_messages_to_prompt_guided(request.messages, &instructions);
+                let pg = prompt_guided::convert_messages_to_prompt_guided(
+                    request.messages,
+                    &instructions,
+                );
                 let messages: Vec<Message> = pg
                     .into_iter()
                     .map(|m| Message {
@@ -687,11 +689,18 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
         assert_eq!(converted[0].content, "");
-        let calls = converted[0].tool_calls.as_ref().expect("tool_calls expected");
+        let calls = converted[0]
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls expected");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "shell");
         assert_eq!(
-            calls[0].function.arguments.get("command").and_then(|v| v.as_str()),
+            calls[0]
+                .function
+                .arguments
+                .get("command")
+                .and_then(|v| v.as_str()),
             Some("ls")
         );
     }
@@ -724,6 +733,9 @@ mod tests {
     fn capabilities_prompt_guided_tools_only() {
         let provider = OllamaProvider::new(None, None);
         let caps = provider.capabilities();
-        assert!(!caps.native_tool_calling, "Ollama uses prompt-guided tool use, not native API tool_calls");
+        assert!(
+            !caps.native_tool_calling,
+            "Ollama uses prompt-guided tool use, not native API tool_calls"
+        );
     }
 }

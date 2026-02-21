@@ -5,13 +5,13 @@ pub mod gemini;
 pub mod group;
 pub mod ollama;
 pub mod openai;
-pub mod prompt_guided;
 pub mod openrouter;
+pub mod prompt_guided;
 pub mod provider_manager;
 pub mod reliable;
 pub mod traits;
 
-pub use provider_manager::{ProviderManager, ProviderManagerTrait, ProviderCtx};
+pub use provider_manager::{ProviderCtx, ProviderManager, ProviderManagerTrait};
 
 #[allow(unused_imports)]
 pub use traits::{

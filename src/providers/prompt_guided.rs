@@ -24,9 +24,7 @@ pub fn build_tool_instructions(specs: &[ToolSpec]) -> String {
         let _ = writeln!(
             instructions,
             "- **{}**: {}\n  Parameters: `{}`",
-            spec.name,
-            spec.description,
-            parameters
+            spec.name, spec.description, parameters
         );
     }
     instructions
@@ -250,10 +248,7 @@ mod tests {
 
     #[test]
     fn convert_messages_to_prompt_guided_injects_instructions_into_first_user() {
-        let messages = vec![
-            ChatMessage::user("hello"),
-            ChatMessage::assistant("hi"),
-        ];
+        let messages = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
         let out = convert_messages_to_prompt_guided(&messages, "## Instructions\nUse tools.");
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].role, "user");

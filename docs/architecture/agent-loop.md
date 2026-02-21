@@ -8,7 +8,7 @@ The agent operates in an iterative loop (capped at `MAX_TOOL_ITERATIONS = 10` by
 1.  **Context Construction**: The system prompt, session history (including compaction summary), and recent user/backlog messages are assembled into a conversation history.
 2.  **LLM Request**: The history and tool specifications are sent to the configured LLM provider.
 3.  **Response Parsing**: The LLM's response is checked for **Tool Calls** (either XML-style `<tool_call>` tags or provider-native JSON).
-4.  **Tool Execution**: If tool calls are found, they are executed (optionally requiring user approval).
+4.  **Tool Execution**: If tool calls are found, they are executed.
 5.  **History Enrichment**: Tool results are appended to the history, and the loop continues until the LLM produces a final text-only response or hits the iteration cap.
 
 ## 2. Tool Use Protocol

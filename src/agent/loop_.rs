@@ -1,4 +1,3 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::observability::{Observer, ObserverEvent};
 use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
 use crate::tools::{self, Tool};
@@ -180,7 +179,6 @@ pub(crate) async fn run_tool_call_loop(
     observer: &dyn Observer,
     provider_name: &str,
     silent: bool,
-    approval: Option<&ApprovalManager>,
     channel_name: &str,
     source_session_id: Option<&str>,
     #[allow(clippy::type_complexity)] mut steer_at_checkpoint: Option<
@@ -252,34 +250,10 @@ pub(crate) async fn run_tool_call_loop(
             let _ = std::io::stdout().flush();
         }
 
-        let mut execution_results: Vec<ToolExecutionResult> =
-            Vec::with_capacity(tool_calls.len());
+        let mut execution_results: Vec<ToolExecutionResult> = Vec::with_capacity(tool_calls.len());
         for call in &tool_calls {
             let arguments_value = serde_json::from_str(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-            if let Some(mgr) = approval {
-                if mgr.needs_approval(&call.name) {
-                    let request = ApprovalRequest {
-                        tool_name: call.name.clone(),
-                        arguments: arguments_value.clone(),
-                    };
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
-                    } else {
-                        ApprovalResponse::Yes
-                    };
-                    mgr.record_decision(&call.name, &arguments_value, decision, channel_name);
-                    if decision == ApprovalResponse::No {
-                        execution_results.push(ToolExecutionResult {
-                            name: call.name.clone(),
-                            output: "Denied by user.".to_string(),
-                            success: false,
-                            tool_call_id: Some(call.id.clone()),
-                        });
-                        continue;
-                    }
-                }
-            }
 
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
@@ -383,7 +357,6 @@ pub(crate) async fn run_one_turn_for_test(
         observer,
         "test",
         true,
-        None,
         "test",
         None,
         None,

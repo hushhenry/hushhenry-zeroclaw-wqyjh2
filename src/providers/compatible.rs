@@ -599,8 +599,7 @@ impl OpenAiCompatibleProvider {
                 let name = function.name?;
                 let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
                 Some(ProviderToolCall {
-                    id: tc.id
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments,
                 })

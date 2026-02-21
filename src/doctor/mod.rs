@@ -199,10 +199,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     // Provider groups validation
     for group in &config.provider_groups {
         if group.name.trim().is_empty() {
-            items.push(DiagItem::warn(
-                cat,
-                "provider group with empty name",
-            ));
+            items.push(DiagItem::warn(cat, "provider group with empty name"));
         }
         if group.members.is_empty() {
             items.push(DiagItem::warn(

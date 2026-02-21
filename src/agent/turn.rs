@@ -87,7 +87,11 @@ pub(crate) async fn run_turn_core(
     let started_at = Instant::now();
 
     let (effective_system_prompt, tool_allow_list) =
-        resolve_effective_system_prompt_and_tool_allow_list(ctx.as_ref(), active_session, &delivery_channel_name);
+        resolve_effective_system_prompt_and_tool_allow_list(
+            ctx.as_ref(),
+            active_session,
+            &delivery_channel_name,
+        );
 
     let mut history: Vec<ChatMessage>;
 
@@ -183,8 +187,7 @@ pub(crate) async fn run_turn_core(
         ];
     }
 
-    let resolved =
-        resolve_turn_provider_model_temperature(ctx.as_ref(), active_session);
+    let resolved = resolve_turn_provider_model_temperature(ctx.as_ref(), active_session);
 
     let llm_result = timeout_future(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -196,7 +199,6 @@ pub(crate) async fn run_turn_core(
             ctx.observer.as_ref(),
             "channel-runtime",
             true,
-            None,
             delivery_channel_name.as_str(),
             active_session.map(SessionId::as_str),
             steer_at_checkpoint,

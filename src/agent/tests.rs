@@ -22,15 +22,15 @@
 //!  18. Idempotent system prompt insertion
 
 use crate::agent::loop_;
-use crate::providers::ProviderCtx;
 use crate::config::MemoryConfig;
 use crate::memory::{self, Memory};
 use crate::observability::{NoopObserver, Observer};
+use crate::providers::traits::ProviderCapabilities;
+use crate::providers::ProviderCtx;
 use crate::providers::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
     ToolResultMessage,
 };
-use crate::providers::traits::ProviderCapabilities;
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -302,7 +302,9 @@ fn text_response(text: &str) -> ChatResponse {
 async fn turn_returns_text_when_no_tools_called() {
     let provider = Arc::new(ScriptedProvider::new(vec![text_response("Hello world")]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools)
+        .await
+        .unwrap();
     assert_eq!(response, "Hello world");
 }
 
@@ -409,9 +411,7 @@ async fn turn_handles_unknown_tool_gracefully() {
         .await
         .unwrap();
     assert_eq!(response, "I couldn't find that tool");
-    let has_tool_result = history
-        .iter()
-        .any(|m| m.content.contains("Unknown tool"));
+    let has_tool_result = history.iter().any(|m| m.content.contains("Unknown tool"));
     assert!(
         has_tool_result,
         "Expected tool result with 'Unknown tool' message (user or tool role)"
@@ -488,7 +488,9 @@ async fn turn_handles_empty_text_response() {
         tool_calls: vec![],
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools)
+        .await
+        .unwrap();
     assert!(response.is_empty());
 }
 
@@ -499,7 +501,9 @@ async fn turn_handles_none_text_response() {
         tool_calls: vec![],
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools)
+        .await
+        .unwrap();
     assert!(response.is_empty());
 }
 
@@ -561,7 +565,9 @@ async fn turn_handles_multiple_tools_in_one_response() {
     ]));
 
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(counting_tool)];
-    let (response, _) = run_turn(&provider_ctx(provider), "batch", &tools).await.unwrap();
+    let (response, _) = run_turn(&provider_ctx(provider), "batch", &tools)
+        .await
+        .unwrap();
     assert_eq!(response, "All 3 done");
     assert_eq!(
         *count.lock().unwrap(),
@@ -578,7 +584,9 @@ async fn turn_handles_multiple_tools_in_one_response() {
 async fn system_prompt_injected_on_first_turn() {
     let provider = Arc::new(ScriptedProvider::new(vec![text_response("ok")]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
+    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools)
+        .await
+        .unwrap();
     assert!(!history.is_empty(), "History should contain entries");
     assert_eq!(
         history[0].role, "system",
@@ -591,7 +599,9 @@ async fn system_prompt_not_duplicated_on_second_turn() {
     // run_one_turn_for_test does a single turn; system appears once in that history.
     let provider = Arc::new(ScriptedProvider::new(vec![text_response("only turn")]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools).await.unwrap();
+    let (_, history) = run_turn(&provider_ctx(provider), "hi", &tools)
+        .await
+        .unwrap();
     let system_count = history.iter().filter(|m| m.role == "system").count();
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
 }
@@ -611,7 +621,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
         text_response("final answer"),
     ]));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let (response, history) = run_turn(&provider_ctx(provider), "test", &tools).await.unwrap();
+    let (response, history) = run_turn(&provider_ctx(provider), "test", &tools)
+        .await
+        .unwrap();
     assert_eq!(response, "final answer");
     assert!(
         history.len() >= 5,
@@ -645,7 +657,9 @@ async fn multi_turn_maintains_growing_history() {
     // run_turn is single-turn; verify one turn returns expected response.
     let provider = Arc::new(ScriptedProvider::new(vec![text_response("response 1")]));
     let tools: Vec<Box<dyn Tool>> = vec![];
-    let (r1, history) = run_turn(&provider_ctx(provider), "msg 1", &tools).await.unwrap();
+    let (r1, history) = run_turn(&provider_ctx(provider), "msg 1", &tools)
+        .await
+        .unwrap();
     assert_eq!(r1, "response 1");
     assert!(
         history.len() >= 2,

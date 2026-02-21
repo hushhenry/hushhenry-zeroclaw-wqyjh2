@@ -36,13 +36,11 @@ use crate::agent::turn::{run_memory_turn, run_session_turn};
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, Provider, ProviderManagerTrait, ProviderCtx};
+use crate::providers::{self, ChatMessage, Provider, ProviderCtx, ProviderManagerTrait};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
-    compaction::{
-        build_compaction_summary_message, build_merged_system_prompt, CompactionState,
-    },
+    compaction::{build_compaction_summary_message, build_merged_system_prompt, CompactionState},
     SessionContext, SessionId, SessionMessage, SessionMessageRole, SessionResolver,
     SessionRouteMetadata, SessionStore,
 };
@@ -318,7 +316,9 @@ fn get_session_model_temperature(
             .flatten(),
     )?;
     let s = raw.trim();
-    let (provider, model) = s.split_once('/').map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))?;
+    let (provider, model) = s
+        .split_once('/')
+        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))?;
     if provider.is_empty() || model.is_empty() {
         return None;
     }
@@ -340,7 +340,12 @@ fn get_agent_model_temperature(
         .get_agent_spec_by_id(&active_agent_id)
         .ok()
         .flatten()
-        .or_else(|| store.get_agent_spec_by_name(&active_agent_id).ok().flatten())?;
+        .or_else(|| {
+            store
+                .get_agent_spec_by_name(&active_agent_id)
+                .ok()
+                .flatten()
+        })?;
     let d = parse_agent_spec_defaults(&spec.config_json);
     let p = d.provider?;
     let m = d.model?;
@@ -350,10 +355,7 @@ fn get_agent_model_temperature(
 
 /// Config default (provider, model, temperature).
 fn get_config_model_temperature(config: &Config) -> (String, String, f64) {
-    let p = config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter");
+    let p = config.default_provider.as_deref().unwrap_or("openrouter");
     let m = config
         .default_model
         .as_deref()
@@ -368,11 +370,9 @@ pub(crate) fn resolve_turn_provider_model_temperature(
     active_session: Option<&SessionId>,
 ) -> ProviderCtx {
     let (provider_name, model, temp) = match (ctx.session_store.as_deref(), active_session) {
-        (Some(store), Some(sid)) => {
-            get_session_model_temperature(store, sid, &ctx.config)
-                .or_else(|| get_agent_model_temperature(store, sid))
-                .unwrap_or_else(|| get_config_model_temperature(&ctx.config))
-        }
+        (Some(store), Some(sid)) => get_session_model_temperature(store, sid, &ctx.config)
+            .or_else(|| get_agent_model_temperature(store, sid))
+            .unwrap_or_else(|| get_config_model_temperature(&ctx.config)),
         _ => get_config_model_temperature(&ctx.config),
     };
 
@@ -452,16 +452,15 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
         })
         .map(|tool| (tool.name(), tool.description()))
         .collect();
-    let filtered_skills_vec: Vec<crate::skills::Skill> =
-        if let Some(ref allow) = allowed_skills {
-            ctx.all_skills
-                .iter()
-                .filter(|skill| allow.iter().any(|name| name == &skill.name))
-                .cloned()
-                .collect()
-        } else {
-            ctx.all_skills.to_vec()
-        };
+    let filtered_skills_vec: Vec<crate::skills::Skill> = if let Some(ref allow) = allowed_skills {
+        ctx.all_skills
+            .iter()
+            .filter(|skill| allow.iter().any(|name| name == &skill.name))
+            .cloned()
+            .collect()
+    } else {
+        ctx.all_skills.to_vec()
+    };
     let bootstrap_max_chars = if ctx.config.agent.compact_context {
         Some(6000)
     } else {
@@ -475,10 +474,8 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
         Some(&ctx.config.identity),
         bootstrap_max_chars,
     );
-    let merged = build_merged_system_prompt(
-        &base_prompt,
-        channel_delivery_instructions(channel_name),
-    );
+    let merged =
+        build_merged_system_prompt(&base_prompt, channel_delivery_instructions(channel_name));
     (merged, allowed_tools)
 }
 
@@ -687,8 +684,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     if let Some(command) = parsed_command {
         let handled =
-            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &session_key, command)
-                .await;
+            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &session_key, command).await;
         if handled {
             return;
         }
@@ -1293,7 +1289,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let manager = providers::ProviderManager::new(&config)?;
-    let default_resolved = manager.default_resolved().map_err(|e| anyhow::anyhow!("Default provider failed: {e}"))?;
+    let default_resolved = manager
+        .default_resolved()
+        .map_err(|e| anyhow::anyhow!("Default provider failed: {e}"))?;
     let default_full_model = manager.default_full_model().to_string();
     let provider_manager: Arc<dyn ProviderManagerTrait> = Arc::new(manager);
     if let Err(e) = default_resolved.provider.warmup().await {
@@ -1576,7 +1574,9 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
-    use crate::providers::{ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait, ToolCall};
+    use crate::providers::{
+        ChatRequest, ChatResponse, Provider, ProviderManager, ProviderManagerTrait, ToolCall,
+    };
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1672,13 +1672,12 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
-            let has_tool_results = request
-                .messages
-                .iter()
-                .any(|msg| msg.role == "tool");
+            let has_tool_results = request.messages.iter().any(|msg| msg.role == "tool");
             if has_tool_results {
                 Ok(ChatResponse {
-                    text: Some("BTC is currently around $65,000 based on latest tool output.".to_string()),
+                    text: Some(
+                        "BTC is currently around $65,000 based on latest tool output.".to_string(),
+                    ),
                     tool_calls: vec![],
                 })
             } else {
@@ -1710,10 +1709,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
-            let has_tool_results = request
-                .messages
-                .iter()
-                .any(|msg| msg.role == "tool");
+            let has_tool_results = request.messages.iter().any(|msg| msg.role == "tool");
             if has_tool_results {
                 Ok(ChatResponse {
                     text: Some("BTC alias-tag flow resolved to final text output.".to_string()),
@@ -1775,11 +1771,7 @@ mod tests {
     /// Test double: returns the same provider for any get() and for default_resolved().
     struct TestProviderManager(Arc<dyn Provider>, String, f64);
     impl ProviderManagerTrait for TestProviderManager {
-        fn get(
-            &self,
-            full_model: &str,
-            temperature: f64,
-        ) -> anyhow::Result<ProviderCtx> {
+        fn get(&self, full_model: &str, temperature: f64) -> anyhow::Result<ProviderCtx> {
             let model = full_model
                 .split_once('/')
                 .map(|(_, m)| m.trim().to_string())

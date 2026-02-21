@@ -6,13 +6,13 @@
 //! `get()` and `default_resolved()` return a [ProviderCtx]: one object carrying provider,
 //! model (for API), and temperature so callers never hold provider and model separately.
 
+use super::create_resilient_provider;
 use super::group::{GroupProvider, GroupStrategy};
 use super::traits::{ChatRequest, ChatResponse, Provider, ProviderCapabilities};
-use super::create_resilient_provider;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 /// A provider bound to a specific model and temperature. Use this for all chat/compaction calls
 /// so provider and model stay in sync.
@@ -108,10 +108,7 @@ impl ProviderManager {
 
     /// Build the manager from config. Creates and caches the default provider.
     pub fn new(config: &crate::config::Config) -> anyhow::Result<Self> {
-        let default_provider_name = config
-            .default_provider
-            .as_deref()
-            .unwrap_or("openrouter");
+        let default_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
         let default_model = config
             .default_model
             .as_deref()

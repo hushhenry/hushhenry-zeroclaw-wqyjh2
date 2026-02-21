@@ -91,9 +91,7 @@ impl Provider for GroupProvider {
             }
             GroupStrategy::RoundRobin | GroupStrategy::Random => {
                 let idx = self.select_index();
-                self.members[idx]
-                    .chat(request, model, temperature)
-                    .await
+                self.members[idx].chat(request, model, temperature).await
             }
         }
     }
@@ -158,10 +156,8 @@ mod tests {
 
     #[tokio::test]
     async fn group_fallback_uses_second_on_first_failure() {
-        let members: Vec<Arc<dyn Provider>> = vec![
-            Arc::new(FailingProvider),
-            Arc::new(EchoProvider),
-        ];
+        let members: Vec<Arc<dyn Provider>> =
+            vec![Arc::new(FailingProvider), Arc::new(EchoProvider)];
         let group = GroupProvider::new(members, GroupStrategy::Fallback);
         let req = super::super::traits::ChatRequest {
             messages: &[ChatMessage::user("hi")],
@@ -173,10 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_round_robin_rotates() {
-        let members: Vec<Arc<dyn Provider>> = vec![
-            Arc::new(EchoProvider),
-            Arc::new(EchoProvider),
-        ];
+        let members: Vec<Arc<dyn Provider>> = vec![Arc::new(EchoProvider), Arc::new(EchoProvider)];
         let group = GroupProvider::new(members, GroupStrategy::RoundRobin);
         let req = super::super::traits::ChatRequest {
             messages: &[ChatMessage::user("a")],
