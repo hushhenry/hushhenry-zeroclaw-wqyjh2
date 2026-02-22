@@ -44,6 +44,8 @@ pub struct SendMessage {
     pub content: String,
     pub recipient: String,
     pub subject: Option<String>,
+    /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
+    pub thread_ts: Option<String>,
 }
 
 impl SendMessage {
@@ -53,6 +55,7 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: None,
+            thread_ts: None,
         }
     }
 
@@ -66,6 +69,7 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: Some(subject.into()),
+            thread_ts: None,
         }
     }
 }

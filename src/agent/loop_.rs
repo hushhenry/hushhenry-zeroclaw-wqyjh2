@@ -113,7 +113,7 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
-pub(crate) fn maybe_bind_source_session_id(
+pub(crate) fn bind_custom_tool_args(
     tool_name: &str,
     arguments: serde_json::Value,
     source_session_id: Option<&str>,
@@ -122,12 +122,22 @@ pub(crate) fn maybe_bind_source_session_id(
         return arguments;
     };
 
-    let field_name = match tool_name {
-        "cron_add" | "cron_update" | "schedule" => "source_session_id",
-        "shell" => "session_id",
-        "subagent_send" => "parent_session_id",
+    let (field_name, inject) = match tool_name {
+        "cron_add" | "cron_update" | "schedule" => ("source_session_id", true),
+        "shell" => ("session_id", true),
+        "subagent" => {
+            let only_spawn = arguments
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim() == "spawn")
+                .unwrap_or(false);
+            ("parent_session_id", only_spawn)
+        }
         _ => return arguments,
     };
+    if !inject {
+        return arguments;
+    }
 
     match arguments {
         serde_json::Value::Object(mut obj) => {
@@ -240,7 +250,7 @@ pub(crate) async fn run_one_turn_for_test(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let tool_args = maybe_bind_source_session_id(&call.name, arguments_value, None);
+            let tool_args = bind_custom_tool_args(&call.name, arguments_value, None);
             let (output, success) = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(tool_args).await {
                     Ok(r) => {
@@ -312,9 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn maybe_bind_source_session_id_injects_parent_session_id_for_subagent_send() {
-        let args = serde_json::json!({"prompt": "task"});
-        let out = maybe_bind_source_session_id("subagent_send", args, Some("session-123"));
+    fn bind_custom_tool_args_injects_parent_session_id_for_subagent_spawn() {
+        let args = serde_json::json!({"action": "spawn"});
+        let out = bind_custom_tool_args("subagent", args, Some("session-123"));
         assert_eq!(
             out.get("parent_session_id").and_then(|v| v.as_str()),
             Some("session-123")
@@ -322,9 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn maybe_bind_source_session_id_injects_session_id_for_shell() {
+    fn bind_custom_tool_args_injects_session_id_for_shell() {
         let args = serde_json::json!({"command": "ls"});
-        let out = maybe_bind_source_session_id("shell", args, Some("session-shell"));
+        let out = bind_custom_tool_args("shell", args, Some("session-shell"));
         assert_eq!(
             out.get("session_id").and_then(|v| v.as_str()),
             Some("session-shell")
@@ -332,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn maybe_bind_source_session_id_does_not_override_existing() {
-        let args = serde_json::json!({"prompt": "task", "parent_session_id": "existing"});
-        let out = maybe_bind_source_session_id("subagent_send", args, Some("new-session"));
+    fn bind_custom_tool_args_does_not_override_existing() {
+        let args = serde_json::json!({"action": "spawn", "parent_session_id": "existing"});
+        let out = bind_custom_tool_args("subagent", args, Some("new-session"));
         assert_eq!(
             out.get("parent_session_id").and_then(|v| v.as_str()),
             Some("existing")
@@ -342,10 +352,21 @@ mod tests {
     }
 
     #[test]
-    fn maybe_bind_source_session_id_returns_unchanged_when_no_source_session_id() {
-        let args = serde_json::json!({"prompt": "task"});
-        let out = maybe_bind_source_session_id("subagent_send", args, None);
+    fn bind_custom_tool_args_returns_unchanged_when_no_source_session_id() {
+        let args = serde_json::json!({"action": "spawn"});
+        let out = bind_custom_tool_args("subagent", args, None);
         assert!(out.get("parent_session_id").is_none());
+    }
+
+    #[test]
+    fn bind_custom_tool_args_does_not_inject_for_subagent_send_or_stop() {
+        let args_send = serde_json::json!({"action": "send", "session_id": "s1", "input": "hi"});
+        let out_send = bind_custom_tool_args("subagent", args_send, Some("parent-1"));
+        assert!(out_send.get("parent_session_id").is_none());
+
+        let args_stop = serde_json::json!({"action": "stop", "session_id": "s1"});
+        let out_stop = bind_custom_tool_args("subagent", args_stop, Some("parent-1"));
+        assert!(out_stop.get("parent_session_id").is_none());
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};

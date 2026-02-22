@@ -1,11 +1,13 @@
 //! Slash-command parsing and handling. Lives in agent so command semantics
 //! are owned by the agent layer; channels only dispatch and send replies.
 
-use crate::channels::traits::{ChannelMessage, SendMessage};
-use crate::channels::{Channel, ChannelRuntimeContext};
+use crate::channels::traits::ChannelMessage;
+use crate::channels::{
+    dispatch_outbound_message, outbound_key_from_parts, SendMessage,
+    ChannelRuntimeContext,
+};
 use crate::session::{SessionId, SessionStore};
 use std::fmt::Write;
-use std::sync::Arc;
 
 pub(crate) const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
 const DEFAULT_QUEUE_MODE: &str = "steer-merge";
@@ -69,19 +71,12 @@ pub(crate) fn is_agent_command(cmd: &SlashCommand) -> bool {
     )
 }
 
-/// Send a command reply to the channel. Used by the gateway when agent commands cannot be enqueued (e.g. no session store).
-pub(crate) async fn send_command_response(
-    target_channel: Option<&Arc<dyn Channel>>,
-    reply_target: &str,
-    content: String,
-) {
-    if let Some(channel) = target_channel {
-        if let Err(error) = channel.send(&SendMessage::new(content, reply_target)).await {
-            tracing::error!(
-                "Failed to send command response on {}: {error}",
-                channel.name()
-            );
-        }
+/// Send a command reply via dispatch_outbound_message (single outbound path).
+async fn dispatch_reply(msg: &ChannelMessage, content: String) {
+    let key = outbound_key_from_parts(&msg.channel, &msg.reply_target);
+    let sm = SendMessage::new(content, msg.reply_target.clone());
+    if let Err(e) = dispatch_outbound_message(key, sm).await {
+        tracing::error!("Failed to send command response: {e}");
     }
 }
 
@@ -105,18 +100,12 @@ fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> S
 /// enqueued to the agent loop by the caller. Returns `true` if the message was consumed.
 pub(crate) async fn handle_slash_command(
     ctx: &ChannelRuntimeContext,
-    target_channel: Option<&Arc<dyn Channel>>,
     msg: &ChannelMessage,
     inbound_key: &str,
     command: SlashCommand,
 ) -> bool {
     let Some(session_store) = ctx.session_store.as_ref() else {
-        send_command_response(
-            target_channel,
-            &msg.reply_target,
-            "Session store is unavailable.".to_string(),
-        )
-        .await;
+        dispatch_reply(&msg, "Session store is unavailable.".to_string()).await;
         return true;
     };
 
@@ -134,9 +123,8 @@ pub(crate) async fn handle_slash_command(
             Ok(session_id) => {
                 if let Some(mode) = mode {
                     if mode != DEFAULT_QUEUE_MODE {
-                        send_command_response(
-                            target_channel,
-                            &msg.reply_target,
+                        dispatch_reply(
+                            &msg,
                             format!(
                                 "Unsupported queue mode `{mode}`. Supported modes: `{DEFAULT_QUEUE_MODE}`."
                             ),
@@ -155,20 +143,15 @@ pub(crate) async fn handle_slash_command(
                             "Failed to persist queue mode for session {}: {error}",
                             session_id.as_str()
                         );
-                        send_command_response(
-                            target_channel,
-                            &msg.reply_target,
-                            "⚠️ Failed to persist queue mode.".to_string(),
-                        )
-                        .await;
+                        dispatch_reply(&msg, "⚠️ Failed to persist queue mode.".to_string())
+                            .await;
                         return true;
                     }
                 }
 
                 let active_mode = current_queue_mode(session_store, &session_id);
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
+                dispatch_reply(
+                    &msg,
                     format!(
                         "Queue mode for session `{}` is `{active_mode}`.",
                         short_session_id(&session_id)
@@ -181,12 +164,7 @@ pub(crate) async fn handle_slash_command(
                     "Failed to resolve active session for queue command ({}): {error}",
                     inbound_key
                 );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to configure queue mode.".to_string(),
-                )
-                .await;
+                dispatch_reply(&msg, "⚠️ Failed to configure queue mode.".to_string()).await;
             }
         },
         SlashCommand::Subagents => {
@@ -212,7 +190,7 @@ pub(crate) async fn handle_slash_command(
                 );
             }
 
-            send_command_response(target_channel, &msg.reply_target, text.trim().to_string()).await;
+            dispatch_reply(&msg, text.trim().to_string()).await;
         }
         SlashCommand::Sessions => match session_store.get_or_create_active(inbound_key) {
             Ok(current_session_id) => {
@@ -235,20 +213,14 @@ pub(crate) async fn handle_slash_command(
                     );
                 }
 
-                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
-                    .await;
+                dispatch_reply(&msg, text.trim().to_string()).await;
             }
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve active session for sessions command ({}): {error}",
                     inbound_key
                 );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to list sessions.".to_string(),
-                )
-                .await;
+                dispatch_reply(&msg, "⚠️ Failed to list sessions.".to_string()).await;
             }
         },
         SlashCommand::Agents => match session_store.get_or_create_active(inbound_key) {
@@ -281,27 +253,20 @@ pub(crate) async fn handle_slash_command(
                     let _ = writeln!(text, "{marker}{} — {}", agent.name, agent.agent_id);
                 }
                 let _ = writeln!(text, "Use /agent <id|name> to switch.");
-                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
-                    .await;
+                dispatch_reply(&msg, text.trim().to_string()).await;
             }
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve session for /agents ({}): {error}",
                     inbound_key
                 );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to list agents.".to_string(),
-                )
-                .await;
+                dispatch_reply(&msg, "⚠️ Failed to list agents.".to_string()).await;
             }
         },
         SlashCommand::AgentSwitch { id_or_name } => {
             if id_or_name.is_empty() {
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
+                dispatch_reply(
+                    &msg,
                     "Usage: /agent <agent_id|agent_name>. Use /agents to list.".to_string(),
                 )
                 .await;
@@ -329,17 +294,12 @@ pub(crate) async fn handle_slash_command(
                                 &value_json,
                             ) {
                                 tracing::error!("Failed to set active_agent_id: {e}");
-                                send_command_response(
-                                    target_channel,
-                                    &msg.reply_target,
-                                    "⚠️ Failed to switch agent.".to_string(),
-                                )
-                                .await;
+                                dispatch_reply(&msg, "⚠️ Failed to switch agent.".to_string())
+                                    .await;
                                 return true;
                             }
-                            send_command_response(
-                                target_channel,
-                                &msg.reply_target,
+                            dispatch_reply(
+                                &msg,
                                 format!(
                                     "Switched to agent `{}` ({}) for this session.",
                                     agent.name,
@@ -349,9 +309,8 @@ pub(crate) async fn handle_slash_command(
                             .await;
                         }
                         None => {
-                            send_command_response(
-                                target_channel,
-                                &msg.reply_target,
+                            dispatch_reply(
+                                &msg,
                                 format!(
                                     "No agent found for `{id_or_name}`. Use /agents to list (match by id or name)."
                                 ),
@@ -365,12 +324,7 @@ pub(crate) async fn handle_slash_command(
                         "Failed to resolve session for /agent ({}): {error}",
                         inbound_key
                     );
-                    send_command_response(
-                        target_channel,
-                        &msg.reply_target,
-                        "⚠️ Failed to switch agent.".to_string(),
-                    )
-                    .await;
+                    dispatch_reply(&msg, "⚠️ Failed to switch agent.".to_string()).await;
                 }
             }
         }

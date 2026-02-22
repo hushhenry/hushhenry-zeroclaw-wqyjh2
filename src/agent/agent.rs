@@ -1,14 +1,16 @@
-//! Struct-based agent loop: Agent owns message_rx, deliver_tx, and (in session mode) history.
-//! Replaces the function-based agent_loop in channels/mod.rs.
+//! Struct-based agent loop: Agent owns message_rx and (in session mode) history.
+//! Outbound messages are sent via dispatch_outbound_message.
 
 use crate::agent::command::{short_session_id, SlashCommand};
 use crate::agent::loop_::{
-    build_assistant_content_native, find_tool, maybe_bind_source_session_id,
+    build_assistant_content_native, bind_custom_tool_args, find_tool,
     maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
 };
 use crate::channels::traits;
 use crate::channels::{
-    build_session_turn_history_with_tail, normalize_tail_messages, send_delivery_message,
+    build_session_turn_history_with_tail, normalize_tail_messages,
+    dispatch_outbound_message, outbound_key_from_parts,
+    parse_outbound_key_to_delivery_parts, INTERNAL_MESSAGE_CHANNEL, SendMessage,
     ChannelRuntimeContext,
 };
 use crate::observability::ObserverEvent;
@@ -31,33 +33,44 @@ use uuid::Uuid;
 // --- Moved types (from channels/mod.rs) ---
 
 /// One unit of work for an agent's internal queue (user message only).
+/// Delivery is via a single outbound_key (internal:{session_id} or channel:{name}:{reply_target}).
 #[derive(Clone)]
 pub(crate) struct AgentWorkItem {
     pub content: String,
-    pub reply_target: String,
-    pub channel: String,
+    /// Where to send replies. None when internal message has no resolved target yet (channels set it from session store).
+    pub outbound_key: Option<String>,
     pub sender: String,
     pub thread_ts: Option<String>,
 }
 
 impl AgentWorkItem {
     pub fn from_message(msg: &traits::ChannelMessage) -> Self {
+        let outbound_key = if msg.channel == INTERNAL_MESSAGE_CHANNEL && msg.reply_target.is_empty()
+        {
+            None
+        } else {
+            Some(outbound_key_from_parts(&msg.channel, &msg.reply_target))
+        };
         Self {
             content: msg.content.clone(),
-            reply_target: msg.reply_target.clone(),
-            channel: msg.channel.clone(),
+            outbound_key,
             sender: msg.sender.clone(),
             thread_ts: msg.thread_ts.clone(),
         }
     }
 
     pub fn to_channel_message(&self) -> traits::ChannelMessage {
+        let (channel, reply_target) = self
+            .outbound_key
+            .as_deref()
+            .and_then(|k| parse_outbound_key_to_delivery_parts(k).ok())
+            .unwrap_or_default();
         traits::ChannelMessage {
             id: Uuid::new_v4().to_string(),
             sender: self.sender.clone(),
-            reply_target: self.reply_target.clone(),
+            reply_target,
             content: self.content.clone(),
-            channel: self.channel.clone(),
+            channel,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -76,7 +89,7 @@ pub(crate) enum AgentQueueItem {
 }
 
 impl AgentQueueItem {
-    /// Delivery envelope (channel, reply_target, etc.) for sending the response.
+    /// Delivery envelope (outbound_key) for sending the response.
     pub(crate) fn envelope(&self) -> &AgentWorkItem {
         match self {
             AgentQueueItem::Message(w) => w,
@@ -157,23 +170,6 @@ pub(crate) fn build_steer_merge_message(
     out
 }
 
-// --- Deliver channel ---
-
-#[derive(Clone)]
-pub(crate) enum DeliverMessage {
-    Assistant {
-        content: String,
-        channel_name: String,
-        reply_target: String,
-    },
-    Tool {
-        tool_name: String,
-        content: String,
-        channel_name: String,
-        reply_target: String,
-    },
-}
-
 /// Agent registry key: always the session_id.
 pub(crate) fn agent_registry_key(session_id: &SessionId, _inbound_key: &str) -> String {
     session_id.as_str().to_string()
@@ -189,22 +185,19 @@ pub(crate) struct Agent {
     /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
     tool_specs: Vec<ToolSpec>,
     message_rx: mpsc::Receiver<AgentQueueItem>,
-    deliver_tx: mpsc::Sender<DeliverMessage>,
     history: Vec<ChatMessage>,
     ctx: Arc<ChannelRuntimeContext>,
-    /// When true, deliver_loop also sends Tool variants (verbose).
+    /// When true, tool output is also sent outbound (verbose).
     verbose_tool_output: bool,
 }
 
 impl Agent {
-    /// Initialize agent: resolve prompt/tools, create deliver channel, spawn deliver_loop.
-    /// Caller creates (message_tx, message_rx) and (deliver_tx, deliver_rx); we take message_rx and deliver_tx.
+    /// Initialize agent: resolve prompt/tools. Caller creates (message_tx, message_rx); we take message_rx.
     pub(crate) fn new(
         ctx: Arc<ChannelRuntimeContext>,
         session_id: SessionId,
         inbound_key: &str,
         message_rx: mpsc::Receiver<AgentQueueItem>,
-        deliver_tx: mpsc::Sender<DeliverMessage>,
         verbose_tool_output: bool,
     ) -> Result<Self> {
         let (system_prompt, tool_allow_list) =
@@ -233,7 +226,6 @@ impl Agent {
             tool_allow_list,
             tool_specs,
             message_rx,
-            deliver_tx,
             history,
             ctx,
             verbose_tool_output,
@@ -251,86 +243,46 @@ impl Agent {
         registry.lock().remove(&key_str);
     }
 
-    /// Spawned task: consumes DeliverMessage, routes assistant (and optionally tool) to send_delivery_message.
-    pub(crate) async fn deliver_loop(
-        ctx: Arc<ChannelRuntimeContext>,
-        mut rx: mpsc::Receiver<DeliverMessage>,
-        verbose_tool_output: bool,
-    ) {
-        while let Some(msg) = rx.recv().await {
-            let (content, channel_name, reply_target, is_tool) = match &msg {
-                DeliverMessage::Assistant {
-                    content,
-                    channel_name,
-                    reply_target,
-                } => (
-                    content.as_str(),
-                    channel_name.as_str(),
-                    reply_target.as_str(),
-                    false,
-                ),
-                DeliverMessage::Tool {
-                    content,
-                    channel_name,
-                    reply_target,
-                    ..
-                } => (
-                    content.as_str(),
-                    channel_name.as_str(),
-                    reply_target.as_str(),
-                    true,
-                ),
-            };
-            if is_tool && !verbose_tool_output {
-                continue;
-            }
-            let target = ctx.channels_by_name.get(channel_name);
-            if let Err(e) = send_delivery_message(target, channel_name, reply_target, content).await
-            {
-                tracing::debug!("deliver_loop: failed to send: {e}");
-            }
-        }
-    }
-
-    fn on_message(
-        &mut self,
+    /// Send one outbound message via dispatch_outbound_message. Skips when is_tool && !verbose_tool_output.
+    /// When outbound_key is None, uses the session's outbound_key from the session store if available.
+    async fn send_outbound(
+        &self,
         content: &str,
         is_tool: bool,
-        channel_name: &str,
-        reply_target: &str,
+        outbound_key: Option<&str>,
     ) -> Result<()> {
-        let msg = if is_tool {
-            DeliverMessage::Tool {
-                tool_name: String::new(),
-                content: content.to_string(),
-                channel_name: channel_name.to_string(),
-                reply_target: reply_target.to_string(),
-            }
-        } else {
-            DeliverMessage::Assistant {
-                content: content.to_string(),
-                channel_name: channel_name.to_string(),
-                reply_target: reply_target.to_string(),
-            }
+        if is_tool && !self.verbose_tool_output {
+            return Ok(());
+        }
+        let key = outbound_key
+            .map(String::from)
+            .or_else(|| {
+                self.ctx.session_store.as_ref().and_then(|store| {
+                    store
+                        .get_outbound_key_for_session(self.session_id.as_str())
+                        .ok()
+                        .flatten()
+                })
+            });
+        let Some(ref key) = key else {
+            tracing::debug!("send_outbound: no outbound_key (work item or session), skipping");
+            return Ok(());
         };
-        let _ = self.deliver_tx.try_send(msg);
-        Ok(())
-    }
-
-    fn delivery_target(&self, envelope: &AgentWorkItem) -> (String, String) {
-        (envelope.channel.clone(), envelope.reply_target.clone())
+        let (_, reply_target) = parse_outbound_key_to_delivery_parts(key)
+            .map_err(|e| anyhow::anyhow!("invalid outbound_key: {e}"))?;
+        let msg = SendMessage::new(content, reply_target);
+        dispatch_outbound_message(key.as_str(), msg).await.map_err(Into::into)
     }
 
     /// /stop: abort current turn. Delivers "Agent was aborted.", returns true.
     async fn cmd_stop(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
-        self.on_message("Agent was aborted.", false, &ch, &rt)?;
+        self.send_outbound("Agent was aborted.", false, envelope.outbound_key.as_deref())
+            .await?;
         Ok(true)
     }
 
     /// /new: create new session, deliver "New session started · model: <provider>/<model>".
     async fn cmd_new(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
         let store = self
             .ctx
             .session_store
@@ -339,24 +291,24 @@ impl Agent {
         match store.create_new(&self.inbound_key) {
             Ok(new_session_id) => {
                 let full_model = self.ctx.provider_manager.default_full_model().to_string();
-                self.on_message(
+                self.send_outbound(
                     &format!("New session started · model: {full_model}"),
                     false,
-                    &ch,
-                    &rt,
-                )?;
+                    envelope.outbound_key.as_deref(),
+                )
+                .await?;
             }
             Err(e) => {
                 tracing::error!(
                     "Failed to create new session for key {}: {e}",
                     self.inbound_key.as_str()
                 );
-                self.on_message(
+                self.send_outbound(
                     "⚠️ Failed to create a new session. Please try again.",
                     false,
-                    &ch,
-                    &rt,
-                )?;
+                    envelope.outbound_key.as_deref(),
+                )
+                .await?;
             }
         }
         Ok(false)
@@ -364,7 +316,6 @@ impl Agent {
 
     /// /compact: compact this agent's in-memory history, then deliver confirmation.
     async fn cmd_compact(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
         let store = Arc::clone(
             self.ctx
                 .session_store
@@ -383,13 +334,13 @@ impl Agent {
         } else {
             "No compaction needed yet. Session tail is already small.".to_string()
         };
-        self.on_message(&msg, false, &ch, &rt)?;
+        self.send_outbound(&msg, false, envelope.outbound_key.as_deref())
+            .await?;
         Ok(false)
     }
 
     /// /model (no args): show current model from session override or default (uses agent's ctx + session_id).
     async fn cmd_model_show(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
         let current = self
             .ctx
             .session_store
@@ -402,7 +353,8 @@ impl Agent {
             })
             .and_then(|raw| crate::channels::decode_session_string_state(Some(raw)))
             .unwrap_or_else(|| self.ctx.provider_manager.default_full_model().to_string());
-        self.on_message(&current, false, &ch, &rt)?;
+        self.send_outbound(&current, false, envelope.outbound_key.as_deref())
+            .await?;
         Ok(false)
     }
 
@@ -412,7 +364,6 @@ impl Agent {
         provider_model: &str,
         envelope: &AgentWorkItem,
     ) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
         let store = self
             .ctx
             .session_store
@@ -426,24 +377,28 @@ impl Agent {
             &value_json,
         ) {
             tracing::error!("Failed to set model_override: {e}");
-            self.on_message("⚠️ Failed to set model override.", false, &ch, &rt)?;
+            self.send_outbound(
+                "⚠️ Failed to set model override.",
+                false,
+                envelope.outbound_key.as_deref(),
+            )
+            .await?;
             return Ok(false);
         }
-        self.on_message(
+        self.send_outbound(
             &format!(
                 "Model override set to `{}` for this session.",
                 provider_model.trim()
             ),
             false,
-            &ch,
-            &rt,
-        )?;
+            envelope.outbound_key.as_deref(),
+        )
+        .await?;
         Ok(false)
     }
 
     /// /models: show model info for this session (override + hint).
     async fn cmd_models(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let (ch, rt) = self.delivery_target(envelope);
         let store = self
             .ctx
             .session_store
@@ -472,7 +427,8 @@ impl Agent {
             text,
             "Use /model <provider>/<model> to set override (e.g. openrouter/anthropic/claude-sonnet-4)."
         );
-        self.on_message(text.trim(), false, &ch, &rt)?;
+        self.send_outbound(text.trim(), false, envelope.outbound_key.as_deref())
+            .await?;
         Ok(false)
     }
 
@@ -569,8 +525,7 @@ impl Agent {
         session_store: Option<&SessionStore>,
         work: &AgentWorkItem,
     ) -> Result<Option<(String, String)>> {
-        let delivery_channel_name = work.channel.clone();
-        let delivery_reply_target = work.reply_target.clone();
+        let delivery_outbound_key = work.outbound_key.clone();
 
         let new_content = work.content.clone();
         let (user_content, _, _) = {
@@ -637,7 +592,7 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 self.history.push(ChatMessage::assistant(text.clone()));
-                self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
+                self.send_outbound(&text, false, delivery_outbound_key.as_deref()).await?;
                 let last_user_content = self
                     .history
                     .iter()
@@ -649,7 +604,7 @@ impl Agent {
             }
 
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
-            self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
+            self.send_outbound(&text, false, delivery_outbound_key.as_deref()).await?;
             self.history.push(ChatMessage::assistant(assistant_content));
 
             for (idx, call) in tool_calls.iter().enumerate() {
@@ -676,12 +631,8 @@ impl Agent {
                             })
                             .to_string(),
                         ));
-                        self.on_message(
-                            skip_msg,
-                            true,
-                            &delivery_channel_name,
-                            &delivery_reply_target,
-                        )?;
+                        self.send_outbound(skip_msg, true, delivery_outbound_key.as_deref())
+                            .await?;
                     }
                     let merged = build_steer_merge_message(&user_content, steer_messages);
                     self.history.push(ChatMessage::user(merged));
@@ -691,7 +642,7 @@ impl Agent {
                 let args = serde_json::from_str(&call.arguments)
                     .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
                 let tool_args =
-                    maybe_bind_source_session_id(&call.name, args, Some(session_id.as_str()));
+                    bind_custom_tool_args(&call.name, args, Some(session_id.as_str()));
                 let (output, _success) = self.execute_single_tool(&call, tool_args).await;
                 let output = maybe_truncate_tool_output(&output);
                 self.history.push(ChatMessage::tool(
@@ -701,12 +652,8 @@ impl Agent {
                     })
                     .to_string(),
                 ));
-                self.on_message(
-                    &output,
-                    true,
-                    &delivery_channel_name,
-                    &delivery_reply_target,
-                )?;
+                self.send_outbound(&output, true, delivery_outbound_key.as_deref())
+                    .await?;
             }
         }
 
@@ -797,7 +744,7 @@ fn is_context_exceeded_error(err: &str) -> bool {
         && (lower.contains("length") || lower.contains("token") || lower.contains("exceeded"))
 }
 
-/// Returns a sender to the agent's queue. Spawns deliver_loop and Agent::run.
+/// Returns a sender to the agent's queue. Spawns Agent::run.
 pub(crate) fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
     session_id: SessionId,
@@ -812,19 +759,12 @@ pub(crate) fn get_or_create_agent(
         }
     }
     let (message_tx, message_rx) = mpsc::channel::<AgentQueueItem>(64);
-    let (deliver_tx, deliver_rx) = mpsc::channel(64);
-
-    let runner_ctx = Arc::clone(&ctx);
-    tokio::spawn(async move {
-        Agent::deliver_loop(runner_ctx, deliver_rx, false).await;
-    });
 
     match Agent::new(
         Arc::clone(&ctx),
         session_id,
         inbound_key,
         message_rx,
-        deliver_tx,
         false,
     ) {
         Ok(agent) => {

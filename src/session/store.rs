@@ -79,9 +79,9 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 9;
+const SESSION_SCHEMA_VERSION: i64 = 10;
 
-/// Subagent session: backed by sessions table (session_id, agent_id, status, ...).
+/// Subagent session: backed by sessions table (session_id, agent_id, status, outbound_key, ...).
 #[derive(Debug, Clone)]
 pub struct SubagentSession {
     pub subagent_session_id: String,
@@ -90,6 +90,7 @@ pub struct SubagentSession {
     pub created_at: String,
     pub updated_at: String,
     pub meta_json: Option<String>,
+    pub outbound_key: Option<String>,
 }
 
 /// Agent profile (main or subagent): model defaults + policies. Stored in agents table.
@@ -139,7 +140,7 @@ impl SessionStore {
 
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
+            "             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 inbound_key TEXT NOT NULL,
                 agent_id TEXT NOT NULL DEFAULT 'main',
@@ -147,7 +148,8 @@ impl SessionStore {
                 title TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                meta_json TEXT
+                meta_json TEXT,
+                outbound_key TEXT
              );
 
              CREATE TABLE IF NOT EXISTS session_messages (
@@ -564,6 +566,7 @@ impl SessionStore {
         &self,
         agent_id: Option<&str>,
         meta_json: Option<&str>,
+        outbound_key: Option<&str>,
     ) -> Result<SubagentSession> {
         let conn = self.conn.lock();
         let now = Self::now();
@@ -571,9 +574,9 @@ impl SessionStore {
         let inbound_key = format!("internal:{session_id}");
         let agent_id_val = agent_id.unwrap_or("main");
         conn.execute(
-            "INSERT INTO sessions (session_id, inbound_key, agent_id, status, title, created_at, updated_at, meta_json)
-             VALUES (?1, ?2, ?3, 'active', NULL, ?4, ?4, ?5)",
-            params![session_id, inbound_key, agent_id_val, now, meta_json],
+            "INSERT INTO sessions (session_id, inbound_key, agent_id, status, title, created_at, updated_at, meta_json, outbound_key)
+             VALUES (?1, ?2, ?3, 'active', NULL, ?4, ?4, ?5, ?6)",
+            params![session_id, inbound_key, agent_id_val, now, meta_json, outbound_key],
         )
         .context("Failed to create subagent session in sessions table")?;
 
@@ -584,6 +587,7 @@ impl SessionStore {
             created_at: now.clone(),
             updated_at: now,
             meta_json: meta_json.map(ToOwned::to_owned),
+            outbound_key: outbound_key.map(ToOwned::to_owned),
         })
     }
 
@@ -593,7 +597,7 @@ impl SessionStore {
     ) -> Result<Option<SubagentSession>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_id, agent_id, status, created_at, updated_at, meta_json
+            "SELECT session_id, agent_id, status, created_at, updated_at, meta_json, outbound_key
              FROM sessions
              WHERE session_id = ?1",
             params![subagent_session_id],
@@ -605,6 +609,7 @@ impl SessionStore {
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                     meta_json: row.get(5)?,
+                    outbound_key: row.get(6)?,
                 })
             },
         )
@@ -612,11 +617,25 @@ impl SessionStore {
         .context("Failed to query subagent session from sessions")
     }
 
+    /// Returns outbound_key for a session (for internal messages with empty reply_target).
+    pub fn get_outbound_key_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let opt: Option<Option<String>> = conn
+            .query_row(
+                "SELECT outbound_key FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query outbound_key from sessions")?;
+        Ok(opt.flatten())
+    }
+
     pub fn list_subagent_sessions(&self, limit: u32) -> Result<Vec<SubagentSession>> {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT session_id, agent_id, status, created_at, updated_at, meta_json
+                "SELECT session_id, agent_id, status, created_at, updated_at, meta_json, outbound_key
                  FROM sessions
                  WHERE inbound_key LIKE 'internal:%'
                  ORDER BY updated_at DESC
@@ -632,6 +651,7 @@ impl SessionStore {
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                     meta_json: row.get(5)?,
+                    outbound_key: row.get(6)?,
                 })
             })
             .context("Failed to query subagent sessions list")?;
@@ -923,7 +943,7 @@ mod tests {
         assert_eq!(agent.name, "reviewer");
 
         let subagent_session = store
-            .create_subagent_session(Some(agent.agent_id.as_str()), None)
+            .create_subagent_session(Some(agent.agent_id.as_str()), None, None)
             .unwrap();
         assert!(!subagent_session.subagent_session_id.is_empty());
         assert_eq!(subagent_session.agent_id, agent.agent_id);

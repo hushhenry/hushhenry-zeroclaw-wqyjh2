@@ -7,8 +7,8 @@ The `SubagentRuntime` provides shared access to the session store for subagent s
 
 ## 2. Delegation Model
 When the primary agent spawns a sub-agent:
-1. **Creation**: A new `SubagentSession` is created (e.g. via `subagent_send` with prompt/context).
-2. **Specs**: Sub-agents can use different "Specs" (predefined model, provider, and system prompt configurations) when creating a session.
+1. **Creation**: A new `SubagentSession` is created via the `subagent` tool with `action: spawn` (optional `agent_id`, default `main`; optional `parent_session_id` injected by runtime for outbound).
+2. **Specs**: Sub-agents can use different agent ids when creating a session.
 3. **Session-based**: Execution is driven by the async session model (no oneshot "run" queue).
 
 ## 3. Concurrency & Isolation
@@ -16,5 +16,5 @@ When the primary agent spawns a sub-agent:
 - **Resource Management**: When subagent sessions are processed (e.g. by a channel or gateway), each turn runs in its own context with iteration limits.
 
 ## 4. Communication & Results
-- **Tooling**: The `subagent_send` tool creates or reuses a subagent session and returns session id and status.
-- **Steer-Backlog**: Sub-agent sessions can carry `parent_session_id` in meta for future announce/backlog integration.
+- **Tooling**: The `subagent` tool supports three actions: **spawn** (create session; returns `session_id`), **send** (send `input` to `internal:{session_id}`), **stop** (send `/stop` to `internal:{session_id}` and mark session stopped).
+- **Steer-Backlog**: Sub-agent sessions can carry `parent_session_id` in meta (outbound = `internal:{parent_session_id}`) for announce/backlog integration.

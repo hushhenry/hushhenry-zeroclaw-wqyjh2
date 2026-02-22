@@ -34,7 +34,7 @@ use crate::agent::agent::{agent_registry_key, get_or_create_agent, AgentQueueIte
 #[cfg(test)]
 use crate::agent::agent::{drain_agent_queue, merge_work_items, partition_steer_items};
 use crate::agent::command::{
-    handle_slash_command, is_agent_command, parse_slash_command, send_command_response,
+    handle_slash_command, is_agent_command, parse_slash_command,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -85,24 +85,17 @@ pub fn channel_inbound_key(channel: &str, sender: &str, thread_ts: Option<&str>)
     }
 }
 
-/// Outbound key for delivery: internal:{session_id} or channel:{channel}:{reply_target}[:{thread_ts}].
-pub fn outbound_key_from_parts(
-    channel: &str,
-    reply_target: &str,
-    thread_ts: Option<&str>,
-) -> String {
+/// Outbound key for delivery: internal:{session_id} or channel:{channel}:{reply_target}. thread_ts is carried in SendMessage, not in the key.
+pub fn outbound_key_from_parts(channel: &str, reply_target: &str) -> String {
     if channel == INTERNAL_MESSAGE_CHANNEL {
         return format!("internal:{}", reply_target);
     }
-    match thread_ts {
-        Some(ts) if !ts.is_empty() => format!("channel:{}:{}:{}", channel, reply_target, ts),
-        _ => format!("channel:{}:{}", channel, reply_target),
-    }
+    format!("channel:{}:{}", channel, reply_target)
 }
 
 /// Outbound key from an inbound message (where we will reply).
 pub fn outbound_key_from_message(msg: &traits::ChannelMessage) -> String {
-    outbound_key_from_parts(&msg.channel, &msg.reply_target, msg.thread_ts.as_deref())
+    outbound_key_from_parts(&msg.channel, &msg.reply_target)
 }
 
 /// Timeout for a single turn (LLM + tools). Exposed for agent turn execution.
@@ -144,6 +137,25 @@ fn set_internal_dispatch_sender(sender: Option<mpsc::Sender<traits::ChannelMessa
     *guard = sender;
 }
 
+/// One outbound request: target key + message. Consumed by run_outbound_message_loop.
+#[derive(Clone)]
+pub struct OutboundRequest {
+    pub outbound_key: String,
+    pub message: traits::SendMessage,
+}
+
+fn outbound_sender() -> Arc<ParkingMutex<Option<mpsc::Sender<OutboundRequest>>>> {
+    static OUTBOUND: LazyLock<Arc<ParkingMutex<Option<mpsc::Sender<OutboundRequest>>>>> =
+        LazyLock::new(|| Arc::new(ParkingMutex::new(None)));
+    OUTBOUND.clone()
+}
+
+fn set_outbound_sender(sender: Option<mpsc::Sender<OutboundRequest>>) {
+    let registry = outbound_sender();
+    let mut guard = registry.lock();
+    *guard = sender;
+}
+
 pub async fn dispatch_internal_message(message: traits::ChannelMessage) -> Result<()> {
     let tx_opt = {
         let registry = internal_dispatch_sender();
@@ -157,6 +169,7 @@ pub async fn dispatch_internal_message(message: traits::ChannelMessage) -> Resul
 }
 
 /// Build an internal inbound message. Only internal messages have session_id set.
+/// reply_target is left empty: internal channel is one-way and does not allow replies.
 pub fn build_internal_channel_message(
     sender: impl Into<String>,
     target_session_id: impl Into<String>,
@@ -166,7 +179,7 @@ pub fn build_internal_channel_message(
     traits::ChannelMessage {
         id: Uuid::new_v4().to_string(),
         sender: sender.into(),
-        reply_target: target.clone(),
+        reply_target: String::new(),
         content: content.into(),
         channel: INTERNAL_MESSAGE_CHANNEL.to_string(),
         timestamp: std::time::SystemTime::now()
@@ -210,6 +223,111 @@ pub(crate) async fn send_delivery_message(
     channel
         .send(&SendMessage::new(content, delivery_reply_target))
         .await
+}
+
+/// Parse outbound_key to (channel_name, reply_target) for use in delivery envelope.
+pub fn parse_outbound_key_to_delivery_parts(outbound_key: &str) -> Result<(String, String)> {
+    let key = outbound_key.trim();
+    if key.is_empty() {
+        anyhow::bail!("outbound_key is empty");
+    }
+    if let Some(session_id) = key.strip_prefix("internal:") {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            anyhow::bail!("internal outbound_key has empty session_id");
+        }
+        return Ok((INTERNAL_MESSAGE_CHANNEL.to_string(), session_id.to_string()));
+    }
+    if let Some(rest) = key.strip_prefix("channel:") {
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        match parts.as_slice() {
+            [name, target] => return Ok(((*name).to_string(), (*target).to_string())),
+            _ => anyhow::bail!(
+                "invalid channel outbound_key: expected channel:name:reply_target"
+            ),
+        }
+    }
+    anyhow::bail!("outbound_key must start with internal: or channel:");
+}
+
+/// Dispatch a message by outbound_key. Sends to the global outbound channel; run_outbound_message_loop performs the actual send.
+/// Format: internal:{session_id} or channel:{channel}:{reply_target}. thread_ts goes in SendMessage.
+pub async fn dispatch_outbound_message(
+    outbound_key: impl Into<String>,
+    msg: traits::SendMessage,
+) -> Result<()> {
+    let tx_opt = {
+        let registry = outbound_sender();
+        let guard = registry.lock();
+        guard.clone()
+    };
+    let tx = tx_opt.ok_or_else(|| anyhow::anyhow!("outbound message loop is not running"))?;
+    let req = OutboundRequest {
+        outbound_key: outbound_key.into().trim().to_string(),
+        message: msg,
+    };
+    tx.send(req)
+        .await
+        .map_err(|_| anyhow::anyhow!("outbound message queue is closed"))
+}
+
+/// Loop that consumes OutboundRequest from the global channel and performs the actual send (internal or channel).
+/// Start this when the channel server starts; pass the same channels_by_name used for the message dispatch.
+pub async fn run_outbound_message_loop(
+    mut rx: mpsc::Receiver<OutboundRequest>,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+) {
+    while let Some(req) = rx.recv().await {
+        let key = req.outbound_key.trim();
+        if key.is_empty() {
+            tracing::debug!("outbound_message_loop: ignoring empty outbound_key");
+            continue;
+        }
+        if let Some(session_id) = key.strip_prefix("internal:") {
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                tracing::debug!("outbound_message_loop: internal key has empty session_id");
+                continue;
+            }
+            let internal_msg = build_internal_channel_message(
+                "zeroclaw_outbound",
+                session_id,
+                req.message.content,
+            );
+            if let Err(e) = dispatch_internal_message(internal_msg).await {
+                tracing::debug!("outbound_message_loop: internal dispatch failed: {e}");
+            }
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("channel:") {
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            let (channel_name, reply_target) = match parts.as_slice() {
+                [name, target] => ((*name).to_string(), (*target).to_string()),
+                _ => {
+                    tracing::debug!(
+                        "outbound_message_loop: invalid channel key (expected channel:name:reply_target)"
+                    );
+                    continue;
+                }
+            };
+            let channel = match channels_by_name.get(&channel_name) {
+                Some(ch) => ch,
+                None => {
+                    tracing::debug!("outbound_message_loop: channel not found: {channel_name}");
+                    continue;
+                }
+            };
+            let out_msg = traits::SendMessage {
+                content: req.message.content,
+                recipient: reply_target,
+                subject: req.message.subject,
+                thread_ts: req.message.thread_ts,
+            };
+            if let Err(e) = channel.send(&out_msg).await {
+                tracing::debug!("outbound_message_loop: channel send failed: {e}");
+            }
+        }
+    }
 }
 
 /// Normalize cached channel turns so that alternating user/assistant is preserved;
@@ -617,7 +735,6 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     let parsed_command = parse_slash_command(&msg.content);
     let inbound_key = inbound_key(&msg);
 
@@ -627,12 +744,14 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 internal_target
             } else {
                 let Some(store) = ctx.session_store.as_ref() else {
-                    send_command_response(
-                        target_channel.as_ref(),
-                        &msg.reply_target,
+                    let key = outbound_key_from_parts(&msg.channel, &msg.reply_target);
+                    let sm = SendMessage::new(
                         "Session store is unavailable.".to_string(),
-                    )
-                    .await;
+                        msg.reply_target.clone(),
+                    );
+                    if let Err(e) = dispatch_outbound_message(key, sm).await {
+                        tracing::error!("Failed to send command response: {e}");
+                    }
                     return;
                 };
                 match store.get_or_create_active(&inbound_key) {
@@ -643,7 +762,16 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     }
                 }
             };
-            let envelope = AgentWorkItem::from_message(&msg);
+            let mut envelope = AgentWorkItem::from_message(&msg);
+            if msg.channel == INTERNAL_MESSAGE_CHANNEL && msg.reply_target.is_empty() {
+                if let Some(store) = ctx.session_store.as_ref() {
+                    if let Ok(Some(ref key)) =
+                        store.get_outbound_key_for_session(session_id.as_str())
+                    {
+                        envelope.outbound_key = Some(key.clone());
+                    }
+                }
+            }
             let item = AgentQueueItem::Command(command, envelope);
             let key = agent_registry_key(&session_id, &inbound_key);
             let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &inbound_key);
@@ -653,7 +781,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             return;
         }
         let handled =
-            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &inbound_key, command).await;
+            handle_slash_command(&ctx, &msg, &inbound_key, command).await;
         if handled {
             return;
         }
@@ -676,7 +804,15 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     };
 
-    let item = AgentQueueItem::Message(AgentWorkItem::from_message(&msg));
+    let mut envelope = AgentWorkItem::from_message(&msg);
+    if msg.channel == INTERNAL_MESSAGE_CHANNEL && msg.reply_target.is_empty() {
+        if let Some(store) = ctx.session_store.as_ref() {
+            if let Ok(Some(ref key)) = store.get_outbound_key_for_session(session_id.as_str()) {
+                envelope.outbound_key = Some(key.clone());
+            }
+        }
+    }
+    let item = AgentQueueItem::Message(envelope);
     let key = agent_registry_key(&session_id, &inbound_key);
     let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &inbound_key);
     if tx.send(item).await.is_err() {
@@ -1380,6 +1516,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    // Global outbound channel: dispatch_outbound_message writes here; this loop performs the actual send
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundRequest>(256);
+    set_outbound_sender(Some(outbound_tx.clone()));
+    let outbound_handle =
+        tokio::spawn(run_outbound_message_loop(outbound_rx, Arc::clone(&channels_by_name)));
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider_manager: Arc::clone(&provider_manager),
@@ -1395,7 +1537,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
-    set_internal_dispatch_sender(None);
+
+    drop(outbound_tx);
+    let _ = outbound_handle.await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -1792,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_work_item_from_message_preserves_content_and_reply_target() {
+    fn agent_work_item_from_message_preserves_content_and_outbound_key() {
         let msg = traits::ChannelMessage {
             id: "id-1".to_string(),
             sender: "alice".to_string(),
@@ -1804,6 +1948,7 @@ mod tests {
             session_id: None,
         };
         let work = AgentWorkItem::from_message(&msg);
+        assert_eq!(work.outbound_key.as_deref(), Some("channel:telegram:chat-99"));
         let back = work.to_channel_message();
         assert_eq!(back.content, "hello world");
         assert_eq!(back.reply_target, "chat-99");
@@ -1860,7 +2005,7 @@ mod tests {
         let (_, messages) = partition_steer_items(drained);
         let m = merge_work_items(messages).expect("merge should return one merged item");
         assert_eq!(m.content, "one\n\ntwo\n\nthree");
-        assert_eq!(m.reply_target, "target-last");
+        assert_eq!(m.outbound_key.as_deref(), Some("channel:ch:target-last"));
         assert_eq!(m.sender, "u3");
     }
 
@@ -2025,7 +2170,7 @@ mod tests {
             .upsert_agent("reviewer", r#"{"model":"test"}"#)
             .unwrap();
         let _subagent_session = session_store
-            .create_subagent_session(Some(agent.agent_id.as_str()), None)
+            .create_subagent_session(Some(agent.agent_id.as_str()), None, None)
             .unwrap();
 
         process_channel_message(
