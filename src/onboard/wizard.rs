@@ -302,6 +302,14 @@ pub fn run_quick_setup(
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
+    if config_path.exists() {
+        bail!(
+            "Config already exists at {}. Non-interactive onboard refuses to overwrite. \
+             Use `zeroclaw onboard --interactive` to reconfigure, or edit the file manually.",
+            config_path.display()
+        );
+    }
+
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
