@@ -55,7 +55,6 @@ pub mod migration;
 pub mod observability;
 pub mod onboard;
 pub mod providers;
-pub mod rag;
 pub mod runtime;
 pub mod security;
 pub mod service;
