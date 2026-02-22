@@ -1,11 +1,10 @@
 use crate::providers::ChatRequest;
-use crate::providers::{ChatMessage, Provider};
+use crate::providers::ChatMessage;
 use crate::session::{SessionId, SessionStore};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::fmt::Write;
 
-pub const SESSION_COMPACTION_SUMMARY_KEY: &str = "compaction_summary";
 pub const SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY: &str = "compaction_after_message_id";
 pub const SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS: usize = 12_000;
 pub const SESSION_COMPACTION_KEEP_RECENT_MESSAGES: usize = 24;
@@ -14,7 +13,6 @@ const SESSION_COMPACTION_MAX_SUMMARY_CHARS: usize = 6_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct CompactionState {
-    pub summary: Option<String>,
     pub after_message_id: Option<i64>,
 }
 
@@ -58,6 +56,7 @@ pub fn resolve_keep_recent_messages(session_history_limit: u32) -> usize {
         .unwrap_or(SESSION_COMPACTION_KEEP_RECENT_MESSAGES)
 }
 
+/// Build the in-memory and persisted compaction summary as an assistant message.
 pub fn build_compaction_summary_message(summary: &str) -> ChatMessage {
     ChatMessage::assistant(format!("[Session Compaction Summary]\n{}", summary.trim()))
 }
@@ -79,19 +78,11 @@ pub fn load_compaction_state(
     store: &SessionStore,
     session_id: &SessionId,
 ) -> Result<CompactionState> {
-    let summary = store
-        .get_state_key(session_id, SESSION_COMPACTION_SUMMARY_KEY)?
-        .and_then(|raw| decode_json_string(&raw))
-        .map(|summary| {
-            truncate_with_ellipsis(summary.trim(), SESSION_COMPACTION_MAX_SUMMARY_CHARS)
-        });
-
     let after_message_id = store
         .get_state_key(session_id, SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY)?
         .and_then(|raw| decode_json_i64(&raw));
 
     Ok(CompactionState {
-        summary,
         after_message_id,
     })
 }
@@ -111,11 +102,7 @@ pub fn build_transcript_from_chat_messages(messages: &[ChatMessage]) -> String {
     }
 }
 
-fn build_compaction_prompt(
-    existing_summary: Option<&str>,
-    transcript: &str,
-    system_prompt: &str,
-) -> String {
+fn build_compaction_prompt(transcript: &str, system_prompt: &str) -> String {
     let mut prompt = String::new();
     let _ = writeln!(prompt, "Goal:");
     let _ = writeln!(
@@ -149,68 +136,46 @@ fn build_compaction_prompt(
     let _ = writeln!(prompt, "Stable system prompt:");
     let _ = writeln!(prompt, "{system_prompt}");
     let _ = writeln!(prompt);
-    if let Some(summary) = existing_summary {
-        let _ = writeln!(prompt, "Previous summary:");
-        let _ = writeln!(prompt, "{summary}");
-        let _ = writeln!(prompt);
-    }
     let _ = writeln!(prompt, "Transcript to compact:");
     let _ = writeln!(prompt, "{transcript}");
     prompt
 }
 
-/// Index of the first tail message in history (after system and optional compaction summary).
-fn tail_start_index(history: &[ChatMessage]) -> usize {
-    if history.is_empty() {
-        return 0;
-    }
-    let mut start = 1;
-    if history.len() > 1
-        && history[1]
-            .content
-            .starts_with("[Session Compaction Summary]")
-    {
-        start = 2;
-    }
-    start
+fn is_tool_call_message(msg: &ChatMessage) -> bool {
+    msg.role == "tool" || (msg.role == "assistant" && msg.content.contains("tool_call_id"))
 }
 
-/// Compact in-memory history: summarize old tail, keep recent, write summary and boundary to store.
-/// Returns (new_history, new_history_message_ids, compacted).
+/// Compact in-memory history: summarize messages *before* the last user, keep last user and rest.
+/// Summary is persisted as an assistant message and placed in memory before that last user.
+/// last_id = current last message id in DB (end boundary). Returns (new_history, compacted).
 pub async fn compact_in_memory_history(
     history: &[ChatMessage],
-    history_message_ids: &[Option<i64>],
     store: &SessionStore,
     session_id: &SessionId,
     provider_ctx: &crate::providers::ProviderCtx,
     system_prompt: &str,
-    keep_recent: usize,
-) -> Result<(Vec<ChatMessage>, Vec<Option<i64>>, bool)> {
-    let keep_recent = keep_recent.max(1);
-    let tail_start = tail_start_index(history);
-    let tail = &history[tail_start..];
-    let mut tail_ids: Vec<Option<i64>> = history_message_ids
-        .get(tail_start..)
-        .map(|s| s.iter().take(tail.len()).copied().collect())
-        .unwrap_or_default();
-    while tail_ids.len() < tail.len() {
-        tail_ids.push(None);
+    _keep_recent: usize,
+) -> Result<(Vec<ChatMessage>, bool)> {
+    let last_user_idx = history.iter().rposition(|m| m.role == "user");
+    let Some(last_user_idx) = last_user_idx else {
+        return Ok((history.to_vec(), false));
+    };
+
+    let to_compact = history.get(1..last_user_idx).unwrap_or_default();
+    let to_compact_for_transcript: Vec<ChatMessage> = to_compact
+        .iter()
+        .filter(|m| !is_tool_call_message(m))
+        .cloned()
+        .collect();
+
+    if to_compact_for_transcript.is_empty() {
+        return Ok((history.to_vec(), false));
     }
 
-    if tail.len() <= keep_recent {
-        return Ok((history.to_vec(), history_message_ids.to_vec(), false));
-    }
+    let last_id = store.last_message_id(session_id).ok().flatten().filter(|&id| id > 0);
 
-    let compact_until = tail.len().saturating_sub(keep_recent);
-    let to_compact = &tail[..compact_until];
-    let kept_tail = &tail[compact_until..];
-    let kept_ids: Vec<Option<i64>> = tail_ids[compact_until..].to_vec();
-
-    let existing_summary = load_compaction_state(store, session_id)
-        .ok()
-        .and_then(|s| s.summary);
-    let transcript = build_transcript_from_chat_messages(to_compact);
-    let prompt = build_compaction_prompt(existing_summary.as_deref(), &transcript, system_prompt);
+    let transcript = build_transcript_from_chat_messages(&to_compact_for_transcript);
+    let prompt = build_compaction_prompt(&transcript, system_prompt);
 
     let summary_messages = vec![
         ChatMessage::system("You are a session compaction engine. Return compact durable context."),
@@ -233,33 +198,24 @@ pub async fn compact_in_memory_history(
         });
     let summary = truncate_with_ellipsis(summary_raw.trim(), SESSION_COMPACTION_MAX_SUMMARY_CHARS);
 
-    let after_message_id = (0..compact_until)
-        .rev()
-        .find_map(|i| tail_ids.get(i).and_then(|o| *o))
-        .filter(|&id| id > 0);
-
-    if let Some(boundary_id) = after_message_id {
+    if let Some(boundary_id) = last_id {
         let _ = store.set_state_key(
             session_id,
             SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY,
             &serde_json::to_string(&boundary_id).unwrap_or_default(),
         );
     }
-    let _ = store.set_state_key(
-        session_id,
-        SESSION_COMPACTION_SUMMARY_KEY,
-        &serde_json::to_string(&summary).unwrap_or_default(),
-    );
 
-    let new_summary_msg = build_compaction_summary_message(&summary);
+    let summary_msg = build_compaction_summary_message(&summary);
+    let summary_content = summary_msg.content.clone();
+    let _ = store.append_message(session_id, "assistant", &summary_content, None);
+
+    let kept = history.get(last_user_idx..).unwrap_or_default();
     let mut new_history = vec![history[0].clone()];
-    new_history.push(new_summary_msg);
-    new_history.extend(kept_tail.to_vec());
+    new_history.push(summary_msg);
+    new_history.extend(kept.to_vec());
 
-    let mut new_ids = vec![None; 2];
-    new_ids.extend(kept_ids);
-
-    Ok((new_history, new_ids, true))
+    Ok((new_history, true))
 }
 
 #[cfg(test)]

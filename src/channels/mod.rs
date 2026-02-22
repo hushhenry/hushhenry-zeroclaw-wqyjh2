@@ -44,7 +44,7 @@ use crate::providers::{self, ChatMessage, Provider, ProviderCtx, ProviderManager
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
-    compaction::{build_compaction_summary_message, build_merged_system_prompt, CompactionState},
+    compaction::build_merged_system_prompt,
     SessionId, SessionMessage, SessionMessageRole, SessionStore,
 };
 use crate::tools::{self, Tool};
@@ -544,59 +544,6 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-/// Returns false when the delivery channel is internal (unified reply: use message envelope only).
-pub(crate) fn should_deliver_to_external_channel(delivery_channel: &str) -> bool {
-    delivery_channel != INTERNAL_MESSAGE_CHANNEL
-}
-
-/// M4: Build ephemeral context from recent announce messages (meta_json with source/result). Not persisted.
-pub(crate) fn build_ephemeral_announce_context(messages: &[SessionMessage]) -> String {
-    const MAX_RESULT_PREVIEW: usize = 120;
-    let mut lines: Vec<String> = Vec::new();
-    for msg in messages {
-        if msg.role != "assistant" {
-            continue;
-        }
-        let Some(meta_str) = msg.meta_json.as_deref() else {
-            continue;
-        };
-        let meta: serde_json::Value = match serde_json::from_str(meta_str) {
-            Ok(m) => m,
-            _ => continue,
-        };
-        let source = match meta.get("source").and_then(|s| s.as_object()) {
-            Some(s) => s,
-            _ => continue,
-        };
-        let agent_id = source
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let result_preview = meta
-            .get("result")
-            .and_then(|r| r.as_str())
-            .map(|s| {
-                let t = s.trim();
-                if t.len() <= MAX_RESULT_PREVIEW {
-                    t.to_string()
-                } else {
-                    format!("{}…", &t[..MAX_RESULT_PREVIEW])
-                }
-            })
-            .unwrap_or_else(|| "(no result)".to_string());
-        lines.push(format!(
-            "- @{}: {}",
-            agent_id,
-            result_preview.replace('\n', " ")
-        ));
-    }
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("[Subagent results]\n{}", lines.join("\n"))
-    }
-}
-
 /// Merges consecutive same-role messages so the tail is strictly user/assistant alternating.
 /// Returns (normalized ChatMessages, last DB id per logical message for boundary tracking).
 pub(crate) fn normalize_tail_messages(
@@ -643,17 +590,13 @@ pub(crate) fn normalize_tail_messages(
     (out, ids)
 }
 
-/// Build session turn history from normalized tail (no DB ids in output).
+/// Build session turn history: system + tail (summary lives in tail as a user message in session_messages).
 pub(crate) fn build_session_turn_history_with_tail(
     system_prompt: &str,
-    compaction_state: &CompactionState,
     tail_chat: &[ChatMessage],
     current_user_content: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut history = vec![ChatMessage::system(system_prompt)];
-    if let Some(summary) = compaction_state.summary.as_deref() {
-        history.push(build_compaction_summary_message(summary));
-    }
     history.extend(tail_chat.iter().cloned());
     if let Some(content) = current_user_content {
         history.push(ChatMessage::user(content));
@@ -661,20 +604,14 @@ pub(crate) fn build_session_turn_history_with_tail(
     history
 }
 
-/// Build session turn history: system prompt, optional compaction summary, tail messages (normalized), and optional current user message.
+/// Build session turn history: system prompt + normalized tail messages + optional current user message.
 pub(crate) fn build_session_turn_history(
     system_prompt: &str,
-    compaction_state: &CompactionState,
     tail_messages: &[SessionMessage],
     current_user_content: Option<&str>,
 ) -> Vec<ChatMessage> {
     let (tail_chat, _) = normalize_tail_messages(tail_messages);
-    build_session_turn_history_with_tail(
-        system_prompt,
-        compaction_state,
-        &tail_chat,
-        current_user_content,
-    )
+    build_session_turn_history_with_tail(system_prompt, &tail_chat, current_user_content)
 }
 
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
@@ -1786,21 +1723,6 @@ mod tests {
     }
 
     #[test]
-    fn should_deliver_to_external_channel_returns_true_when_no_store_or_session() {
-        assert!(should_deliver_to_external_channel("telegram"));
-    }
-
-    #[test]
-    fn should_deliver_to_external_channel_returns_false_for_internal_channel() {
-        assert!(!should_deliver_to_external_channel(INTERNAL_MESSAGE_CHANNEL));
-    }
-
-    #[test]
-    fn should_deliver_to_external_channel_returns_true_for_telegram() {
-        assert!(should_deliver_to_external_channel("telegram"));
-    }
-
-    #[test]
     fn normalize_tail_messages_merges_consecutive_same_role_and_returns_last_id() {
         use crate::session::SessionMessage;
         let tail = vec![
@@ -1836,48 +1758,6 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], Some(2));
         assert_eq!(ids[1], Some(3));
-    }
-
-    #[test]
-    fn build_ephemeral_announce_context_returns_empty_for_empty_messages() {
-        let messages: Vec<SessionMessage> = vec![];
-        assert!(build_ephemeral_announce_context(&messages).is_empty());
-    }
-
-    #[test]
-    fn build_ephemeral_announce_context_returns_empty_when_no_announce_meta() {
-        let messages = vec![
-            SessionMessage {
-                id: 1,
-                role: "assistant".to_string(),
-                content: "hello".to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                meta_json: None,
-            },
-            SessionMessage {
-                id: 2,
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                created_at: "2026-01-01T00:00:01Z".to_string(),
-                meta_json: None,
-            },
-        ];
-        assert!(build_ephemeral_announce_context(&messages).is_empty());
-    }
-
-    #[test]
-    fn build_ephemeral_announce_context_formats_announce_messages() {
-        let messages = vec![SessionMessage {
-            id: 1,
-            role: "assistant".to_string(),
-            content: "[@agent:runner#spec-1] finish".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            meta_json: Some(r#"{"source":{"agent_id":"spec-1"},"result":"done"}"#.to_string()),
-        }];
-        let out = build_ephemeral_announce_context(&messages);
-        assert!(out.contains("[Subagent results]"));
-        assert!(out.contains("@spec-1:"));
-        assert!(out.contains("done"));
     }
 
     #[test]
@@ -2848,10 +2728,11 @@ mod tests {
             )
             .unwrap();
         session_store
-            .set_state_key(
+            .append_message(
                 &session_id,
-                crate::session::compaction::SESSION_COMPACTION_SUMMARY_KEY,
-                "\"summary-v2\"",
+                "user",
+                "[Session Compaction Summary]\nsummary-v2",
+                None,
             )
             .unwrap();
 
@@ -2883,7 +2764,7 @@ mod tests {
 
         let captured_history = provider.captured_history.lock().await;
         assert!(captured_history.iter().any(|(role, content)| {
-            role == "assistant" && content.contains("[Session Compaction Summary]")
+            role == "user" && content.contains("[Session Compaction Summary]")
         }));
         assert!(captured_history
             .iter()

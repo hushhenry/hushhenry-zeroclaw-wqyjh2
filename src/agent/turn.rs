@@ -36,20 +36,12 @@ pub(crate) async fn run_session_compaction(
     let tail_messages = session_store
         .load_messages_after_id(session_id, compaction_state.after_message_id)
         .unwrap_or_default();
-    let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
-    let history = build_session_turn_history_with_tail(
-        &effective_system_prompt,
-        &compaction_state,
-        &tail_chat,
-        None,
-    );
-    let n_leading = history.len().saturating_sub(tail_chat.len());
-    let mut history_message_ids = vec![None; n_leading];
-    history_message_ids.extend(tail_ids);
+    let (tail_chat, _) = normalize_tail_messages(&tail_messages);
+    let history =
+        build_session_turn_history_with_tail(&effective_system_prompt, &tail_chat, None);
 
-    let (_, _, compacted) = compact_in_memory_history(
+    let (_, compacted) = compact_in_memory_history(
         &history,
-        &history_message_ids,
         session_store.as_ref(),
         session_id,
         &default_resolved,

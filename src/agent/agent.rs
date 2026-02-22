@@ -9,7 +9,7 @@ use crate::agent::loop_::{
 use crate::channels::traits;
 use crate::channels::{
     build_session_turn_history_with_tail, normalize_tail_messages, send_delivery_message,
-    should_deliver_to_external_channel, ChannelRuntimeContext, INTERNAL_MESSAGE_CHANNEL,
+    ChannelRuntimeContext,
 };
 use crate::observability::ObserverEvent;
 use crate::providers::{ChatMessage, ChatRequest, ToolCall};
@@ -191,8 +191,6 @@ pub(crate) struct Agent {
     message_rx: mpsc::Receiver<AgentQueueItem>,
     deliver_tx: mpsc::Sender<DeliverMessage>,
     history: Vec<ChatMessage>,
-    /// DB message id per history entry (Some for persisted user/assistant, None for system/summary/tool).
-    history_message_ids: Vec<Option<i64>>,
     ctx: Arc<ChannelRuntimeContext>,
     /// When true, deliver_loop also sends Tool variants (verbose).
     verbose_tool_output: bool,
@@ -217,24 +215,16 @@ impl Agent {
             );
         let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
 
-        let (history, history_message_ids) = if let Some(store) = ctx.session_store.as_ref() {
+        let history = if let Some(store) = ctx.session_store.as_ref() {
             let compaction_state =
                 load_compaction_state(store, &session_id).unwrap_or_default();
             let tail_messages = store
                 .load_messages_after_id(&session_id, compaction_state.after_message_id)
                 .unwrap_or_default();
-            let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
-            let history = build_session_turn_history_with_tail(
-                &system_prompt,
-                &compaction_state,
-                &tail_chat,
-                None,
-            );
-            let mut ids = vec![None; history.len().saturating_sub(tail_chat.len())];
-            ids.extend(tail_ids);
-            (history, ids)
+            let (tail_chat, _) = normalize_tail_messages(&tail_messages);
+            build_session_turn_history_with_tail(&system_prompt, &tail_chat, None)
         } else {
-            (vec![], vec![])
+            vec![]
         };
 
         Ok(Self {
@@ -246,7 +236,6 @@ impl Agent {
             message_rx,
             deliver_tx,
             history,
-            history_message_ids,
             ctx,
             verbose_tool_output,
         })
@@ -330,8 +319,7 @@ impl Agent {
     }
 
     fn delivery_target(&self, envelope: &AgentWorkItem) -> (String, String) {
-        let msg = envelope.to_channel_message();
-        (msg.channel.clone(), msg.reply_target.clone())
+        (envelope.channel.clone(), envelope.reply_target.clone())
     }
 
     /// /stop: abort current turn. Delivers "Agent was aborted.", returns true.
@@ -539,29 +527,37 @@ impl Agent {
                 continue;
             };
 
-            let msg = work.to_channel_message();
-
-            if let Err(e) = self
-                .tool_call_loop_session(&session_id, session_store.as_deref(), &msg)
+            match self
+                .tool_call_loop_session(&session_id, session_store.as_deref(), &work)
                 .await
             {
-                tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
+                Ok(Some((user_content, assistant_content))) => {
+                    if let Some(store) = session_store.as_ref() {
+                        let _ = store.append_message(&session_id, "user", &user_content, None);
+                        let _ = store.append_message(&session_id, "assistant", &assistant_content, None);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
+                }
             }
         }
     }
 
-    /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user; persist user at start, assistant at end only when session_store is Some.
+    /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user.
+    /// Returns Ok(Some((user, assistant))) on successful turn (persist both after return); Ok(None) on abort (e.g. /stop).
     async fn tool_call_loop_session(
         &mut self,
         session_id: &SessionId,
         session_store: Option<&SessionStore>,
-        msg: &traits::ChannelMessage,
-    ) -> Result<()> {
-        let delivery_channel_name = msg.channel.clone();
-        let delivery_reply_target = msg.reply_target.clone();
+        work: &AgentWorkItem,
+    ) -> Result<Option<(String, String)>> {
+        let delivery_channel_name = work.channel.clone();
+        let delivery_reply_target = work.reply_target.clone();
 
-        let new_content = msg.content.clone();
-        let (user_content, persist_user_content, merged_into_orphan) = {
+        let new_content = work.content.clone();
+        let (user_content, _, _) = {
             let last_is_user = self
                 .history
                 .last()
@@ -574,24 +570,11 @@ impl Agent {
                 (merged, new_content, true)
             } else {
                 self.history.push(ChatMessage::user(new_content.clone()));
-                self.history_message_ids.push(None);
                 (new_content.clone(), new_content, false)
             }
         };
 
         if let Some(store) = session_store {
-            if should_deliver_to_external_channel(&delivery_channel_name) {
-                if let Ok(id) =
-                    store.append_message(session_id, "user", &persist_user_content, None)
-                {
-                    if id > 0 && !merged_into_orphan {
-                        if let Some(last) = self.history_message_ids.last_mut() {
-                            *last = Some(id);
-                        }
-                    }
-                }
-            }
-
             if estimate_tokens(&self.history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
                 self.run_compact_in_memory(session_id, store).await?;
             }
@@ -639,27 +622,19 @@ impl Agent {
             if tool_calls.is_empty() {
                 self.history.push(ChatMessage::assistant(text.clone()));
                 self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
-                if let Some(store) = session_store {
-                    if should_deliver_to_external_channel(&delivery_channel_name) {
-                        if let Ok(id) = store.append_message(session_id, "assistant", &text, None) {
-                            self.history_message_ids
-                                .push(if id > 0 { Some(id) } else { None });
-                        } else {
-                            self.history_message_ids.push(None);
-                        }
-                    } else {
-                        self.history_message_ids.push(None);
-                    }
-                } else {
-                    self.history_message_ids.push(None);
-                }
-                return Ok(());
+                let last_user_content = self
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                return Ok(Some((last_user_content, text)));
             }
 
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
             self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
             self.history.push(ChatMessage::assistant(assistant_content));
-            self.history_message_ids.push(None);
 
             for (idx, call) in tool_calls.iter().enumerate() {
                 let steer_items = drain_agent_queue(&mut self.message_rx);
@@ -667,7 +642,7 @@ impl Agent {
 
                 for (cmd, envelope) in steer_commands {
                     match self.run_command_and_deliver(cmd, &envelope).await {
-                        Ok(true) => return Ok(()),
+                        Ok(true) => return Ok(None),
                         Ok(false) => {}
                         Err(e) => {
                             tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
@@ -685,7 +660,6 @@ impl Agent {
                             })
                             .to_string(),
                         ));
-                        self.history_message_ids.push(None);
                         self.on_message(
                             skip_msg,
                             true,
@@ -695,7 +669,6 @@ impl Agent {
                     }
                     let merged = build_steer_merge_message(&user_content, steer_messages);
                     self.history.push(ChatMessage::user(merged));
-                    self.history_message_ids.push(None);
                     break;
                 }
 
@@ -712,7 +685,6 @@ impl Agent {
                     })
                     .to_string(),
                 ));
-                self.history_message_ids.push(None);
                 self.on_message(
                     &output,
                     true,
@@ -739,7 +711,6 @@ impl Agent {
             .map_err(anyhow::Error::msg)?;
         match compact_in_memory_history(
             &self.history,
-            &self.history_message_ids,
             session_store,
             session_id,
             &default_resolved,
@@ -748,9 +719,8 @@ impl Agent {
         )
         .await
         {
-            Ok((new_history, new_ids, compacted)) => {
+            Ok((new_history, compacted)) => {
                 self.history = new_history;
-                self.history_message_ids = new_ids;
                 Ok(compacted)
             }
             Err(e) => {

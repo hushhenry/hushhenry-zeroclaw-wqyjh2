@@ -411,6 +411,20 @@ impl SessionStore {
             .context("Failed to decode boundary-filtered session messages")
     }
 
+    /// Returns the id of the last message in the session (max id).
+    pub fn last_message_id(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        let conn = self.conn.lock();
+        let id = conn
+            .query_row(
+                "SELECT id FROM session_messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("Failed to query last message id")?;
+        Ok(id)
+    }
+
     pub fn get_state_key(&self, session_id: &SessionId, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let value = conn
@@ -673,6 +687,29 @@ mod tests {
 
         let active = store.get_or_create_active(inbound_key).unwrap();
         assert_eq!(active.as_str(), newer_session.as_str());
+    }
+
+    #[test]
+    fn last_message_id_returns_none_when_no_messages_and_max_id_after_append() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+        let inbound_key = "channel:test:chat-last-id";
+        let session_id = store.get_or_create_active(inbound_key).unwrap();
+
+        assert!(store.last_message_id(&session_id).unwrap().is_none());
+
+        store.append_message(&session_id, "user", "first", None).unwrap();
+        let id1 = store.last_message_id(&session_id).unwrap();
+        assert!(id1.is_some());
+        assert!(id1.unwrap() > 0);
+
+        store.append_message(&session_id, "assistant", "second", None).unwrap();
+        let id2 = store.last_message_id(&session_id).unwrap();
+        assert!(id2.is_some());
+        assert!(id2.unwrap() >= id1.unwrap());
+
+        let other_session = store.create_new("channel:test:other").unwrap();
+        assert!(store.last_message_id(&other_session).unwrap().is_none());
     }
 
     #[test]
