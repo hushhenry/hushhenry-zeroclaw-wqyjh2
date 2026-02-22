@@ -519,7 +519,7 @@ mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use crate::session::{ExecRunStatus, SessionStore};
+    use crate::tools::shell_exec_runtime::ExecRunStatus;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -618,10 +618,14 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
         let run_id = payload["run_id"].as_str().unwrap();
 
-        let store = SessionStore::new(tmp.path()).unwrap();
-        let run = store.get_exec_run(run_id).unwrap().unwrap();
-        assert_eq!(run.session_id, "session-spawn");
-        assert_eq!(run.status, ExecRunStatus::Queued.as_str());
+        let poll_result = tool
+            .execute(json!({ "action": "poll", "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(poll_result.success);
+        let poll_payload: serde_json::Value = serde_json::from_str(poll_result.output.as_str()).unwrap();
+        assert_eq!(poll_payload["session_id"], "session-spawn");
+        assert_eq!(poll_payload["status"], ExecRunStatus::Queued.as_str());
     }
 
     #[tokio::test]

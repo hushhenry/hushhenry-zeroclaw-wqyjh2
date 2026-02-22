@@ -215,23 +215,18 @@ impl MattermostChannel {
 
         Some(ChannelMessage {
             id: format!("mattermost_{id}"),
-            agent_id: None,
-            account_id: None,
             sender: user_id.to_string(),
             reply_target,
             content: text.to_string(),
             channel: "mattermost".to_string(),
-            title: None,
-            chat_type: ChatType::Thread,
-            raw_chat_type: None,
-            chat_id: channel_id.to_string(),
-            thread_id: Some(if root_id.is_empty() {
+            #[allow(clippy::cast_sign_loss)]
+            timestamp: (create_at / 1000) as u64,
+            thread_ts: Some(if root_id.is_empty() {
                 id.to_string()
             } else {
                 root_id.to_string()
             }),
-            #[allow(clippy::cast_sign_loss)]
-            timestamp: (create_at / 1000) as u64,
+            session_id: None,
         })
     }
 }

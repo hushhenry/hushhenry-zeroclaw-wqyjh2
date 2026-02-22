@@ -267,21 +267,16 @@ impl Channel for DingTalkChannel {
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
-                        agent_id: None,
-                        account_id: None,
                         sender: sender_id.to_string(),
                         reply_target: chat_id.clone(),
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
-                        title: None,
-                        chat_type,
-                        raw_chat_type: None,
-                        chat_id: chat_id,
-                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
+                        session_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

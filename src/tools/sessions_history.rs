@@ -105,7 +105,7 @@ impl Tool for SessionsHistoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionKey, SessionStore};
+    use crate::session::SessionStore;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -113,7 +113,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
         let session_id = store
-            .get_or_create_active(&SessionKey::new("direct:telegram:zeroclaw_user"))
+            .get_or_create_active("channel:telegram:zeroclaw_user")
             .unwrap();
         store
             .append_message(&session_id, "user", "history-message", None)

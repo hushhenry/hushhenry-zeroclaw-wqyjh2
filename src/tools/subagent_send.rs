@@ -41,9 +41,13 @@ impl Tool for SubagentSendTool {
                     "type": "string",
                     "description": "Optional subagent spec name (used when creating a new subagent session)"
                 },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional agent id (used when creating a new subagent session)"
+                },
                 "spec_id": {
                     "type": "string",
-                    "description": "Optional subagent spec id (used when creating a new subagent session)"
+                    "description": "Deprecated alias for agent_id"
                 },
                 "input_json": {
                     "type": "string",
@@ -86,8 +90,9 @@ impl Tool for SubagentSendTool {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
 
-        let spec_id = args
-            .get("spec_id")
+        let agent_id = args
+            .get("agent_id")
+            .or(args.get("spec_id"))
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -127,16 +132,16 @@ impl Tool for SubagentSendTool {
         };
 
         let runtime = SubagentRuntime::shared(Arc::clone(&self.config))?;
-        let resolved_spec_id = if spec_id.is_some() || subagent_session_id.is_some() {
-            spec_id
+        let resolved_agent_id = if agent_id.is_some() || subagent_session_id.is_some() {
+            agent_id
         } else if let Some(name) = _spec_name {
-            match runtime.store.get_subagent_spec_by_name(name)? {
-                Some(spec) => Some(spec.spec_id),
+            match runtime.store.get_agent_by_name(name)? {
+                Some(agent) => Some(agent.agent_id),
                 None => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Subagent spec not found: {name}")),
+                        error: Some(format!("Agent not found: {name}")),
                     });
                 }
             }
@@ -151,7 +156,7 @@ impl Tool for SubagentSendTool {
                 .ok_or_else(|| anyhow::anyhow!("Subagent session not found: {id}"))?
         } else {
             runtime.store.create_subagent_session(
-                resolved_spec_id.as_deref(),
+                resolved_agent_id.as_deref(),
                 session_meta_json.as_deref(),
             )?
         };
@@ -161,7 +166,7 @@ impl Tool for SubagentSendTool {
             output: serde_json::to_string_pretty(&json!({
                 "subagent_session_id": session.subagent_session_id,
                 "status": session.status,
-                "spec_id": session.spec_id,
+                "agent_id": session.agent_id,
                 "created_at": session.created_at,
                 "updated_at": session.updated_at
             }))?,

@@ -89,7 +89,6 @@ impl Tool for SessionsSendTool {
             "sessions_send",
             session_id.as_str(),
             content,
-            None::<&str>,
         );
         match dispatch_internal_message(msg).await {
             Ok(()) => Ok(ToolResult {
@@ -113,7 +112,7 @@ impl Tool for SessionsSendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionKey, SessionStore};
+    use crate::session::SessionStore;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -121,7 +120,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
         let session_id = store
-            .get_or_create_active(&SessionKey::new("group:discord:chan-1"))
+            .get_or_create_active("channel:discord:chan-1")
             .unwrap();
 
         let tool = SessionsSendTool::new(workspace.path().to_path_buf());

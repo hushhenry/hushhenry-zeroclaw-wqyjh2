@@ -1,7 +1,7 @@
 use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
+    IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::memory::{
@@ -114,7 +114,6 @@ pub fn run_wizard() -> Result<Config> {
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
         provider_groups: Vec::new(),
-        heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
@@ -329,7 +328,6 @@ pub fn run_quick_setup(
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
         provider_groups: Vec::new(),
-        heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
@@ -3309,17 +3307,6 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          This is a starting point. Add your own conventions, style, and rules.\n"
     );
 
-    let heartbeat = format!(
-        "# HEARTBEAT.md\n\n\
-         # Keep this file empty (or with only comments) to skip heartbeat work.\n\
-         # Add tasks below when you want {agent} to check something periodically.\n\
-         #\n\
-         # Examples:\n\
-         # - Check my email for important messages\n\
-         # - Review my calendar for upcoming events\n\
-         # - Run `git status` on my active projects\n"
-    );
-
     let soul = format!(
         "# SOUL.md — Who You Are\n\n\
          *You're not a chatbot. You're becoming someone.*\n\n\
@@ -3417,7 +3404,6 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
-        ("HEARTBEAT.md", heartbeat),
         ("SOUL.md", soul),
         ("USER.md", user_md),
         ("BOOTSTRAP.md", bootstrap),
@@ -3681,7 +3667,6 @@ mod tests {
         let expected = [
             "IDENTITY.md",
             "AGENTS.md",
-            "HEARTBEAT.md",
             "SOUL.md",
             "USER.md",
             "BOOTSTRAP.md",
@@ -3774,12 +3759,6 @@ mod tests {
         assert!(
             agents.contains("Crabby Personal Assistant"),
             "AGENTS.md should contain agent name"
-        );
-
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
-        assert!(
-            heartbeat.contains("Crabby"),
-            "HEARTBEAT.md should contain agent name"
         );
 
         let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
@@ -3912,7 +3891,6 @@ mod tests {
         for f in &[
             "IDENTITY.md",
             "AGENTS.md",
-            "HEARTBEAT.md",
             "SOUL.md",
             "USER.md",
             "BOOTSTRAP.md",
@@ -4047,9 +4025,6 @@ mod tests {
         assert!(bootstrap.contains("**Argenis**"));
         assert!(bootstrap.contains("US/Eastern"));
         assert!(bootstrap.contains("Introduce yourself as Claw"));
-
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
-        assert!(heartbeat.contains("Claw"));
     }
 
     // ── model helper coverage ───────────────────────────────────

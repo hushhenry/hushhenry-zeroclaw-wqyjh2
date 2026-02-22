@@ -20,7 +20,6 @@ pub struct OtelObserver {
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
-    heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
     request_latency: Histogram<f64>,
     tokens_used: Counter<u64>,
@@ -118,11 +117,6 @@ impl OtelObserver {
             .with_description("Total channel messages")
             .build();
 
-        let heartbeat_ticks = meter
-            .u64_counter("zeroclaw.heartbeat.ticks")
-            .with_description("Total heartbeat ticks")
-            .build();
-
         let errors = meter
             .u64_counter("zeroclaw.errors")
             .with_description("Total errors by component")
@@ -159,7 +153,6 @@ impl OtelObserver {
             tool_calls,
             tool_duration,
             channel_messages,
-            heartbeat_ticks,
             errors,
             request_latency,
             tokens_used,
@@ -299,9 +292,6 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
-            ObserverEvent::HeartbeatTick => {
-                self.heartbeat_ticks.add(1, &[]);
-            }
             ObserverEvent::Error { component, message } => {
                 // Create an error span for visibility in trace backends
                 let mut span = tracer.build(
@@ -423,7 +413,6 @@ mod tests {
             channel: "telegram".into(),
             direction: "inbound".into(),
         });
-        obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
             component: "provider".into(),
             message: "timeout".into(),
@@ -443,7 +432,7 @@ mod tests {
     #[test]
     fn flush_does_not_panic() {
         let obs = test_observer();
-        obs.record_event(&ObserverEvent::HeartbeatTick);
+        obs.record_event(&ObserverEvent::TurnComplete);
         obs.flush();
     }
 }

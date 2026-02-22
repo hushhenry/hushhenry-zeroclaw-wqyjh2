@@ -31,9 +31,9 @@ impl Tool for SessionsListTool {
         json!({
             "type": "object",
             "properties": {
-                "session_key": {
+                "inbound_key": {
                     "type": "string",
-                    "description": "Optional exact session_key filter"
+                    "description": "Optional exact inbound_key filter"
                 },
                 "limit": {
                     "type": "integer",
@@ -51,20 +51,20 @@ impl Tool for SessionsListTool {
             .unwrap_or(DEFAULT_LIMIT)
             .clamp(1, MAX_LIMIT);
 
-        let session_key = args
-            .get("session_key")
+        let inbound_key = args
+            .get("inbound_key")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
         let store = SessionStore::new(&self.workspace_dir)?;
-        let sessions = store.list_sessions(session_key, limit)?;
+        let sessions = store.list_sessions(inbound_key, limit)?;
         let output = sessions
             .iter()
             .map(|session| {
                 json!({
                     "session_id": session.session_id,
-                    "session_key": session.session_key,
+                    "inbound_key": session.inbound_key,
                     "status": session.status,
                     "title": session.title,
                     "created_at": session.created_at,
@@ -85,15 +85,15 @@ impl Tool for SessionsListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionKey, SessionStore};
+    use crate::session::SessionStore;
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn sessions_list_returns_created_sessions() {
         let workspace = TempDir::new().unwrap();
         let store = SessionStore::new(workspace.path()).unwrap();
-        let session_key = SessionKey::new("group:telegram:chat-1");
-        let session_id = store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = "channel:telegram:chat-1";
+        let session_id = store.get_or_create_active(inbound_key).unwrap();
         store
             .append_message(&session_id, "user", "hello", None)
             .unwrap();
@@ -101,6 +101,6 @@ mod tests {
         let tool = SessionsListTool::new(workspace.path().to_path_buf());
         let result = tool.execute(json!({ "limit": 5 })).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("group:telegram:chat-1"));
+        assert!(result.output.contains("channel:telegram:chat-1"));
     }
 }

@@ -172,21 +172,16 @@ impl Channel for SlackChannel {
 
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
-                        agent_id: None,
-                        account_id: None,
                         sender: user.to_string(),
                         reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
-                        title: None,
-                        chat_type,
-                        raw_chat_type: None,
-                        chat_id: channel_id.clone(),
-                        thread_id,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: thread_id,
+                        session_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

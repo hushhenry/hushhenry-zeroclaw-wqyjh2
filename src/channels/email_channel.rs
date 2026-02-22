@@ -428,18 +428,13 @@ impl Channel for EmailChannel {
                         } // MutexGuard dropped before await
                         let msg = ChannelMessage {
                             id,
-                            agent_id: None,
-                            account_id: None,
-                            reply_target: sender.clone(),
                             sender: sender.clone(),
+                            reply_target: sender.clone(),
                             content,
                             channel: "email".to_string(),
-                            title: None,
-                            chat_type: ChatType::Direct,
-                            raw_chat_type: None,
-                            chat_id: sender,
-                            thread_id: None,
                             timestamp: ts,
+                            thread_ts: None,
+                            session_id: None,
                         };
                         if tx.send(msg).await.is_err() {
                             return Ok(());

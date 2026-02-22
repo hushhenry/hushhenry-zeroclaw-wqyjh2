@@ -171,21 +171,16 @@ end tell"#
 
                         let msg = ChannelMessage {
                             id: rowid.to_string(),
-                            agent_id: None,
-                            account_id: None,
                             sender: sender.clone(),
                             reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
-                            title: None,
-                            chat_type: ChatType::Direct,
-                            raw_chat_type: None,
-                            chat_id: sender,
-                            thread_id: None,
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
+                            thread_ts: None,
+                            session_id: None,
                         };
 
                         if tx.send(msg).await.is_err() {

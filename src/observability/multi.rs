@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn multi_empty_no_panic() {
         let m = MultiObserver::new(vec![]);
-        m.record_event(&ObserverEvent::HeartbeatTick);
+        m.record_event(&ObserverEvent::TurnComplete);
         m.record_metric(&ObserverMetric::TokensUsed(10));
         m.flush();
     }
@@ -106,9 +106,9 @@ mod tests {
             Box::new(CountingObserver::new(ec2.clone(), mc2.clone(), fc2.clone())),
         ]);
 
-        m.record_event(&ObserverEvent::HeartbeatTick);
-        m.record_event(&ObserverEvent::HeartbeatTick);
-        m.record_event(&ObserverEvent::HeartbeatTick);
+        m.record_event(&ObserverEvent::TurnComplete);
+        m.record_event(&ObserverEvent::TurnComplete);
+        m.record_event(&ObserverEvent::TurnComplete);
 
         assert_eq!(ec1.load(Ordering::SeqCst), 3);
         assert_eq!(ec2.load(Ordering::SeqCst), 3);

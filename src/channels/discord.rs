@@ -409,8 +409,6 @@ impl Channel for DiscordChannel {
                         } else {
                             format!("discord_{message_id}")
                         },
-                        agent_id: None,
-                        account_id: None,
                         sender: author_id.to_string(),
                         reply_target: if channel_id.is_empty() {
                             author_id.to_string()
@@ -419,15 +417,12 @@ impl Channel for DiscordChannel {
                         },
                         content: clean_content,
                         channel: channel_id,
-                        title: None,
-                        chat_type,
-                        raw_chat_type: None,
-                        chat_id,
-                        thread_id: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
+                        session_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

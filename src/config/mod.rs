@@ -4,7 +4,7 @@ pub mod schema;
 pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DiscordConfig,
-    DockerRuntimeConfig, GatewayConfig, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
+    DockerRuntimeConfig, GatewayConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     ProviderGroupConfig, ProviderGroupStrategy, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,

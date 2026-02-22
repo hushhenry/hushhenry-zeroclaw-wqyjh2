@@ -9,7 +9,7 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
-use crate::session::{SessionId, SessionKey, SessionStore};
+use crate::session::{SessionId, SessionStore};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
@@ -121,11 +121,11 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
             .map(|id| SessionId::from_string(id.to_string()))
             .or_else(|| {
                 store
-                    .get_or_create_active(&SessionKey::new("internal:cron:main"))
+                    .get_or_create_active("internal:cron:main")
                     .ok()
             }),
         SessionTarget::Isolated => store
-            .get_or_create_active(&SessionKey::new(format!("internal:cron:{}", job.id)))
+            .get_or_create_active(&format!("internal:cron:{}", job.id))
             .ok(),
     };
     let Some(session_id) = session_id else {
@@ -138,7 +138,6 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
         "zeroclaw_scheduler",
         session_id.as_str(),
         prefixed_prompt,
-        None,
     );
     match dispatch_internal_message(msg).await {
         Ok(()) => (true, "agent job enqueued to internal channel".to_string()),
@@ -274,50 +273,9 @@ fn resolve_delivery_route(
     job: &CronJob,
     delivery: &DeliveryConfig,
 ) -> Result<DeliveryRoute> {
-    let effective_session_id = job
-        .delivery_session_id
-        .as_deref()
-        .or(job.source_session_id.as_deref());
-
-    if let Some(session_id) = effective_session_id {
-        let store = SessionStore::new(&config.workspace_dir)?;
-        match store.load_route_metadata(&SessionId::from_string(session_id)) {
-            Ok(Some(metadata)) => {
-                let target = if metadata.channel == INTERNAL_MESSAGE_CHANNEL {
-                    metadata
-                        .chat_id
-                        .strip_prefix("session:")
-                        .unwrap_or(metadata.chat_id.as_str())
-                        .to_string()
-                } else {
-                    metadata.route_id.unwrap_or(metadata.chat_id)
-                };
-                return Ok(DeliveryRoute {
-                    channel: metadata.channel,
-                    target,
-                });
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    "Cron delivery session_id route lookup returned no metadata: {}",
-                    session_id
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "Cron delivery session_id route lookup failed for {}: {error}",
-                    session_id
-                );
-            }
-        }
-    }
-
-    // Legacy: fallback to delivery.channel + delivery.to when no session route is available
+    // Unified reply: delivery target from job config only (delivery.channel + delivery.to).
     let channel = delivery.channel.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "delivery requires either a session (delivery_session_id or source_session_id with \
-                 route in session store) or delivery.channel + delivery.to"
-        )
+        anyhow::anyhow!("delivery.channel is required")
     })?;
     let target = delivery
         .to
@@ -336,7 +294,7 @@ async fn send_via_channel(
     output: &str,
 ) -> Result<()> {
     if channel == INTERNAL_MESSAGE_CHANNEL {
-        let msg = build_internal_channel_message("zeroclaw_scheduler", target, output, None);
+        let msg = build_internal_channel_message("zeroclaw_scheduler", target, output);
         return dispatch_internal_message(msg).await;
     }
 
@@ -537,7 +495,6 @@ mod tests {
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
-    use crate::session::{SessionKey, SessionRouteMetadata, SessionStore};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
 
@@ -814,31 +771,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_delivery_route_prefers_source_session_route() {
+    fn resolve_delivery_route_uses_delivery_channel_and_to() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let store = SessionStore::new(&config.workspace_dir).unwrap();
-        let session_id = store
-            .get_or_create_active(&SessionKey::new("group:telegram:chat-42"))
-            .unwrap();
-        store
-            .upsert_route_metadata(
-                &session_id,
-                &SessionRouteMetadata {
-                    agent_id: None,
-                    channel: "discord".into(),
-                    account_id: None,
-                    chat_type: "thread".into(),
-                    chat_id: "chan-root".into(),
-                    route_id: Some("thread-99".into()),
-                    sender_id: "user-x".into(),
-                    title: None,
-                },
-            )
-            .unwrap();
-
         let mut job = test_job("echo ok");
-        job.source_session_id = Some(session_id.as_str().to_string());
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
             channel: Some("slack".into()),
@@ -847,8 +783,8 @@ mod tests {
         };
 
         let route = resolve_delivery_route(&config, &job, &job.delivery).unwrap();
-        assert_eq!(route.channel, "discord");
-        assert_eq!(route.target, "thread-99");
+        assert_eq!(route.channel, "slack");
+        assert_eq!(route.target, "fallback");
     }
 
     #[test]
@@ -870,35 +806,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_delivery_route_keeps_lark_channel_from_session_meta() {
+    fn resolve_delivery_route_requires_channel_and_to() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let store = SessionStore::new(&config.workspace_dir).unwrap();
-        let session_id = store
-            .get_or_create_active(&SessionKey::new("group:lark:chat-88"))
-            .unwrap();
-        store
-            .upsert_route_metadata(
-                &session_id,
-                &SessionRouteMetadata {
-                    agent_id: None,
-                    channel: "lark".into(),
-                    account_id: None,
-                    chat_type: "group".into(),
-                    chat_id: "lark-chat".into(),
-                    route_id: None,
-                    sender_id: "ou_test".into(),
-                    title: None,
-                },
-            )
-            .unwrap();
-
         let mut job = test_job("echo ok");
-        job.source_session_id = Some(session_id.as_str().to_string());
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
-            channel: Some("slack".into()),
-            to: Some("fallback".into()),
+            channel: Some("lark".into()),
+            to: Some("lark-chat".into()),
             best_effort: true,
         };
 

@@ -19,29 +19,23 @@ impl ChatType {
     }
 }
 
-/// A message received from or sent to a channel
+/// A message received from or sent to a channel.
+/// For channel messages, `session_id` is None and must not be read by channel code.
+/// Only internal messages carry `session_id` for routing.
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
     pub id: String,
-    pub agent_id: Option<String>,
-    pub account_id: Option<String>,
     pub sender: String,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
-    pub title: Option<String>,
-    pub chat_type: ChatType,
-    pub raw_chat_type: Option<String>,
-    pub chat_id: String,
-    pub thread_id: Option<String>,
     pub timestamp: u64,
-}
-
-impl ChannelMessage {
-    #[deprecated(note = "renamed to chat_id; use `chat_id` instead")]
-    pub fn conversation_id(&self) -> &str {
-        &self.chat_id
-    }
+    /// Platform thread identifier (e.g. Slack ts, Discord thread ID).
+    /// When set, replies should be posted as threaded responses.
+    pub thread_ts: Option<String>,
+    /// Optional target session identifier used by internal routing.
+    /// Set only when sending internal messages; channels must not access this field.
+    pub session_id: Option<String>,
 }
 
 /// Message to send through a channel
@@ -127,18 +121,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             tx.send(ChannelMessage {
                 id: "1".into(),
-                agent_id: None,
-                account_id: None,
                 sender: "tester".into(),
                 reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
-                title: None,
-                chat_type: ChatType::Direct,
-                raw_chat_type: None,
-                chat_id: "tester".into(),
-                thread_id: None,
                 timestamp: 123,
+                thread_ts: None,
+                session_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -149,33 +138,23 @@ mod tests {
     fn channel_message_clone_preserves_fields() {
         let message = ChannelMessage {
             id: "42".into(),
-            agent_id: None,
-            account_id: None,
             sender: "alice".into(),
             reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
-            title: Some("Example Chat".into()),
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "alice".into(),
-            thread_id: None,
             timestamp: 999,
+            thread_ts: Some("ts-1".into()),
+            session_id: None,
         };
 
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
-        assert!(cloned.agent_id.is_none());
-        assert!(cloned.account_id.is_none());
         assert_eq!(cloned.sender, "alice");
         assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");
-        assert_eq!(cloned.title.as_deref(), Some("Example Chat"));
-        assert_eq!(cloned.chat_type, ChatType::Direct);
-        assert!(cloned.raw_chat_type.is_none());
-        assert_eq!(cloned.chat_id, "alice");
-        assert!(cloned.thread_id.is_none());
+        assert_eq!(cloned.thread_ts.as_deref(), Some("ts-1"));
+        assert!(cloned.session_id.is_none());
         assert_eq!(cloned.timestamp, 999);
     }
 

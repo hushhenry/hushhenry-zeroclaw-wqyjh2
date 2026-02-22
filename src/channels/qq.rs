@@ -351,21 +351,16 @@ impl Channel for QQChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
-                                agent_id: None,
-                                account_id: None,
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
-                                chat_type: ChatType::Direct,
-                                title: None,
-                                raw_chat_type: None,
-                                chat_id: user_openid.to_string(),
-                                thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
+                                session_id: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -396,21 +391,16 @@ impl Channel for QQChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
-                                agent_id: None,
-                                account_id: None,
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
-                                chat_type: ChatType::Group,
-                                title: None,
-                                raw_chat_type: None,
-                                chat_id: group_openid.to_string(),
-                                thread_id: None,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                thread_ts: None,
+                                session_id: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

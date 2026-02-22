@@ -12,14 +12,13 @@
 
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
-use crate::session::{ExecRun, ExecRunItem, ExecRunStatus, SessionStore};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as SyncMutex;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -39,6 +38,214 @@ pub const CHUNK_MAX_CHARS: usize = 65536;
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecRunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+    TimedOut,
+}
+
+impl ExecRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecRun {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub command: String,
+    pub pty: bool,
+    pub timeout_secs: i64,
+    pub max_output_bytes: i64,
+    pub watch_json: Option<String>,
+    pub exit_code: Option<i64>,
+    pub output_bytes: i64,
+    pub truncated: bool,
+    pub error_message: Option<String>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecRunItem {
+    pub seq: i64,
+    pub run_id: String,
+    pub item_type: String,
+    pub payload: String,
+    pub meta_json: Option<String>,
+    pub created_at: String,
+}
+
+/// In-memory exec run queue and items (no persistence, no failure recovery).
+struct InMemoryExecRunStore {
+    runs: SyncMutex<HashMap<String, ExecRun>>,
+    items: SyncMutex<HashMap<String, Vec<ExecRunItem>>>,
+    queue: SyncMutex<VecDeque<String>>,
+    next_seq: AtomicI64,
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().format("%+").to_string()
+}
+
+impl InMemoryExecRunStore {
+    fn new() -> Self {
+        Self {
+            runs: SyncMutex::new(HashMap::new()),
+            items: SyncMutex::new(HashMap::new()),
+            queue: SyncMutex::new(VecDeque::new()),
+            next_seq: AtomicI64::new(1),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        session_id: &str,
+        command: &str,
+        pty: bool,
+        timeout_secs: i64,
+        max_output_bytes: i64,
+        watch_json: Option<&str>,
+    ) -> ExecRun {
+        let now = now_iso();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run = ExecRun {
+            run_id: run_id.clone(),
+            session_id: session_id.to_string(),
+            status: ExecRunStatus::Queued.as_str().to_string(),
+            command: command.to_string(),
+            pty,
+            timeout_secs,
+            max_output_bytes,
+            watch_json: watch_json.map(ToOwned::to_owned),
+            exit_code: None,
+            output_bytes: 0,
+            truncated: false,
+            error_message: None,
+            queued_at: now.clone(),
+            started_at: None,
+            finished_at: None,
+            updated_at: now.clone(),
+        };
+        self.runs.lock().insert(run_id.clone(), run.clone());
+        self.items.lock().insert(run_id.clone(), Vec::new());
+        self.queue.lock().push_back(run_id);
+        run
+    }
+
+    fn claim_next(&self) -> Option<ExecRun> {
+        let mut queue = self.queue.lock();
+        let run_id = queue.pop_front()?;
+        let mut runs = self.runs.lock();
+        let run = runs.get_mut(&run_id)?;
+        if run.status != ExecRunStatus::Queued.as_str() {
+            return None;
+        }
+        let now = now_iso();
+        run.status = ExecRunStatus::Running.as_str().to_string();
+        run.started_at = Some(now.clone());
+        run.updated_at = now;
+        Some(run.clone())
+    }
+
+    fn get_run(&self, run_id: &str) -> Option<ExecRun> {
+        self.runs.lock().get(run_id).cloned()
+    }
+
+    fn append_item(&self, run_id: &str, item_type: &str, payload: &str, meta_json: Option<&str>) -> i64 {
+        let now = now_iso();
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let item = ExecRunItem {
+            seq,
+            run_id: run_id.to_string(),
+            item_type: item_type.to_string(),
+            payload: payload.to_string(),
+            meta_json: meta_json.map(ToOwned::to_owned),
+            created_at: now,
+        };
+        self.items
+            .lock()
+            .get_mut(run_id)
+            .map(|vec| vec.push(item));
+        seq
+    }
+
+    fn load_items_since(&self, run_id: &str, since_seq: Option<i64>, limit: u32) -> Vec<ExecRunItem> {
+        let items = self.items.lock();
+        let vec = match items.get(run_id) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        vec.iter()
+            .filter(|i| since_seq.map_or(true, |s| i.seq > s))
+            .take(limit as usize)
+            .cloned()
+            .collect()
+    }
+
+    fn mark_succeeded(&self, run_id: &str, exit_code: Option<i64>, output_bytes: i64, truncated: bool) {
+        let now = now_iso();
+        if let Some(run) = self.runs.lock().get_mut(run_id) {
+            run.status = ExecRunStatus::Succeeded.as_str().to_string();
+            run.exit_code = exit_code;
+            run.output_bytes = output_bytes;
+            run.truncated = truncated;
+            run.finished_at = Some(now.clone());
+            run.updated_at = now;
+        }
+    }
+
+    fn mark_failed(&self, run_id: &str, exit_code: Option<i64>, output_bytes: i64, truncated: bool, error_message: &str) {
+        let now = now_iso();
+        if let Some(run) = self.runs.lock().get_mut(run_id) {
+            run.status = ExecRunStatus::Failed.as_str().to_string();
+            run.exit_code = exit_code;
+            run.output_bytes = output_bytes;
+            run.truncated = truncated;
+            run.error_message = Some(error_message.to_string());
+            run.finished_at = Some(now.clone());
+            run.updated_at = now;
+        }
+    }
+
+    fn mark_timed_out(&self, run_id: &str, output_bytes: i64, truncated: bool) {
+        let now = now_iso();
+        if let Some(run) = self.runs.lock().get_mut(run_id) {
+            run.status = ExecRunStatus::TimedOut.as_str().to_string();
+            run.output_bytes = output_bytes;
+            run.truncated = truncated;
+            run.error_message = Some("exec run timed out".to_string());
+            run.finished_at = Some(now.clone());
+            run.updated_at = now;
+        }
+    }
+
+    fn mark_canceled(&self, run_id: &str) {
+        let now = now_iso();
+        if let Some(run) = self.runs.lock().get_mut(run_id) {
+            run.status = ExecRunStatus::Canceled.as_str().to_string();
+            run.error_message = Some("exec run canceled".to_string());
+            run.finished_at = Some(now.clone());
+            run.updated_at = now;
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SpawnExecRunRequest {
@@ -129,7 +336,7 @@ impl ExecEventSink for LoggingSink {
 }
 
 pub struct ShellExecRuntime {
-    store: Arc<SessionStore>,
+    exec_store: Arc<InMemoryExecRunStore>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     running: AsyncMutex<HashMap<String, RunningRunControl>>,
@@ -153,9 +360,9 @@ impl ShellExecRuntime {
             return Ok(existing);
         }
 
-        let store = Arc::new(SessionStore::new(&security.workspace_dir)?);
+        let exec_store = Arc::new(InMemoryExecRunStore::new());
         let runtime_instance = Arc::new(Self {
-            store,
+            exec_store: exec_store.clone(),
             security,
             runtime,
             running: AsyncMutex::new(HashMap::new()),
@@ -173,14 +380,14 @@ impl ShellExecRuntime {
     }
 
     pub async fn enqueue_run(&self, request: SpawnExecRunRequest) -> Result<ExecRun> {
-        let run = self.store.enqueue_exec_run(
+        let run = self.exec_store.enqueue(
             request.session_id.as_str(),
             request.command.as_str(),
             request.pty,
             request.timeout_secs,
             request.max_output_bytes,
             request.watch_json.as_deref(),
-        )?;
+        );
         self.worker_notify.notify_waiters();
         Ok(run)
     }
@@ -190,12 +397,12 @@ impl ShellExecRuntime {
         run_id: &str,
         since_seq: Option<i64>,
     ) -> Result<Option<PollExecRunResponse>> {
-        let Some(run) = self.store.get_exec_run(run_id)? else {
+        let Some(run) = self.exec_store.get_run(run_id) else {
             return Ok(None);
         };
         let items = self
-            .store
-            .load_exec_run_items_since(run_id, since_seq, DEFAULT_POLL_LIMIT)?;
+            .exec_store
+            .load_items_since(run_id, since_seq, DEFAULT_POLL_LIMIT);
         let next_seq = items.last().map_or(since_seq.unwrap_or(0), |item| item.seq);
         let snippet = build_snippet(&items, SNIPPET_MAX_CHARS);
 
@@ -216,13 +423,13 @@ impl ShellExecRuntime {
         limit: u32,
         stream_filter: Option<&str>,
     ) -> Result<Option<LogExecRunResult>> {
-        if self.store.get_exec_run(run_id)?.is_none() {
+        if self.exec_store.get_run(run_id).is_none() {
             return Ok(None);
         }
         let limit = limit.min(MAX_LOG_LIMIT);
         let items = self
-            .store
-            .load_exec_run_items_since(run_id, since_seq, limit)?;
+            .exec_store
+            .load_items_since(run_id, since_seq, limit);
         let next_seq = items.last().map_or(since_seq.unwrap_or(0), |item| item.seq);
         let filtered: Vec<ExecRunItem> = match stream_filter {
             Some(ty) => items.into_iter().filter(|i| i.item_type == ty).collect(),
@@ -235,22 +442,21 @@ impl ShellExecRuntime {
     }
 
     pub async fn stop_run(&self, run_id: &str) -> Result<Option<ExecRun>> {
-        let Some(existing) = self.store.get_exec_run(run_id)? else {
+        let Some(existing) = self.exec_store.get_run(run_id) else {
             return Ok(None);
         };
 
-        if matches!(
-            ExecRunStatus::from_str(existing.status.as_str()),
-            Some(ExecRunStatus::Queued | ExecRunStatus::Running)
-        ) {
+        if existing.status == ExecRunStatus::Queued.as_str()
+            || existing.status == ExecRunStatus::Running.as_str()
+        {
             if let Some(control) = self.running.lock().await.remove(run_id) {
                 control.cancellation.cancel();
             }
-            self.store.mark_exec_run_canceled(run_id)?;
+            self.exec_store.mark_canceled(run_id);
             self.worker_notify.notify_waiters();
         }
 
-        self.store.get_exec_run(run_id)
+        Ok(self.exec_store.get_run(run_id))
     }
 
     fn start_background_worker(self: &Arc<Self>) {
@@ -267,14 +473,6 @@ impl ShellExecRuntime {
     }
 
     async fn worker_loop(self: Arc<Self>) -> Result<()> {
-        let recovered = self.store.recover_running_exec_runs_to_queued()?;
-        if recovered > 0 {
-            tracing::info!(
-                recovered,
-                "Recovered running shell exec runs to queued state"
-            );
-        }
-
         loop {
             self.claim_and_spawn_available_runs().await?;
             tokio::select! {
@@ -286,7 +484,7 @@ impl ShellExecRuntime {
 
     async fn claim_and_spawn_available_runs(self: &Arc<Self>) -> Result<()> {
         loop {
-            let Some(run) = self.store.claim_next_queued_exec_run()? else {
+            let Some(run) = self.exec_store.claim_next() else {
                 return Ok(());
             };
             self.spawn_run(run).await;
@@ -323,7 +521,7 @@ impl ShellExecRuntime {
 
         if let Err(err) = result {
             if !self.run_is_canceled(run_id.as_str()).await {
-                let _ = self.store.mark_exec_run_failed(
+                self.exec_store.mark_failed(
                     run_id.as_str(),
                     None,
                     0,
@@ -391,7 +589,7 @@ impl ShellExecRuntime {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     if !self.run_is_canceled(run.run_id.as_str()).await {
-                        let _ = self.store.mark_exec_run_canceled(run.run_id.as_str());
+                        self.exec_store.mark_canceled(run.run_id.as_str());
                     }
                     break;
                 }
@@ -450,8 +648,8 @@ impl ShellExecRuntime {
         }
 
         if timed_out {
-            self.store
-                .mark_exec_run_timed_out(run.run_id.as_str(), output_bytes, truncated)?;
+            self.exec_store
+                .mark_timed_out(run.run_id.as_str(), output_bytes, truncated);
             return Ok(());
         }
 
@@ -460,22 +658,22 @@ impl ShellExecRuntime {
         }
 
         if exit_code == Some(0) {
-            self.store.mark_exec_run_succeeded(
+            self.exec_store.mark_succeeded(
                 run.run_id.as_str(),
                 exit_code,
                 output_bytes,
                 truncated,
-            )?;
+            );
             return Ok(());
         }
 
-        self.store.mark_exec_run_failed(
+        self.exec_store.mark_failed(
             run.run_id.as_str(),
             exit_code,
             output_bytes,
             truncated,
             "exec run failed",
-        )?;
+        );
         Ok(())
     }
 
@@ -520,7 +718,7 @@ impl ShellExecRuntime {
                 *truncated = true;
             }
             if !*truncation_event_written {
-                let _ = self.store.append_exec_run_item(
+                self.exec_store.append_item(
                     run.run_id.as_str(),
                     "event",
                     "output_truncated",
@@ -545,12 +743,12 @@ impl ShellExecRuntime {
         }
 
         if !text.is_empty() {
-            self.store.append_exec_run_item(
+            self.exec_store.append_item(
                 run.run_id.as_str(),
                 chunk.stream,
                 text.as_str(),
                 None,
-            )?;
+            );
             *output_bytes += text.len() as i64;
         }
 
@@ -583,12 +781,12 @@ impl ShellExecRuntime {
                     "regex": watcher.regex.as_str()
                 })
                 .to_string();
-                self.store.append_exec_run_item(
+                self.exec_store.append_item(
                     run.run_id.as_str(),
                     "event",
                     watcher.event.as_str(),
                     Some(meta_json.as_str()),
-                )?;
+                );
                 sink.on_watcher_hit(
                     run.run_id.as_str(),
                     run.session_id.as_str(),
@@ -601,10 +799,8 @@ impl ShellExecRuntime {
     }
 
     async fn run_is_canceled(&self, run_id: &str) -> bool {
-        self.store
-            .get_exec_run(run_id)
-            .ok()
-            .flatten()
+        self.exec_store
+            .get_run(run_id)
             .is_some_and(|run| run.status == ExecRunStatus::Canceled.as_str())
     }
 }
@@ -678,7 +874,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{build_snippet, SNIPPET_MAX_CHARS};
-    use crate::session::ExecRunItem;
+    use crate::tools::shell_exec_runtime::ExecRunItem;
 
     fn item(seq: i64, item_type: &str, payload: &str) -> ExecRunItem {
         ExecRunItem {

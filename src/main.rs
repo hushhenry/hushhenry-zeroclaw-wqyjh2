@@ -45,7 +45,6 @@ mod daemon;
 mod doctor;
 mod gateway;
 mod health;
-mod heartbeat;
 mod identity;
 mod integrations;
 mod memory;
@@ -125,7 +124,7 @@ enum Commands {
         host: Option<String>,
     },
 
-    /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
+    /// Start long-running autonomous runtime (gateway + channels + scheduler)
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -431,15 +430,7 @@ async fn main() -> Result<()> {
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
-            );
-            println!(
-                "🧠 Memory:         {} (auto-save: {})",
+                "🧠 Memory:        {} (auto-save: {})",
                 config.memory.backend,
                 if config.memory.auto_save { "on" } else { "off" }
             );

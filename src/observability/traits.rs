@@ -44,7 +44,6 @@ pub enum ObserverEvent {
         channel: String,
         direction: String,
     },
-    HeartbeatTick,
     Error {
         component: String,
         message: String,
@@ -115,7 +114,7 @@ mod tests {
     fn observer_records_events_and_metrics() {
         let observer = DummyObserver::default();
 
-        observer.record_event(&ObserverEvent::HeartbeatTick);
+        observer.record_event(&ObserverEvent::TurnComplete);
         observer.record_event(&ObserverEvent::Error {
             component: "test".into(),
             message: "boom".into(),

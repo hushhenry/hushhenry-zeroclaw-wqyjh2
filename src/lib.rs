@@ -47,7 +47,6 @@ pub mod daemon;
 pub mod doctor;
 pub mod gateway;
 pub mod health;
-pub mod heartbeat;
 pub mod identity;
 pub mod integrations;
 pub mod memory;

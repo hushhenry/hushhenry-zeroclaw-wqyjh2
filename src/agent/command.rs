@@ -3,7 +3,7 @@
 
 use crate::channels::traits::{ChannelMessage, SendMessage};
 use crate::channels::{Channel, ChannelRuntimeContext};
-use crate::session::{SessionId, SessionKey, SessionRouteMetadata, SessionStore};
+use crate::session::{SessionId, SessionStore};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -90,20 +90,6 @@ pub(crate) fn short_session_id(session_id: &SessionId) -> String {
     session_id.as_str().chars().take(8).collect::<String>()
 }
 
-/// Build route metadata from a channel message for session routing.
-pub fn build_route_metadata(msg: &ChannelMessage) -> SessionRouteMetadata {
-    SessionRouteMetadata {
-        agent_id: msg.agent_id.clone(),
-        channel: msg.channel.clone(),
-        account_id: msg.account_id.clone(),
-        chat_type: format!("{:?}", msg.chat_type).to_ascii_lowercase(),
-        chat_id: msg.chat_id.clone(),
-        route_id: msg.thread_id.clone(),
-        sender_id: msg.sender.clone(),
-        title: msg.title.clone(),
-    }
-}
-
 fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> String {
     crate::channels::decode_session_string_state(
         session_store
@@ -166,7 +152,7 @@ pub(crate) async fn handle_slash_command(
     ctx: &ChannelRuntimeContext,
     target_channel: Option<&Arc<dyn Channel>>,
     msg: &ChannelMessage,
-    session_key: &SessionKey,
+    inbound_key: &str,
     command: SlashCommand,
 ) -> bool {
     let Some(session_store) = ctx.session_store.as_ref() else {
@@ -189,17 +175,8 @@ pub(crate) async fn handle_slash_command(
             .await;
             return true;
         }
-        SlashCommand::New => match session_store.create_new(session_key) {
+        SlashCommand::New => match session_store.create_new(inbound_key) {
             Ok(session_id) => {
-                if let Err(error) =
-                    session_store.upsert_route_metadata(&session_id, &build_route_metadata(msg))
-                {
-                    tracing::warn!(
-                        "Failed to persist route metadata for session {}: {error}",
-                        session_id.as_str()
-                    );
-                }
-
                 send_command_response(
                     target_channel,
                     &msg.reply_target,
@@ -213,7 +190,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to create new session for key {}: {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -223,7 +200,7 @@ pub(crate) async fn handle_slash_command(
                 .await;
             }
         },
-        SlashCommand::Compact => match session_store.get_or_create_active(session_key) {
+        SlashCommand::Compact => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 run_manual_session_compaction(
                     ctx,
@@ -237,7 +214,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve active session for compact command ({}): {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -247,7 +224,7 @@ pub(crate) async fn handle_slash_command(
                 .await;
             }
         },
-        SlashCommand::Queue { mode } => match session_store.get_or_create_active(session_key) {
+        SlashCommand::Queue { mode } => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 if let Some(mode) = mode {
                     if mode != DEFAULT_QUEUE_MODE {
@@ -296,7 +273,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve active session for queue command ({}): {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -307,8 +284,8 @@ pub(crate) async fn handle_slash_command(
             }
         },
         SlashCommand::Subagents => {
-            let specs = session_store
-                .list_subagent_specs(COMMAND_LIST_LIMIT)
+            let agents = session_store
+                .list_agents(COMMAND_LIST_LIMIT)
                 .unwrap_or_default();
             let sessions = session_store
                 .list_subagent_sessions(COMMAND_LIST_LIMIT)
@@ -316,9 +293,9 @@ pub(crate) async fn handle_slash_command(
 
             let mut text = String::new();
             let _ = writeln!(text, "Subagents");
-            let _ = writeln!(text, "specs: {}", specs.len());
-            for spec in specs.iter().take(5) {
-                let _ = writeln!(text, "- {} ({})", spec.name, spec.spec_id);
+            let _ = writeln!(text, "agents: {}", agents.len());
+            for agent in agents.iter().take(5) {
+                let _ = writeln!(text, "- {} ({})", agent.name, agent.agent_id);
             }
             let _ = writeln!(text, "sessions: {}", sessions.len());
             for session in sessions.iter().take(5) {
@@ -331,14 +308,14 @@ pub(crate) async fn handle_slash_command(
 
             send_command_response(target_channel, &msg.reply_target, text.trim().to_string()).await;
         }
-        SlashCommand::Sessions => match session_store.get_or_create_active(session_key) {
+        SlashCommand::Sessions => match session_store.get_or_create_active(inbound_key) {
             Ok(current_session_id) => {
                 let sessions = session_store
-                    .list_sessions(Some(session_key.as_str()), COMMAND_LIST_LIMIT)
+                    .list_sessions(Some(inbound_key), COMMAND_LIST_LIMIT)
                     .unwrap_or_default();
                 let mut text = String::new();
                 let _ = writeln!(text, "Current session: `{}`", current_session_id.as_str());
-                let _ = writeln!(text, "Sessions for key `{}`:", session_key.as_str());
+                let _ = writeln!(text, "Sessions for key `{}`:", inbound_key);
                 for session in sessions.iter().take(10) {
                     let marker = if session.session_id == current_session_id.as_str() {
                         "*"
@@ -358,7 +335,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve active session for sessions command ({}): {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -368,10 +345,10 @@ pub(crate) async fn handle_slash_command(
                 .await;
             }
         },
-        SlashCommand::Agents => match session_store.get_or_create_active(session_key) {
+        SlashCommand::Agents => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
-                let specs = session_store
-                    .list_agent_specs(COMMAND_LIST_LIMIT)
+                let agents = session_store
+                    .list_agents(COMMAND_LIST_LIMIT)
                     .unwrap_or_default();
                 let active_id = session_store
                     .get_state_key(&session_id, SessionStore::ACTIVE_AGENT_ID_KEY)
@@ -389,13 +366,13 @@ pub(crate) async fn handle_slash_command(
                     "Active: {}",
                     active_id.as_deref().unwrap_or("(default)")
                 );
-                for spec in specs.iter().take(10) {
-                    let marker = if active_id.as_deref() == Some(spec.agent_id.as_str()) {
+                for agent in agents.iter().take(10) {
+                    let marker = if active_id.as_deref() == Some(agent.agent_id.as_str()) {
                         "* "
                     } else {
                         "- "
                     };
-                    let _ = writeln!(text, "{marker}{} — {}", spec.name, spec.agent_id);
+                    let _ = writeln!(text, "{marker}{} — {}", agent.name, agent.agent_id);
                 }
                 let _ = writeln!(text, "Use /agent <id|name> to switch.");
                 send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
@@ -404,7 +381,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve session for /agents ({}): {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -424,22 +401,22 @@ pub(crate) async fn handle_slash_command(
                 .await;
                 return true;
             }
-            match session_store.get_or_create_active(session_key) {
+            match session_store.get_or_create_active(inbound_key) {
                 Ok(session_id) => {
-                    let spec = session_store
-                        .get_agent_spec_by_id(id_or_name.trim())
+                    let agent = session_store
+                        .get_agent_by_id(id_or_name.trim())
                         .ok()
                         .flatten()
                         .or_else(|| {
                             session_store
-                                .get_agent_spec_by_name(id_or_name.trim())
+                                .get_agent_by_name(id_or_name.trim())
                                 .ok()
                                 .flatten()
                         });
-                    match spec {
-                        Some(agent_spec) => {
-                            let value_json = serde_json::to_string(&agent_spec.agent_id)
-                                .unwrap_or_else(|_| format!("\"{}\"", agent_spec.agent_id));
+                    match agent {
+                        Some(agent) => {
+                            let value_json = serde_json::to_string(&agent.agent_id)
+                                .unwrap_or_else(|_| format!("\"{}\"", agent.agent_id));
                             if let Err(e) = session_store.set_state_key(
                                 &session_id,
                                 SessionStore::ACTIVE_AGENT_ID_KEY,
@@ -459,8 +436,8 @@ pub(crate) async fn handle_slash_command(
                                 &msg.reply_target,
                                 format!(
                                     "Switched to agent `{}` ({}) for this session.",
-                                    agent_spec.name,
-                                    &agent_spec.agent_id[..agent_spec.agent_id.len().min(8)]
+                                    agent.name,
+                                    &agent.agent_id[..agent.agent_id.len().min(8)]
                                 ),
                             )
                             .await;
@@ -480,7 +457,7 @@ pub(crate) async fn handle_slash_command(
                 Err(error) => {
                     tracing::error!(
                         "Failed to resolve session for /agent ({}): {error}",
-                        session_key.as_str()
+                        inbound_key
                     );
                     send_command_response(
                         target_channel,
@@ -491,7 +468,7 @@ pub(crate) async fn handle_slash_command(
                 }
             }
         }
-        SlashCommand::Models => match session_store.get_or_create_active(session_key) {
+        SlashCommand::Models => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 let override_val = session_store
                     .get_state_key(&session_id, SessionStore::MODEL_OVERRIDE_KEY)
@@ -522,7 +499,7 @@ pub(crate) async fn handle_slash_command(
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve session for /models ({}): {error}",
-                    session_key.as_str()
+                    inbound_key
                 );
                 send_command_response(
                     target_channel,
@@ -542,7 +519,7 @@ pub(crate) async fn handle_slash_command(
                 .await;
                 return true;
             }
-            match session_store.get_or_create_active(session_key) {
+            match session_store.get_or_create_active(inbound_key) {
                 Ok(session_id) => {
                     let value_json = serde_json::to_string(&provider_model.trim())
                         .unwrap_or_else(|_| format!("\"{}\"", provider_model.trim()));
@@ -573,7 +550,7 @@ pub(crate) async fn handle_slash_command(
                 Err(error) => {
                     tracing::error!(
                         "Failed to resolve session for /model ({}): {error}",
-                        session_key.as_str()
+                        inbound_key
                     );
                     send_command_response(
                         target_channel,

@@ -39,21 +39,16 @@ impl Channel for CliChannel {
 
             let msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
-                agent_id: None,
-                account_id: None,
                 sender: "user".to_string(),
                 reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
-                title: None,
-                chat_type: ChatType::Direct,
-                raw_chat_type: None,
-                chat_id: "user".to_string(),
-                thread_id: None,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                thread_ts: None,
+                session_id: None,
             };
 
             if tx.send(msg).await.is_err() {
@@ -109,18 +104,13 @@ mod tests {
     fn channel_message_struct() {
         let msg = ChannelMessage {
             id: "test-id".into(),
-            agent_id: None,
-            account_id: None,
             sender: "user".into(),
             reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "user".into(),
-            thread_id: None,
             timestamp: 1_234_567_890,
+            thread_ts: None,
+            session_id: None,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -134,18 +124,13 @@ mod tests {
     fn channel_message_clone() {
         let msg = ChannelMessage {
             id: "id".into(),
-            agent_id: None,
-            account_id: None,
             sender: "s".into(),
             reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "s".into(),
-            thread_id: None,
             timestamp: 0,
+            thread_ts: None,
+            session_id: None,
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

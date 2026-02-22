@@ -70,9 +70,6 @@ impl Observer for LogObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
-            ObserverEvent::HeartbeatTick => {
-                info!("heartbeat.tick");
-            }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }
@@ -154,7 +151,6 @@ mod tests {
             channel: "telegram".into(),
             direction: "outbound".into(),
         });
-        obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
             component: "provider".into(),
             message: "timeout".into(),

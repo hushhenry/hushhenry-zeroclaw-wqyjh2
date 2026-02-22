@@ -1,7 +1,7 @@
 //! Struct-based agent loop: Agent owns message_rx, deliver_tx, and (in session mode) history.
 //! Replaces the function-based agent_loop in channels/mod.rs.
 
-use crate::agent::command::{build_route_metadata, short_session_id, SlashCommand};
+use crate::agent::command::{short_session_id, SlashCommand};
 use crate::agent::loop_::{
     build_assistant_content_native, find_tool, maybe_bind_source_session_id,
     maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
@@ -17,7 +17,7 @@ use crate::session::compaction::{
     compact_in_memory_history, estimate_tokens, load_compaction_state,
     resolve_keep_recent_messages, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
-use crate::session::{SessionId, SessionKey, SessionStore};
+use crate::session::{SessionId, SessionStore};
 use std::fmt::Write;
 use crate::tools::ToolSpec;
 use anyhow::Result;
@@ -37,13 +37,7 @@ pub(crate) struct AgentWorkItem {
     pub reply_target: String,
     pub channel: String,
     pub sender: String,
-    pub chat_id: String,
-    pub thread_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub account_id: Option<String>,
-    pub title: Option<String>,
-    pub chat_type: traits::ChatType,
-    pub raw_chat_type: Option<String>,
+    pub thread_ts: Option<String>,
 }
 
 impl AgentWorkItem {
@@ -53,34 +47,23 @@ impl AgentWorkItem {
             reply_target: msg.reply_target.clone(),
             channel: msg.channel.clone(),
             sender: msg.sender.clone(),
-            chat_id: msg.chat_id.clone(),
-            thread_id: msg.thread_id.clone(),
-            agent_id: msg.agent_id.clone(),
-            account_id: msg.account_id.clone(),
-            title: msg.title.clone(),
-            chat_type: msg.chat_type,
-            raw_chat_type: msg.raw_chat_type.clone(),
+            thread_ts: msg.thread_ts.clone(),
         }
     }
 
     pub fn to_channel_message(&self) -> traits::ChannelMessage {
         traits::ChannelMessage {
             id: Uuid::new_v4().to_string(),
-            agent_id: self.agent_id.clone(),
-            account_id: self.account_id.clone(),
             sender: self.sender.clone(),
             reply_target: self.reply_target.clone(),
             content: self.content.clone(),
             channel: self.channel.clone(),
-            title: self.title.clone(),
-            chat_type: self.chat_type,
-            raw_chat_type: self.raw_chat_type.clone(),
-            chat_id: self.chat_id.clone(),
-            thread_id: self.thread_id.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            thread_ts: self.thread_ts.clone(),
+            session_id: None,
         }
     }
 }
@@ -192,7 +175,7 @@ pub(crate) enum DeliverMessage {
 }
 
 /// Agent registry key: always the session_id.
-pub(crate) fn agent_registry_key(session_id: &SessionId, _session_key: &SessionKey) -> String {
+pub(crate) fn agent_registry_key(session_id: &SessionId, _inbound_key: &str) -> String {
     session_id.as_str().to_string()
 }
 
@@ -200,7 +183,7 @@ pub(crate) fn agent_registry_key(session_id: &SessionId, _session_key: &SessionK
 
 pub(crate) struct Agent {
     session_id: SessionId,
-    session_key: SessionKey,
+    inbound_key: String,
     system_prompt: String,
     tool_allow_list: Option<Vec<String>>,
     /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
@@ -221,7 +204,7 @@ impl Agent {
     pub(crate) fn new(
         ctx: Arc<ChannelRuntimeContext>,
         session_id: SessionId,
-        session_key: &SessionKey,
+        inbound_key: &str,
         message_rx: mpsc::Receiver<AgentQueueItem>,
         deliver_tx: mpsc::Sender<DeliverMessage>,
         verbose_tool_output: bool,
@@ -256,7 +239,7 @@ impl Agent {
 
         Ok(Self {
             session_id: session_id.clone(),
-            session_key: session_key.clone(),
+            inbound_key: inbound_key.to_string(),
             system_prompt,
             tool_allow_list,
             tool_specs,
@@ -347,11 +330,8 @@ impl Agent {
     }
 
     fn delivery_target(&self, envelope: &AgentWorkItem) -> (String, String) {
-        resolve_delivery_target(
-            &self.ctx,
-            Some(&self.session_id),
-            &envelope.to_channel_message(),
-        )
+        let msg = envelope.to_channel_message();
+        (msg.channel.clone(), msg.reply_target.clone())
     }
 
     /// /stop: abort current turn. Delivers "Agent was aborted.", returns true.
@@ -369,15 +349,8 @@ impl Agent {
             .session_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
-        match store.create_new(&self.session_key) {
+        match store.create_new(&self.inbound_key) {
             Ok(new_session_id) => {
-                let meta = build_route_metadata(&envelope.to_channel_message());
-                if let Err(e) = store.upsert_route_metadata(&new_session_id, &meta) {
-                    tracing::warn!(
-                        "Failed to persist route metadata for session {}: {e}",
-                        new_session_id.as_str()
-                    );
-                }
                 let full_model = self.ctx.provider_manager.default_full_model().to_string();
                 self.on_message(
                     &format!("New session started · model: {full_model}"),
@@ -389,7 +362,7 @@ impl Agent {
             Err(e) => {
                 tracing::error!(
                     "Failed to create new session for key {}: {e}",
-                    self.session_key.as_str()
+                    self.inbound_key.as_str()
                 );
                 self.on_message(
                     "⚠️ Failed to create a new session. Please try again.",
@@ -567,18 +540,6 @@ impl Agent {
             };
 
             let msg = work.to_channel_message();
-            if let Some(ref store) = session_store {
-                if msg.channel != INTERNAL_MESSAGE_CHANNEL {
-                    if let Err(e) =
-                        store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
-                    {
-                        tracing::warn!(
-                            session_id = %session_id.as_str(),
-                            "Failed to persist route metadata: {e}"
-                        );
-                    }
-                }
-            }
 
             if let Err(e) = self
                 .tool_call_loop_session(&session_id, session_store.as_deref(), &msg)
@@ -596,8 +557,8 @@ impl Agent {
         session_store: Option<&SessionStore>,
         msg: &traits::ChannelMessage,
     ) -> Result<()> {
-        let (delivery_channel_name, delivery_reply_target) =
-            resolve_delivery_target(&self.ctx, Some(session_id), msg);
+        let delivery_channel_name = msg.channel.clone();
+        let delivery_reply_target = msg.reply_target.clone();
 
         let new_content = msg.content.clone();
         let (user_content, persist_user_content, merged_into_orphan) = {
@@ -619,8 +580,7 @@ impl Agent {
         };
 
         if let Some(store) = session_store {
-            if should_deliver_to_external_channel(self.ctx.session_store.as_ref(), Some(session_id))
-            {
+            if should_deliver_to_external_channel(&delivery_channel_name) {
                 if let Ok(id) =
                     store.append_message(session_id, "user", &persist_user_content, None)
                 {
@@ -680,10 +640,7 @@ impl Agent {
                 self.history.push(ChatMessage::assistant(text.clone()));
                 self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
                 if let Some(store) = session_store {
-                    if should_deliver_to_external_channel(
-                        self.ctx.session_store.as_ref(),
-                        Some(session_id),
-                    ) {
+                    if should_deliver_to_external_channel(&delivery_channel_name) {
                         if let Ok(id) = store.append_message(session_id, "assistant", &text, None) {
                             self.history_message_ids
                                 .push(if id > 0 { Some(id) } else { None });
@@ -848,27 +805,6 @@ impl Agent {
     }
 }
 
-/// Resolve delivery channel and reply target from message; use route metadata when on internal channel and session is present.
-fn resolve_delivery_target(
-    ctx: &ChannelRuntimeContext,
-    active_session: Option<&SessionId>,
-    msg: &traits::ChannelMessage,
-) -> (String, String) {
-    let mut ch = msg.channel.clone();
-    let mut rt = msg.reply_target.clone();
-    if msg.channel == INTERNAL_MESSAGE_CHANNEL {
-        if let (Some(store), Some(session_id)) = (ctx.session_store.as_ref(), active_session) {
-            if let Ok(Some(meta)) = store.load_route_metadata(session_id) {
-                if meta.channel != INTERNAL_MESSAGE_CHANNEL {
-                    rt = meta.route_id.unwrap_or(meta.chat_id);
-                    ch = meta.channel;
-                }
-            }
-        }
-    }
-    (ch, rt)
-}
-
 fn is_context_exceeded_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("context")
@@ -879,9 +815,9 @@ fn is_context_exceeded_error(err: &str) -> bool {
 pub(crate) fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
     session_id: SessionId,
-    session_key: &SessionKey,
+    inbound_key: &str,
 ) -> mpsc::Sender<AgentQueueItem> {
-    let key_str = agent_registry_key(&session_id, session_key);
+    let key_str = agent_registry_key(&session_id, inbound_key);
     let registry = agent_registry();
     {
         let guard = registry.lock();
@@ -900,7 +836,7 @@ pub(crate) fn get_or_create_agent(
     match Agent::new(
         Arc::clone(&ctx),
         session_id,
-        session_key,
+        inbound_key,
         message_rx,
         deliver_tx,
         false,

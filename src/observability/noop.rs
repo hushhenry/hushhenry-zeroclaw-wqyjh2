@@ -28,7 +28,6 @@ mod tests {
     #[test]
     fn noop_record_event_does_not_panic() {
         let obs = NoopObserver;
-        obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "test".into(),
             model: "test".into(),

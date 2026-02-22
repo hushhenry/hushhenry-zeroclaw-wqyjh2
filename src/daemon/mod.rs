@@ -17,12 +17,6 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
-    if config.heartbeat.enabled {
-        let _ =
-            crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
-                .await;
-    }
-
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     {
@@ -58,19 +52,6 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
-    if config.heartbeat.enabled {
-        let heartbeat_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "heartbeat",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
-            },
-        ));
-    }
-
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -89,7 +70,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, scheduler");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -171,48 +152,6 @@ where
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
-}
-
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = crate::heartbeat::engine::HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
-
-    let interval_mins = config.heartbeat.interval_minutes.max(5);
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
-
-    loop {
-        interval.tick().await;
-
-        let tasks = engine.collect_tasks().await?;
-        if tasks.is_empty() {
-            continue;
-        }
-
-        for task in tasks {
-            let prompt = format!("[Heartbeat Task] {task}");
-            let store = crate::session::SessionStore::new(&config.workspace_dir)?;
-            let session_id = store.get_or_create_active(&crate::session::SessionKey::new(
-                "internal:heartbeat:main",
-            ))?;
-            let msg = crate::channels::build_internal_channel_message(
-                "zeroclaw_heartbeat",
-                session_id.as_str(),
-                prompt,
-                None,
-            );
-            if let Err(e) = crate::channels::dispatch_internal_message(msg).await {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
-            }
-        }
-    }
 }
 
 fn has_supervised_channels(config: &Config) -> bool {

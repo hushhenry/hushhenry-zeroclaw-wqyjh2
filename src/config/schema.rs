@@ -47,9 +47,6 @@ pub struct Config {
     pub provider_groups: Vec<ProviderGroupConfig>,
 
     #[serde(default)]
-    pub heartbeat: HeartbeatConfig,
-
-    #[serde(default)]
     pub cron: CronConfig,
 
     #[serde(default)]
@@ -592,7 +589,7 @@ pub struct MemoryConfig {
     /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
     #[serde(default)]
     pub snapshot_enabled: bool,
-    /// Run snapshot during hygiene passes (heartbeat-driven)
+    /// Run snapshot during hygiene passes
     #[serde(default)]
     pub snapshot_on_hygiene: bool,
     /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
@@ -1019,23 +1016,6 @@ pub struct ProviderGroupConfig {
     pub strategy: ProviderGroupStrategy,
     /// Fully-qualified model names (e.g. `openrouter/anthropic/claude-sonnet-4`).
     pub members: Vec<String>,
-}
-
-// ── Heartbeat ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatConfig {
-    pub enabled: bool,
-    pub interval_minutes: u32,
-}
-
-impl Default for HeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            interval_minutes: 30,
-        }
-    }
 }
 
 // ── Cron ────────────────────────────────────────────────────────
@@ -1492,7 +1472,6 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
             provider_groups: Vec::new(),
-            heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -2013,13 +1992,6 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_config_default() {
-        let h = HeartbeatConfig::default();
-        assert!(!h.enabled);
-        assert_eq!(h.interval_minutes, 30);
-    }
-
-    #[test]
     fn cron_config_default() {
         let c = CronConfig::default();
         assert!(c.enabled);
@@ -2111,10 +2083,6 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             provider_groups: Vec::new(),
-            heartbeat: HeartbeatConfig {
-                enabled: true,
-                interval_minutes: 15,
-            },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
@@ -2159,8 +2127,6 @@ default_temperature = 0.7
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert!(!parsed.autonomy.workspace_only);
         assert_eq!(parsed.runtime.kind, "docker");
-        assert!(parsed.heartbeat.enabled);
-        assert_eq!(parsed.heartbeat.interval_minutes, 15);
         assert!(parsed.channels_config.telegram.is_some());
         assert_eq!(
             parsed.channels_config.telegram.unwrap().bot_token,
@@ -2181,7 +2147,6 @@ default_temperature = 0.7
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
-        assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
@@ -2239,7 +2204,6 @@ tool_dispatcher = "xml"
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             provider_groups: Vec::new(),
-            heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),

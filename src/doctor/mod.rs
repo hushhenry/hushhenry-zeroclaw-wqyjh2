@@ -391,7 +391,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         }
     };
 
-    // Daemon heartbeat freshness
+    // Daemon state freshness
     let updated_at = snapshot
         .get("updated_at")
         .and_then(serde_json::Value::as_str)
@@ -402,11 +402,11 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             .signed_duration_since(ts.with_timezone(&Utc))
             .num_seconds();
         if age <= DAEMON_STALE_SECONDS {
-            items.push(DiagItem::ok(cat, format!("heartbeat fresh ({age}s ago)")));
+            items.push(DiagItem::ok(cat, format!("daemon state fresh ({age}s ago)")));
         } else {
             items.push(DiagItem::error(
                 cat,
-                format!("heartbeat stale ({age}s ago)"),
+                format!("daemon state stale ({age}s ago)"),
             ));
         }
     } else {

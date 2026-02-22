@@ -15,7 +15,7 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Base storage path for this runtime
     fn storage_path(&self) -> PathBuf;
 
-    /// Whether long-running processes (gateway, heartbeat) are supported
+    /// Whether long-running processes (gateway) are supported
     fn supports_long_running(&self) -> bool;
 
     /// Maximum memory budget in bytes (0 = unlimited)

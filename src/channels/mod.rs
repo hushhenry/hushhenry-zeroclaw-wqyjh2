@@ -34,8 +34,7 @@ use crate::agent::agent::{agent_registry_key, get_or_create_agent, AgentQueueIte
 #[cfg(test)]
 use crate::agent::agent::{drain_agent_queue, merge_work_items, partition_steer_items};
 use crate::agent::command::{
-    build_route_metadata, handle_slash_command, is_agent_command, parse_slash_command,
-    send_command_response,
+    handle_slash_command, is_agent_command, parse_slash_command, send_command_response,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -46,8 +45,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::{build_compaction_summary_message, build_merged_system_prompt, CompactionState},
-    SessionContext, SessionId, SessionKey, SessionMessage, SessionMessageRole, SessionResolver,
-    SessionRouteMetadata, SessionStore,
+    SessionId, SessionMessage, SessionMessageRole, SessionStore,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -68,7 +66,44 @@ const BOOTSTRAP_MAX_CHARS: usize = crate::agent::prompt::DEFAULT_BOOTSTRAP_MAX_C
 
 /// Reserved channel for internal/child sessions. Sessions with this channel do not deliver to external users (M4).
 pub const INTERNAL_MESSAGE_CHANNEL: &str = "internal";
-const INTERNAL_SESSION_ID_PREFIX: &str = "session:";
+
+/// Inbound key for routing: internal:{session_id} or channel:{channel}:{sender}[:{thread_ts}].
+pub fn inbound_key(msg: &traits::ChannelMessage) -> String {
+    if msg.channel == INTERNAL_MESSAGE_CHANNEL {
+        if let Some(ref sid) = msg.session_id {
+            return format!("internal:{}", sid);
+        }
+    }
+    channel_inbound_key(&msg.channel, &msg.sender, msg.thread_ts.as_deref())
+}
+
+/// Inbound key for channel messages (no internal).
+pub fn channel_inbound_key(channel: &str, sender: &str, thread_ts: Option<&str>) -> String {
+    match thread_ts {
+        Some(ts) if !ts.is_empty() => format!("channel:{}:{}:{}", channel, sender, ts),
+        _ => format!("channel:{}:{}", channel, sender),
+    }
+}
+
+/// Outbound key for delivery: internal:{session_id} or channel:{channel}:{reply_target}[:{thread_ts}].
+pub fn outbound_key_from_parts(
+    channel: &str,
+    reply_target: &str,
+    thread_ts: Option<&str>,
+) -> String {
+    if channel == INTERNAL_MESSAGE_CHANNEL {
+        return format!("internal:{}", reply_target);
+    }
+    match thread_ts {
+        Some(ts) if !ts.is_empty() => format!("channel:{}:{}:{}", channel, reply_target, ts),
+        _ => format!("channel:{}:{}", channel, reply_target),
+    }
+}
+
+/// Outbound key from an inbound message (where we will reply).
+pub fn outbound_key_from_message(msg: &traits::ChannelMessage) -> String {
+    outbound_key_from_parts(&msg.channel, &msg.reply_target, msg.thread_ts.as_deref())
+}
 
 /// Timeout for a single turn (LLM + tools). Exposed for agent turn execution.
 pub(crate) const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
@@ -90,7 +125,6 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) auto_save_memory: bool,
     pub(crate) session_history_limit: u32,
     pub(crate) session_store: Option<Arc<SessionStore>>,
-    pub(crate) session_resolver: SessionResolver,
     /// Config for per-session agent/model resolution (multi-agent).
     pub(crate) config: Arc<Config>,
     /// All skills (for per-agent filtering in Milestone 2).
@@ -122,41 +156,38 @@ pub async fn dispatch_internal_message(message: traits::ChannelMessage) -> Resul
         .map_err(|_| anyhow::anyhow!("channel dispatcher queue is closed"))
 }
 
+/// Build an internal inbound message. Only internal messages have session_id set.
 pub fn build_internal_channel_message(
     sender: impl Into<String>,
     target_session_id: impl Into<String>,
     content: impl Into<String>,
-    session_key: Option<&str>,
 ) -> traits::ChannelMessage {
-    let chat_id = format!("{INTERNAL_SESSION_ID_PREFIX}{}", target_session_id.into());
+    let target = target_session_id.into();
     traits::ChannelMessage {
         id: Uuid::new_v4().to_string(),
-        agent_id: None,
-        account_id: None,
         sender: sender.into(),
-        reply_target: chat_id.clone(),
+        reply_target: target.clone(),
         content: content.into(),
         channel: INTERNAL_MESSAGE_CHANNEL.to_string(),
-        title: None,
-        chat_type: traits::ChatType::Direct,
-        raw_chat_type: Some("internal".to_string()),
-        chat_id,
-        thread_id: session_key.map(ToOwned::to_owned),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        thread_ts: None,
+        session_id: Some(target),
     }
 }
 
+/// For internal channel messages, returns the target session_id from the message.
+/// Channels must not use this; only the dispatcher uses it for routing.
 pub fn parse_internal_target_session_id(msg: &traits::ChannelMessage) -> Option<SessionId> {
     if msg.channel != INTERNAL_MESSAGE_CHANNEL {
         return None;
     }
-    msg.chat_id
-        .strip_prefix(INTERNAL_SESSION_ID_PREFIX)
-        .filter(|raw| !raw.trim().is_empty())
-        .map(|raw| SessionId::from_string(raw.to_string()))
+    msg.session_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| SessionId::from_string(s.to_string()))
 }
 
 pub(crate) async fn send_delivery_message(
@@ -166,15 +197,11 @@ pub(crate) async fn send_delivery_message(
     content: &str,
 ) -> Result<()> {
     if delivery_channel_name == INTERNAL_MESSAGE_CHANNEL {
-        let target_session_id = delivery_reply_target
-            .strip_prefix(INTERNAL_SESSION_ID_PREFIX)
-            .unwrap_or(delivery_reply_target)
-            .trim();
+        let target_session_id = delivery_reply_target.trim();
         if target_session_id.is_empty() {
             anyhow::bail!("internal delivery target session_id is empty");
         }
-        let msg =
-            build_internal_channel_message("zeroclaw_internal", target_session_id, content, None);
+        let msg = build_internal_channel_message("zeroclaw_internal", target_session_id, content);
         return dispatch_internal_message(msg).await;
     }
 
@@ -310,17 +337,17 @@ fn get_agent_model_temperature(
             .ok()
             .flatten(),
     )?;
-    let spec = store
-        .get_agent_spec_by_id(&active_agent_id)
+    let agent = store
+        .get_agent_by_id(&active_agent_id)
         .ok()
         .flatten()
         .or_else(|| {
             store
-                .get_agent_spec_by_name(&active_agent_id)
+                .get_agent_by_name(&active_agent_id)
                 .ok()
                 .flatten()
         })?;
-    let d = parse_agent_spec_defaults(&spec.config_json);
+    let d = parse_agent_spec_defaults(&agent.config_json);
     let p = d.provider?;
     let m = d.model?;
     let t = d.temperature?;
@@ -378,17 +405,17 @@ pub(crate) fn resolve_agent_spec_policy(
             .ok()
             .flatten(),
     )?;
-    let spec = session_store
-        .get_agent_spec_by_id(&active_agent_id)
+    let agent = session_store
+        .get_agent_by_id(&active_agent_id)
         .ok()
         .flatten()
         .or_else(|| {
             session_store
-                .get_agent_spec_by_name(&active_agent_id)
+                .get_agent_by_name(&active_agent_id)
                 .ok()
                 .flatten()
         })?;
-    let policy = parse_agent_spec_policy(&spec.config_json);
+    let policy = parse_agent_spec_policy(&agent.config_json);
     let has_policy = policy.tools.is_some() || policy.skills.is_some();
     if has_policy {
         Some(policy)
@@ -451,16 +478,6 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
     let merged =
         build_merged_system_prompt(&base_prompt, channel_delivery_instructions(channel_name));
     (merged, allowed_tools)
-}
-
-fn normalize_session_context(msg: &traits::ChannelMessage) -> SessionContext {
-    SessionContext {
-        channel: msg.channel.clone(),
-        chat_type: msg.chat_type,
-        sender_id: msg.sender.clone(),
-        chat_id: msg.chat_id.clone(),
-        thread_id: msg.thread_id.clone(),
-    }
 }
 
 pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -527,18 +544,9 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-/// Returns false when the session is bound to INTERNAL_MESSAGE_CHANNEL (no external delivery). Used for M4 child sessions.
-pub(crate) fn should_deliver_to_external_channel(
-    session_store: Option<&Arc<SessionStore>>,
-    active_session: Option<&SessionId>,
-) -> bool {
-    let (Some(store), Some(session_id)) = (session_store, active_session) else {
-        return true;
-    };
-    !matches!(
-        store.load_route_metadata(session_id),
-        Ok(Some(meta)) if meta.channel == INTERNAL_MESSAGE_CHANNEL
-    )
+/// Returns false when the delivery channel is internal (unified reply: use message envelope only).
+pub(crate) fn should_deliver_to_external_channel(delivery_channel: &str) -> bool {
+    delivery_channel != INTERNAL_MESSAGE_CHANNEL
 }
 
 /// M4: Build ephemeral context from recent announce messages (meta_json with source/result). Not persisted.
@@ -679,8 +687,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     let parsed_command = parse_slash_command(&msg.content);
-    let session_context = normalize_session_context(&msg);
-    let session_key = ctx.session_resolver.resolve(&session_context);
+    let inbound_key = inbound_key(&msg);
 
     if let Some(command) = parsed_command {
         if is_agent_command(&command) {
@@ -696,25 +703,25 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     .await;
                     return;
                 };
-                match store.get_or_create_active(&session_key) {
+                match store.get_or_create_active(&inbound_key) {
                     Ok(id) => id,
                     Err(e) => {
-                        tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
+                        tracing::error!(inbound_key = %inbound_key, "Failed to resolve active session: {e}");
                         return;
                     }
                 }
             };
             let envelope = AgentWorkItem::from_message(&msg);
             let item = AgentQueueItem::Command(command, envelope);
-            let key = agent_registry_key(&session_id, &session_key);
-            let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &session_key);
+            let key = agent_registry_key(&session_id, &inbound_key);
+            let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &inbound_key);
             if tx.send(item).await.is_err() {
                 tracing::debug!(agent_key = %key, "Agent queue closed");
             }
             return;
         }
         let handled =
-            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &session_key, command).await;
+            handle_slash_command(&ctx, target_channel.as_ref(), &msg, &inbound_key, command).await;
         if handled {
             return;
         }
@@ -728,18 +735,18 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             tracing::error!("Session store missing");
             return;
         };
-        match store.get_or_create_active(&session_key) {
+        match store.get_or_create_active(&inbound_key) {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
+                tracing::error!(inbound_key = %inbound_key, "Failed to resolve active session: {e}");
                 return;
             }
         }
     };
 
     let item = AgentQueueItem::Message(AgentWorkItem::from_message(&msg));
-    let key = agent_registry_key(&session_id, &session_key);
-    let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &session_key);
+    let key = agent_registry_key(&session_id, &inbound_key);
+    let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &inbound_key);
     if tx.send(item).await.is_err() {
         tracing::debug!(agent_key = %key, "Agent queue closed");
     }
@@ -1451,7 +1458,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         session_history_limit: config.session.history_limit,
         session_store,
-        session_resolver: SessionResolver::new(),
         config: Arc::new(config.clone()),
         all_skills: Arc::new(skills),
     });
@@ -1744,18 +1750,13 @@ mod tests {
     fn session_test_message(content: &str, id: &str) -> traits::ChannelMessage {
         traits::ChannelMessage {
             id: id.to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user".to_string(),
             reply_target: "chat-session".to_string(),
             content: content.to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-session".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         }
     }
 
@@ -1779,7 +1780,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: Some(session_store),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(config),
             all_skills: Arc::new(vec![]),
         })
@@ -1787,61 +1787,17 @@ mod tests {
 
     #[test]
     fn should_deliver_to_external_channel_returns_true_when_no_store_or_session() {
-        assert!(should_deliver_to_external_channel(None, None));
+        assert!(should_deliver_to_external_channel("telegram"));
     }
 
     #[test]
-    fn should_deliver_to_external_channel_returns_false_when_session_channel_is_internal() {
-        let temp = TempDir::new().unwrap();
-        let store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let session_key = crate::session::SessionKey::new("group:test:internal");
-        let session_id = store.get_or_create_active(&session_key).unwrap();
-        store
-            .upsert_route_metadata(
-                &session_id,
-                &SessionRouteMetadata {
-                    agent_id: None,
-                    channel: INTERNAL_MESSAGE_CHANNEL.to_string(),
-                    account_id: None,
-                    chat_type: "direct".to_string(),
-                    chat_id: "chat-internal".to_string(),
-                    route_id: None,
-                    sender_id: "zeroclaw_user".to_string(),
-                    title: None,
-                },
-            )
-            .unwrap();
-        assert!(!should_deliver_to_external_channel(
-            Some(&store),
-            Some(&session_id)
-        ));
+    fn should_deliver_to_external_channel_returns_false_for_internal_channel() {
+        assert!(!should_deliver_to_external_channel(INTERNAL_MESSAGE_CHANNEL));
     }
 
     #[test]
-    fn should_deliver_to_external_channel_returns_true_when_session_channel_is_telegram() {
-        let temp = TempDir::new().unwrap();
-        let store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let session_key = crate::session::SessionKey::new("group:telegram:deliver");
-        let session_id = store.get_or_create_active(&session_key).unwrap();
-        store
-            .upsert_route_metadata(
-                &session_id,
-                &SessionRouteMetadata {
-                    agent_id: None,
-                    channel: "telegram".to_string(),
-                    account_id: None,
-                    chat_type: "direct".to_string(),
-                    chat_id: "chat-123".to_string(),
-                    route_id: None,
-                    sender_id: "zeroclaw_user".to_string(),
-                    title: None,
-                },
-            )
-            .unwrap();
-        assert!(should_deliver_to_external_channel(
-            Some(&store),
-            Some(&session_id)
-        ));
+    fn should_deliver_to_external_channel_returns_true_for_telegram() {
+        assert!(should_deliver_to_external_channel("telegram"));
     }
 
     #[test]
@@ -1964,18 +1920,13 @@ mod tests {
     fn agent_work_item_from_message_preserves_content_and_reply_target() {
         let msg = traits::ChannelMessage {
             id: "id-1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "alice".to_string(),
             reply_target: "chat-99".to_string(),
             content: "hello world".to_string(),
             channel: "telegram".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-99".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let work = AgentWorkItem::from_message(&msg);
         let back = work.to_channel_message();
@@ -1990,48 +1941,33 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<AgentQueueItem>(4);
         let msg1 = traits::ChannelMessage {
             id: "i1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "u1".to_string(),
             reply_target: "r1".to_string(),
             content: "one".to_string(),
             channel: "ch".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "c1".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "i2".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "u2".to_string(),
             reply_target: "r2".to_string(),
             content: "two".to_string(),
             channel: "ch".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "c2".to_string(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
         let msg3 = traits::ChannelMessage {
             id: "i3".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "u3".to_string(),
             reply_target: "target-last".to_string(),
             content: "three".to_string(),
             channel: "ch".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "c3".to_string(),
-            thread_id: None,
             timestamp: 3,
+            thread_ts: None,
+            session_id: None,
         };
         let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
         let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
@@ -2062,13 +1998,13 @@ mod tests {
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let msg = session_test_message("/new", "cmd-new");
-        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
-        let previous_session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&msg);
+        let previous_session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
         process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let active_after = session_store.get_or_create_active(&session_key).unwrap();
+        let active_after = session_store.get_or_create_active(&inbound_key).unwrap();
         assert_ne!(active_after.as_str(), previous_session_id.as_str());
         let previous_messages = session_store
             .load_recent_messages(&previous_session_id, 10)
@@ -2091,8 +2027,8 @@ mod tests {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let msg = session_test_message("/compact", "cmd-compact");
-        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
-        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&msg);
+        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
         process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2128,7 +2064,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: None,
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -2152,8 +2087,8 @@ mod tests {
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let runtime_ctx = session_runtime_ctx(session_store.clone(), channel);
         let base_msg = session_test_message("hello", "seed");
-        let session_key = SessionResolver::new().resolve(&normalize_session_context(&base_msg));
-        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&base_msg);
+        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -2187,8 +2122,8 @@ mod tests {
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let msg = session_test_message("/sessions", "cmd-sessions");
-        let session_key = SessionResolver::new().resolve(&normalize_session_context(&msg));
-        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&msg);
+        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
         process_channel_message(session_runtime_ctx(session_store, channel), msg).await;
 
@@ -2205,11 +2140,11 @@ mod tests {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
-        let spec = session_store
-            .upsert_subagent_spec("reviewer", r#"{"model":"test"}"#)
+        let agent = session_store
+            .upsert_agent("reviewer", r#"{"model":"test"}"#)
             .unwrap();
         let _subagent_session = session_store
-            .create_subagent_session(Some(spec.spec_id.as_str()), None)
+            .create_subagent_session(Some(agent.agent_id.as_str()), None)
             .unwrap();
 
         process_channel_message(
@@ -2221,7 +2156,7 @@ mod tests {
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Subagents"));
-        assert!(sent[0].contains("specs: 1"));
+        assert!(sent[0].contains("agents: 1"));
         assert!(sent[0].contains("sessions: 1"));
     }
 
@@ -2250,7 +2185,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: session_store.clone(),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -2259,18 +2193,13 @@ mod tests {
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
-                agent_id: None,
-                account_id: None,
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
-                title: None,
-                chat_type: ChatType::Group,
-                raw_chat_type: None,
-                chat_id: "chat-42".to_string(),
-                thread_id: None,
                 timestamp: 1,
+                thread_ts: None,
+                session_id: None,
             },
         )
         .await;
@@ -2311,7 +2240,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: session_store.clone(),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -2320,18 +2248,13 @@ mod tests {
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-2".to_string(),
-                agent_id: None,
-                account_id: None,
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
-                title: None,
-                chat_type: ChatType::Group,
-                raw_chat_type: None,
-                chat_id: "chat-84".to_string(),
-                thread_id: None,
                 timestamp: 2,
+                thread_ts: None,
+                session_id: None,
             },
         )
         .await;
@@ -2594,43 +2517,32 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: Some(session_store),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
 
         let msg1 = traits::ChannelMessage {
             id: "i1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_same_agent".to_string(),
             reply_target: "chat-same".to_string(),
             content: "first".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-same".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "i2".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_same_agent".to_string(),
             reply_target: "chat-same".to_string(),
             content: "second".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-same".to_string(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
 
-        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let key = inbound_key(&msg1);
         let session_id = ctx
             .session_store
             .as_ref()
@@ -2686,43 +2598,32 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: Some(session_store),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
 
         let msg1 = traits::ChannelMessage {
             id: "u1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_unreg".to_string(),
             reply_target: "chat-unreg".to_string(),
             content: "first".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-unreg".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "u2".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_unreg".to_string(),
             reply_target: "chat-unreg".to_string(),
             content: "second".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-unreg".to_string(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
 
-        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let key = inbound_key(&msg1);
         let session_id = ctx
             .session_store
             .as_ref()
@@ -2772,43 +2673,32 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: Some(session_store),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
 
         let msg1 = traits::ChannelMessage {
             id: "steer-1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_steer".to_string(),
             reply_target: "chat-steer".to_string(),
             content: "trigger tool".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-steer".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "steer-2".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_steer".to_string(),
             reply_target: "chat-steer".to_string(),
             content: "new priority".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-steer".to_string(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
 
-        let key = SessionResolver::new().resolve(&normalize_session_context(&msg1));
+        let key = inbound_key(&msg1);
         let session_id = ctx
             .session_store
             .as_ref()
@@ -2848,23 +2738,17 @@ mod tests {
 
         let msg = traits::ChannelMessage {
             id: "msg-3".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_skip_memory".to_string(),
             reply_target: "chat-skip-mem".to_string(),
             content: "current question".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-skip-mem".to_string(),
-            thread_id: None,
             timestamp: 3,
+            thread_ts: None,
+            session_id: None,
         };
 
-        let session_resolver = SessionResolver::new();
-        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
-        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&msg);
+        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
         session_store
             .append_message(&session_id, "user", "past-user", None)
             .unwrap();
@@ -2889,7 +2773,6 @@ mod tests {
             auto_save_memory: true,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
-            session_resolver,
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -2929,23 +2812,17 @@ mod tests {
 
         let msg = traits::ChannelMessage {
             id: "msg-4".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "zeroclaw_user_compaction_tail".to_string(),
             reply_target: "chat-200".to_string(),
             content: "latest question".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "chat-200".to_string(),
-            thread_id: None,
             timestamp: 4,
+            thread_ts: None,
+            session_id: None,
         };
 
-        let session_resolver = SessionResolver::new();
-        let session_key = session_resolver.resolve(&normalize_session_context(&msg));
-        let session_id = session_store.get_or_create_active(&session_key).unwrap();
+        let inbound_key = inbound_key(&msg);
+        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
         session_store
             .append_message(&session_id, "user", "old-user", None)
             .unwrap();
@@ -2995,7 +2872,6 @@ mod tests {
             auto_save_memory: true,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
-            session_resolver,
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -3024,7 +2900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_channel_message_session_mode_upserts_route_metadata() {
+    async fn process_channel_message_session_mode_creates_session() {
         let temp = TempDir::new().unwrap();
         let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
         let provider = Arc::new(HistoryCaptureProvider::default()) as Arc<dyn Provider>;
@@ -3048,7 +2924,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -3057,31 +2932,24 @@ mod tests {
             runtime_ctx,
             traits::ChannelMessage {
                 id: "msg-meta".to_string(),
-                agent_id: Some("zeroclaw-bot".to_string()),
-                account_id: Some("account-main".to_string()),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-meta".to_string(),
-                content: "metadata ping".to_string(),
+                content: "session ping".to_string(),
                 channel: "test-channel".to_string(),
-                title: Some("Project Alpha Group".to_string()),
-                chat_type: ChatType::Group,
-                raw_chat_type: None,
-                chat_id: "chat-meta".to_string(),
-                thread_id: Some("thread-77".to_string()),
                 timestamp: 5,
+                thread_ts: Some("thread-77".to_string()),
+                session_id: None,
             },
         )
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let candidates = session_store
-            .find_chat_candidates_by_title("alpha", 10)
+        let inbound_key = "channel:test-channel:zeroclaw_user:thread-77";
+        let sessions = session_store
+            .list_sessions(Some(inbound_key), 10)
             .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].chat_id, "chat-meta");
-        assert_eq!(candidates[0].channel, "test-channel");
-        assert_eq!(candidates[0].account_id.as_deref(), Some("account-main"));
-        assert_eq!(candidates[0].chat_type, "group");
+        assert!(!sessions.is_empty());
+        assert_eq!(sessions[0].inbound_key, inbound_key);
     }
 
     #[tokio::test]
@@ -3111,7 +2979,6 @@ mod tests {
             auto_save_memory: false,
             session_history_limit: 40,
             session_store,
-            session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
         });
@@ -3119,35 +2986,25 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "alice".to_string(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         })
         .await
         .unwrap();
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
-            agent_id: None,
-            account_id: None,
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
-            title: None,
-            chat_type: ChatType::Direct,
-            raw_chat_type: None,
-            chat_id: "bob".to_string(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         })
         .await
         .unwrap();
@@ -3404,18 +3261,13 @@ mod tests {
     fn conversation_memory_key_uses_message_id() {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
-            agent_id: None,
-            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
-            title: None,
-            chat_type: ChatType::Group,
-            raw_chat_type: None,
-            chat_id: "C456".into(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -3425,33 +3277,23 @@ mod tests {
     fn conversation_memory_key_is_unique_per_message() {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
-            agent_id: None,
-            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
-            title: None,
-            chat_type: ChatType::Group,
-            raw_chat_type: None,
-            chat_id: "C456".into(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
-            agent_id: None,
-            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
-            title: None,
-            chat_type: ChatType::Group,
-            raw_chat_type: None,
-            chat_id: "C456".into(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
 
         assert_ne!(
@@ -3467,33 +3309,23 @@ mod tests {
 
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
-            agent_id: None,
-            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
-            title: None,
-            chat_type: ChatType::Group,
-            raw_chat_type: None,
-            chat_id: "C456".into(),
-            thread_id: None,
             timestamp: 1,
+            thread_ts: None,
+            session_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
-            agent_id: None,
-            account_id: None,
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),
-            title: None,
-            chat_type: ChatType::Group,
-            raw_chat_type: None,
-            chat_id: "C456".into(),
-            thread_id: None,
             timestamp: 2,
+            thread_ts: None,
+            session_id: None,
         };
 
         mem.store(
