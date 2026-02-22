@@ -13,6 +13,7 @@ const COMMAND_LIST_LIMIT: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
+    Stop,
     New,
     Compact,
     Queue { mode: Option<String> },
@@ -36,6 +37,7 @@ pub fn parse_slash_command(content: &str) -> Option<SlashCommand> {
     let command = parts.next()?;
 
     match command {
+        "/stop" => Some(SlashCommand::Stop),
         "/new" => Some(SlashCommand::New),
         "/compact" => Some(SlashCommand::Compact),
         "/queue" => Some(SlashCommand::Queue {
@@ -55,6 +57,34 @@ pub fn parse_slash_command(content: &str) -> Option<SlashCommand> {
     }
 }
 
+/// True for commands that are executed in the agent loop (enqueued to agent, not handled in gateway).
+pub(crate) fn is_agent_command(cmd: &SlashCommand) -> bool {
+    matches!(
+        cmd,
+        SlashCommand::Stop
+            | SlashCommand::New
+            | SlashCommand::Compact
+            | SlashCommand::Models
+            | SlashCommand::Model { .. }
+    )
+}
+
+/// Send a command reply to the channel. Used by the gateway when agent commands cannot be enqueued (e.g. no session store).
+pub(crate) async fn send_command_response(
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    content: String,
+) {
+    if let Some(channel) = target_channel {
+        if let Err(error) = channel.send(&SendMessage::new(content, reply_target)).await {
+            tracing::error!(
+                "Failed to send command response on {}: {error}",
+                channel.name()
+            );
+        }
+    }
+}
+
 /// Short display form of a session id (first 8 chars).
 pub(crate) fn short_session_id(session_id: &SessionId) -> String {
     session_id.as_str().chars().take(8).collect::<String>()
@@ -71,21 +101,6 @@ pub fn build_route_metadata(msg: &ChannelMessage) -> SessionRouteMetadata {
         route_id: msg.thread_id.clone(),
         sender_id: msg.sender.clone(),
         title: msg.title.clone(),
-    }
-}
-
-async fn send_command_response(
-    target_channel: Option<&Arc<dyn Channel>>,
-    reply_target: &str,
-    content: String,
-) {
-    if let Some(channel) = target_channel {
-        if let Err(error) = channel.send(&SendMessage::new(content, reply_target)).await {
-            tracing::error!(
-                "Failed to send command response on {}: {error}",
-                channel.name()
-            );
-        }
     }
 }
 
@@ -165,6 +180,15 @@ pub(crate) async fn handle_slash_command(
     };
 
     match command {
+        SlashCommand::Stop => {
+            send_command_response(
+                target_channel,
+                &msg.reply_target,
+                "Agent was aborted.".to_string(),
+            )
+            .await;
+            return true;
+        }
         SlashCommand::New => match session_store.create_new(session_key) {
             Ok(session_id) => {
                 if let Err(error) =
@@ -571,6 +595,7 @@ mod tests {
 
     #[test]
     fn parse_slash_command_recognizes_supported_commands() {
+        assert_eq!(parse_slash_command("/stop"), Some(SlashCommand::Stop));
         assert_eq!(parse_slash_command("/new"), Some(SlashCommand::New));
         assert_eq!(
             parse_slash_command("   /compact"),
@@ -608,6 +633,19 @@ mod tests {
                 provider_model: "openrouter/anthropic/claude-sonnet-4".to_string()
             })
         );
+    }
+
+    #[test]
+    fn is_agent_command_returns_true_for_agent_commands() {
+        assert!(is_agent_command(&SlashCommand::Stop));
+        assert!(is_agent_command(&SlashCommand::New));
+        assert!(is_agent_command(&SlashCommand::Compact));
+        assert!(is_agent_command(&SlashCommand::Models));
+        assert!(is_agent_command(&SlashCommand::Model {
+            provider_model: "p/m".to_string()
+        }));
+        assert!(!is_agent_command(&SlashCommand::Queue { mode: None }));
+        assert!(!is_agent_command(&SlashCommand::Sessions));
     }
 
     #[test]

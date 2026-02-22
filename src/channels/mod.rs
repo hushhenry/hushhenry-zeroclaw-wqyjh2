@@ -30,10 +30,13 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::agent::{agent_registry_key, get_or_create_agent, AgentWorkItem};
+use crate::agent::agent::{agent_registry_key, get_or_create_agent, AgentQueueItem, AgentWorkItem};
 #[cfg(test)]
-use crate::agent::agent::{drain_agent_queue, merge_work_items};
-use crate::agent::command::{build_route_metadata, handle_slash_command, parse_slash_command};
+use crate::agent::agent::{drain_agent_queue, merge_work_items, partition_steer_items};
+use crate::agent::command::{
+    build_route_metadata, handle_slash_command, is_agent_command, parse_slash_command,
+    send_command_response,
+};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory};
@@ -680,6 +683,36 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let session_key = ctx.session_resolver.resolve(&session_context);
 
     if let Some(command) = parsed_command {
+        if is_agent_command(&command) {
+            let session_id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
+                internal_target
+            } else {
+                let Some(store) = ctx.session_store.as_ref() else {
+                    send_command_response(
+                        target_channel.as_ref(),
+                        &msg.reply_target,
+                        "Session store is unavailable.".to_string(),
+                    )
+                    .await;
+                    return;
+                };
+                match store.get_or_create_active(&session_key) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
+                        return;
+                    }
+                }
+            };
+            let envelope = AgentWorkItem::from_message(&msg);
+            let item = AgentQueueItem::Command(command, envelope);
+            let key = agent_registry_key(&session_id, &session_key);
+            let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &session_key);
+            if tx.send(item).await.is_err() {
+                tracing::debug!(agent_key = %key, "Agent queue closed");
+            }
+            return;
+        }
         let handled =
             handle_slash_command(&ctx, target_channel.as_ref(), &msg, &session_key, command).await;
         if handled {
@@ -704,10 +737,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     };
 
-    let work = AgentWorkItem::from_message(&msg);
+    let item = AgentQueueItem::Message(AgentWorkItem::from_message(&msg));
     let key = agent_registry_key(&session_id, &session_key);
     let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &session_key);
-    if tx.send(work).await.is_err() {
+    if tx.send(item).await.is_err() {
         tracing::debug!(agent_key = %key, "Agent queue closed");
     }
 }
@@ -1954,7 +1987,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_agent_queue_returns_all_items_in_order() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel::<AgentQueueItem>(4);
         let msg1 = traits::ChannelMessage {
             id: "i1".to_string(),
             agent_id: None,
@@ -2000,14 +2033,15 @@ mod tests {
             thread_id: None,
             timestamp: 3,
         };
-        let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
-        let _ = tx.send(AgentWorkItem::from_message(&msg2)).await;
-        let _ = tx.send(AgentWorkItem::from_message(&msg3)).await;
+        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
+        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
+        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg3))).await;
         drop(tx);
 
         let drained = drain_agent_queue(&mut rx);
         assert_eq!(drained.len(), 3);
-        let m = merge_work_items(drained).expect("merge should return one merged item");
+        let (_, messages) = partition_steer_items(drained);
+        let m = merge_work_items(messages).expect("merge should return one merged item");
         assert_eq!(m.content, "one\n\ntwo\n\nthree");
         assert_eq!(m.reply_target, "target-last");
         assert_eq!(m.sender, "u3");
@@ -2015,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_agent_queue_returns_empty_when_empty() {
-        let (_tx, mut rx) = mpsc::channel::<AgentWorkItem>(2);
+        let (_tx, mut rx) = mpsc::channel::<AgentQueueItem>(2);
         let drained = drain_agent_queue(&mut rx);
         assert!(drained.is_empty());
     }
@@ -2032,6 +2066,7 @@ mod tests {
         let previous_session_id = session_store.get_or_create_active(&session_key).unwrap();
 
         process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let active_after = session_store.get_or_create_active(&session_key).unwrap();
         assert_ne!(active_after.as_str(), previous_session_id.as_str());
@@ -2046,7 +2081,7 @@ mod tests {
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Started a new session"));
+        assert!(sent[0].contains("New session started"));
     }
 
     #[tokio::test]
@@ -2060,6 +2095,7 @@ mod tests {
         let session_id = session_store.get_or_create_active(&session_key).unwrap();
 
         process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let messages = session_store.load_recent_messages(&session_id, 10).unwrap();
         assert!(messages.is_empty());
@@ -2603,8 +2639,8 @@ mod tests {
             .unwrap();
         let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
         let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
-        let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
-        let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
+        let _ = tx1.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
+        let _ = tx2.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
         drop(tx1);
         drop(tx2);
 
@@ -2694,13 +2730,13 @@ mod tests {
             .get_or_create_active(&key)
             .unwrap();
         let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
-        let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
+        let _ = tx1.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         drop(tx1);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let tx2 = get_or_create_agent(ctx, session_id, &key);
-        let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
+        let _ = tx2.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let sent = channel_impl.sent_messages.lock().await;
@@ -2780,10 +2816,10 @@ mod tests {
             .get_or_create_active(&key)
             .unwrap();
         let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
-        let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
+        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
         tokio::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = tx.send(AgentWorkItem::from_message(&msg2)).await;
+            let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
         });
         tokio::time::sleep(Duration::from_millis(600)).await;
 

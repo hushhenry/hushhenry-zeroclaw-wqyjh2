@@ -1,7 +1,7 @@
 //! Struct-based agent loop: Agent owns message_rx, deliver_tx, and (in session mode) history.
 //! Replaces the function-based agent_loop in channels/mod.rs.
 
-use crate::agent::command::build_route_metadata;
+use crate::agent::command::{build_route_metadata, short_session_id, SlashCommand};
 use crate::agent::loop_::{
     build_assistant_content_native, find_tool, maybe_bind_source_session_id,
     maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
@@ -18,6 +18,7 @@ use crate::session::compaction::{
     resolve_keep_recent_messages, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::{SessionId, SessionKey, SessionStore};
+use std::fmt::Write;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use parking_lot::Mutex as ParkingMutex;
@@ -29,7 +30,7 @@ use uuid::Uuid;
 
 // --- Moved types (from channels/mod.rs) ---
 
-/// One unit of work for an agent's internal queue.
+/// One unit of work for an agent's internal queue (user message only).
 #[derive(Clone)]
 pub(crate) struct AgentWorkItem {
     pub content: String,
@@ -84,8 +85,25 @@ impl AgentWorkItem {
     }
 }
 
+/// Item in the agent queue: either a user message or a slash command to execute in the agent loop.
+#[derive(Clone)]
+pub(crate) enum AgentQueueItem {
+    Message(AgentWorkItem),
+    Command(SlashCommand, AgentWorkItem),
+}
+
+impl AgentQueueItem {
+    /// Delivery envelope (channel, reply_target, etc.) for sending the response.
+    pub(crate) fn envelope(&self) -> &AgentWorkItem {
+        match self {
+            AgentQueueItem::Message(w) => w,
+            AgentQueueItem::Command(_, w) => w,
+        }
+    }
+}
+
 pub(crate) struct AgentHandle {
-    pub tx: mpsc::Sender<AgentWorkItem>,
+    pub tx: mpsc::Sender<AgentQueueItem>,
 }
 
 fn agent_registry() -> Arc<ParkingMutex<HashMap<String, AgentHandle>>> {
@@ -95,12 +113,28 @@ fn agent_registry() -> Arc<ParkingMutex<HashMap<String, AgentHandle>>> {
 }
 
 /// Drain receiver without blocking.
-pub(crate) fn drain_agent_queue(rx: &mut mpsc::Receiver<AgentWorkItem>) -> Vec<AgentWorkItem> {
-    let mut batch: Vec<AgentWorkItem> = Vec::new();
+pub(crate) fn drain_agent_queue(rx: &mut mpsc::Receiver<AgentQueueItem>) -> Vec<AgentQueueItem> {
+    let mut batch: Vec<AgentQueueItem> = Vec::new();
     while let Ok(w) = rx.try_recv() {
         batch.push(w);
     }
     batch
+}
+
+/// Split drained items into commands (first, in order) and messages (second). Used so commands are
+/// processed and delivered before merging messages (e.g. steer-merge).
+pub(crate) fn partition_steer_items(
+    items: Vec<AgentQueueItem>,
+) -> (Vec<(SlashCommand, AgentWorkItem)>, Vec<AgentWorkItem>) {
+    let mut commands = Vec::new();
+    let mut messages = Vec::new();
+    for item in items {
+        match item {
+            AgentQueueItem::Message(w) => messages.push(w),
+            AgentQueueItem::Command(cmd, w) => commands.push((cmd, w)),
+        }
+    }
+    (commands, messages)
 }
 
 pub(crate) fn merge_work_items(mut batch: Vec<AgentWorkItem>) -> Option<AgentWorkItem> {
@@ -166,11 +200,12 @@ pub(crate) fn agent_registry_key(session_id: &SessionId, _session_key: &SessionK
 
 pub(crate) struct Agent {
     session_id: SessionId,
+    session_key: SessionKey,
     system_prompt: String,
     tool_allow_list: Option<Vec<String>>,
     /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
     tool_specs: Vec<ToolSpec>,
-    message_rx: mpsc::Receiver<AgentWorkItem>,
+    message_rx: mpsc::Receiver<AgentQueueItem>,
     deliver_tx: mpsc::Sender<DeliverMessage>,
     history: Vec<ChatMessage>,
     /// DB message id per history entry (Some for persisted user/assistant, None for system/summary/tool).
@@ -186,8 +221,8 @@ impl Agent {
     pub(crate) fn new(
         ctx: Arc<ChannelRuntimeContext>,
         session_id: SessionId,
-        _session_key: &SessionKey,
-        message_rx: mpsc::Receiver<AgentWorkItem>,
+        session_key: &SessionKey,
+        message_rx: mpsc::Receiver<AgentQueueItem>,
         deliver_tx: mpsc::Sender<DeliverMessage>,
         verbose_tool_output: bool,
     ) -> Result<Self> {
@@ -220,7 +255,8 @@ impl Agent {
         };
 
         Ok(Self {
-            session_id,
+            session_id: session_id.clone(),
+            session_key: session_key.clone(),
             system_prompt,
             tool_allow_list,
             tool_specs,
@@ -310,8 +346,195 @@ impl Agent {
         Ok(())
     }
 
+    fn delivery_target(&self, envelope: &AgentWorkItem) -> (String, String) {
+        resolve_delivery_target(
+            &self.ctx,
+            Some(&self.session_id),
+            &envelope.to_channel_message(),
+        )
+    }
+
+    /// /stop: abort current turn. Delivers "Agent was aborted.", returns true.
+    async fn cmd_stop(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        self.on_message("Agent was aborted.", false, &ch, &rt)?;
+        Ok(true)
+    }
+
+    /// /new: create new session, deliver "New session started · model: <provider>/<model>".
+    async fn cmd_new(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        let store = self
+            .ctx
+            .session_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+        match store.create_new(&self.session_key) {
+            Ok(new_session_id) => {
+                let meta = build_route_metadata(&envelope.to_channel_message());
+                if let Err(e) = store.upsert_route_metadata(&new_session_id, &meta) {
+                    tracing::warn!(
+                        "Failed to persist route metadata for session {}: {e}",
+                        new_session_id.as_str()
+                    );
+                }
+                let full_model = self.ctx.provider_manager.default_full_model().to_string();
+                self.on_message(
+                    &format!("New session started · model: {full_model}"),
+                    false,
+                    &ch,
+                    &rt,
+                )?;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create new session for key {}: {e}",
+                    self.session_key.as_str()
+                );
+                self.on_message(
+                    "⚠️ Failed to create a new session. Please try again.",
+                    false,
+                    &ch,
+                    &rt,
+                )?;
+            }
+        }
+        Ok(false)
+    }
+
+    /// /compact: compact this agent's in-memory history, then deliver confirmation.
+    async fn cmd_compact(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        let store = Arc::clone(
+            self.ctx
+                .session_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?,
+        );
+        let session_id = self.session_id.clone();
+        let compacted = self
+            .run_compact_in_memory(&session_id, store.as_ref())
+            .await?;
+        let msg = if compacted {
+            format!(
+                "Session compacted successfully for `{}`.",
+                short_session_id(&session_id)
+            )
+        } else {
+            "No compaction needed yet. Session tail is already small.".to_string()
+        };
+        self.on_message(&msg, false, &ch, &rt)?;
+        Ok(false)
+    }
+
+    /// /model (no args): show current model from session override or default (uses agent's ctx + session_id).
+    async fn cmd_model_show(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        let current = self
+            .ctx
+            .session_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .get_state_key(&self.session_id, SessionStore::MODEL_OVERRIDE_KEY)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|raw| crate::channels::decode_session_string_state(Some(raw)))
+            .unwrap_or_else(|| self.ctx.provider_manager.default_full_model().to_string());
+        self.on_message(&current, false, &ch, &rt)?;
+        Ok(false)
+    }
+
+    /// /model <provider>/<model>: set session model override.
+    async fn cmd_model_set(&mut self, provider_model: &str, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        let store = self
+            .ctx
+            .session_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+        let value_json = serde_json::to_string(&provider_model.trim())
+            .unwrap_or_else(|_| format!("\"{}\"", provider_model.trim()));
+        if let Err(e) = store.set_state_key(
+            &self.session_id,
+            SessionStore::MODEL_OVERRIDE_KEY,
+            &value_json,
+        ) {
+            tracing::error!("Failed to set model_override: {e}");
+            self.on_message("⚠️ Failed to set model override.", false, &ch, &rt)?;
+            return Ok(false);
+        }
+        self.on_message(
+            &format!("Model override set to `{}` for this session.", provider_model.trim()),
+            false,
+            &ch,
+            &rt,
+        )?;
+        Ok(false)
+    }
+
+    /// /models: show model info for this session (override + hint).
+    async fn cmd_models(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+        let (ch, rt) = self.delivery_target(envelope);
+        let store = self
+            .ctx
+            .session_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+        let override_val = crate::channels::decode_session_string_state(
+            store
+                .get_state_key(&self.session_id, SessionStore::MODEL_OVERRIDE_KEY)
+                .ok()
+                .flatten(),
+        );
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "Model for session `{}`",
+            short_session_id(&self.session_id)
+        );
+        let _ = writeln!(
+            text,
+            "Override: {}",
+            override_val
+                .as_deref()
+                .unwrap_or("(none — use agent/default)")
+        );
+        let _ = writeln!(
+            text,
+            "Use /model <provider>/<model> to set override (e.g. openrouter/anthropic/claude-sonnet-4)."
+        );
+        self.on_message(text.trim(), false, &ch, &rt)?;
+        Ok(false)
+    }
+
+    /// Execute one agent command using agent state; deliver reply. Returns true if /stop (abort turn).
+    async fn run_command_and_deliver(
+        &mut self,
+        command: SlashCommand,
+        envelope: &AgentWorkItem,
+    ) -> Result<bool> {
+        match command {
+            SlashCommand::Stop => self.cmd_stop(envelope).await,
+            SlashCommand::New => self.cmd_new(envelope).await,
+            SlashCommand::Compact => self.cmd_compact(envelope).await,
+            SlashCommand::Models => self.cmd_models(envelope).await,
+            SlashCommand::Model { provider_model } => {
+                if provider_model.is_empty() {
+                    self.cmd_model_show(envelope).await
+                } else {
+                    self.cmd_model_set(provider_model.as_str(), envelope).await
+                }
+            }
+            _ => Err(anyhow::anyhow!(
+                "run_command_and_deliver called with non-agent command"
+            )),
+        }
+    }
+
     /// Non-blocking drain of message_rx for steer-merge.
-    /// Session context loop: sequential, in-memory history, steer-merge. When session_store is None, no persistence.
+    /// Session context loop: commands and messages; partition steer items so commands are processed first, then messages.
     async fn session_context_loop(
         mut self,
         _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
@@ -323,7 +546,23 @@ impl Agent {
         while let Some(first) = self.message_rx.recv().await {
             let mut batch = vec![first];
             batch.extend(drain_agent_queue(&mut self.message_rx));
-            let Some(work) = merge_work_items(batch) else {
+            let (commands, messages) = partition_steer_items(batch);
+
+            let mut aborted = false;
+            for (cmd, envelope) in commands {
+                match self.run_command_and_deliver(cmd, &envelope).await {
+                    Ok(true) => aborted = true,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
+                    }
+                }
+            }
+            if aborted {
+                continue;
+            }
+
+            let Some(work) = merge_work_items(messages) else {
                 continue;
             };
 
@@ -466,8 +705,20 @@ impl Agent {
             self.history_message_ids.push(None);
 
             for (idx, call) in tool_calls.iter().enumerate() {
-                let steer = drain_agent_queue(&mut self.message_rx);
-                if !steer.is_empty() {
+                let steer_items = drain_agent_queue(&mut self.message_rx);
+                let (steer_commands, steer_messages) = partition_steer_items(steer_items);
+
+                for (cmd, envelope) in steer_commands {
+                    match self.run_command_and_deliver(cmd, &envelope).await {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
+                        }
+                    }
+                }
+
+                if !steer_messages.is_empty() {
                     let skip_msg = "tool skipped (new user message)";
                     for c in &tool_calls[idx..] {
                         self.history.push(ChatMessage::tool(
@@ -485,7 +736,7 @@ impl Agent {
                             &delivery_reply_target,
                         )?;
                     }
-                    let merged = build_steer_merge_message(&user_content, steer);
+                    let merged = build_steer_merge_message(&user_content, steer_messages);
                     self.history.push(ChatMessage::user(merged));
                     self.history_message_ids.push(None);
                     break;
@@ -517,11 +768,12 @@ impl Agent {
         anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
     }
 
+    /// Compact in-memory history using agent state. Returns true if compaction was performed.
     async fn run_compact_in_memory(
         &mut self,
         session_id: &SessionId,
         session_store: &SessionStore,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let keep_recent = resolve_keep_recent_messages(self.ctx.session_history_limit);
         let default_resolved = self
             .ctx
@@ -539,15 +791,16 @@ impl Agent {
         )
         .await
         {
-            Ok((new_history, new_ids, _compacted)) => {
+            Ok((new_history, new_ids, compacted)) => {
                 self.history = new_history;
                 self.history_message_ids = new_ids;
+                Ok(compacted)
             }
             Err(e) => {
                 tracing::warn!(session_id = %session_id.as_str(), "In-memory compaction failed: {e}");
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     async fn execute_single_tool(
@@ -627,7 +880,7 @@ pub(crate) fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
     session_id: SessionId,
     session_key: &SessionKey,
-) -> mpsc::Sender<AgentWorkItem> {
+) -> mpsc::Sender<AgentQueueItem> {
     let key_str = agent_registry_key(&session_id, session_key);
     let registry = agent_registry();
     {
@@ -636,7 +889,7 @@ pub(crate) fn get_or_create_agent(
             return handle.tx.clone();
         }
     }
-    let (message_tx, message_rx) = mpsc::channel(64);
+    let (message_tx, message_rx) = mpsc::channel::<AgentQueueItem>(64);
     let (deliver_tx, deliver_rx) = mpsc::channel(64);
 
     let runner_ctx = Arc::clone(&ctx);
