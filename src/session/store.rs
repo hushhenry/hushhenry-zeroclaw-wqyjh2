@@ -650,7 +650,6 @@ impl SessionStore {
         .context("Failed to mark subagent session stopped")?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -698,12 +697,16 @@ mod tests {
 
         assert!(store.last_message_id(&session_id).unwrap().is_none());
 
-        store.append_message(&session_id, "user", "first", None).unwrap();
+        store
+            .append_message(&session_id, "user", "first", None)
+            .unwrap();
         let id1 = store.last_message_id(&session_id).unwrap();
         assert!(id1.is_some());
         assert!(id1.unwrap() > 0);
 
-        store.append_message(&session_id, "assistant", "second", None).unwrap();
+        store
+            .append_message(&session_id, "assistant", "second", None)
+            .unwrap();
         let id2 = store.last_message_id(&session_id).unwrap();
         assert!(id2.is_some());
         assert!(id2.unwrap() >= id1.unwrap());

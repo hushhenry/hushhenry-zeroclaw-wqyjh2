@@ -4,11 +4,11 @@ pub mod schema;
 pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DiscordConfig,
-    DockerRuntimeConfig, GatewayConfig, HttpRequestConfig, IMessageConfig,
-    IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    ProviderGroupConfig, ProviderGroupStrategy, ReliabilityConfig, ResourceLimitsConfig,
-    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SessionConfig, SlackConfig, TelegramConfig, WebhookConfig,
+    DockerRuntimeConfig, GatewayConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
+    LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, ProviderGroupConfig,
+    ProviderGroupStrategy, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
+    SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SessionConfig, SlackConfig,
+    TelegramConfig, WebhookConfig,
 };
 
 #[cfg(test)]

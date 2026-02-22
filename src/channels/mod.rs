@@ -44,8 +44,8 @@ use crate::providers::{self, ChatMessage, Provider, ProviderCtx, ProviderManager
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
-    compaction::build_merged_system_prompt,
-    SessionId, SessionMessage, SessionMessageRole, SessionStore,
+    compaction::build_merged_system_prompt, SessionId, SessionMessage, SessionMessageRole,
+    SessionStore,
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -341,12 +341,7 @@ fn get_agent_model_temperature(
         .get_agent_by_id(&active_agent_id)
         .ok()
         .flatten()
-        .or_else(|| {
-            store
-                .get_agent_by_name(&active_agent_id)
-                .ok()
-                .flatten()
-        })?;
+        .or_else(|| store.get_agent_by_name(&active_agent_id).ok().flatten())?;
     let d = parse_agent_spec_defaults(&agent.config_json);
     let p = d.provider?;
     let m = d.model?;
@@ -1849,9 +1844,15 @@ mod tests {
             thread_ts: None,
             session_id: None,
         };
-        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
-        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
-        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg3))).await;
+        let _ = tx
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1)))
+            .await;
+        let _ = tx
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2)))
+            .await;
+        let _ = tx
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg3)))
+            .await;
         drop(tx);
 
         let drained = drain_agent_queue(&mut rx);
@@ -2431,8 +2432,12 @@ mod tests {
             .unwrap();
         let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
         let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
-        let _ = tx1.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
-        let _ = tx2.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
+        let _ = tx1
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1)))
+            .await;
+        let _ = tx2
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2)))
+            .await;
         drop(tx1);
         drop(tx2);
 
@@ -2511,13 +2516,17 @@ mod tests {
             .get_or_create_active(&key)
             .unwrap();
         let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
-        let _ = tx1.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
+        let _ = tx1
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1)))
+            .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         drop(tx1);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let tx2 = get_or_create_agent(ctx, session_id, &key);
-        let _ = tx2.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
+        let _ = tx2
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2)))
+            .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let sent = channel_impl.sent_messages.lock().await;
@@ -2586,10 +2595,14 @@ mod tests {
             .get_or_create_active(&key)
             .unwrap();
         let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
-        let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1))).await;
+        let _ = tx
+            .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg1)))
+            .await;
         tokio::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = tx.send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2))).await;
+            let _ = tx
+                .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2)))
+                .await;
         });
         tokio::time::sleep(Duration::from_millis(600)).await;
 
@@ -2826,9 +2839,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let inbound_key = "channel:test-channel:zeroclaw_user:thread-77";
-        let sessions = session_store
-            .list_sessions(Some(inbound_key), 10)
-            .unwrap();
+        let sessions = session_store.list_sessions(Some(inbound_key), 10).unwrap();
         assert!(!sessions.is_empty());
         assert_eq!(sessions[0].inbound_key, inbound_key);
     }

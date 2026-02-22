@@ -1,5 +1,5 @@
-use crate::providers::ChatRequest;
 use crate::providers::ChatMessage;
+use crate::providers::ChatRequest;
 use crate::session::{SessionId, SessionStore};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -82,9 +82,7 @@ pub fn load_compaction_state(
         .get_state_key(session_id, SESSION_COMPACTION_AFTER_MESSAGE_ID_KEY)?
         .and_then(|raw| decode_json_i64(&raw));
 
-    Ok(CompactionState {
-        after_message_id,
-    })
+    Ok(CompactionState { after_message_id })
 }
 
 /// Build transcript from in-memory ChatMessages for summarization.
@@ -172,7 +170,11 @@ pub async fn compact_in_memory_history(
         return Ok((history.to_vec(), false));
     }
 
-    let last_id = store.last_message_id(session_id).ok().flatten().filter(|&id| id > 0);
+    let last_id = store
+        .last_message_id(session_id)
+        .ok()
+        .flatten()
+        .filter(|&id| id > 0);
 
     let transcript = build_transcript_from_chat_messages(&to_compact_for_transcript);
     let prompt = build_compaction_prompt(&transcript, system_prompt);

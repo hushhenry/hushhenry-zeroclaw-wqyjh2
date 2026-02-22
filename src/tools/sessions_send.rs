@@ -85,11 +85,7 @@ impl Tool for SessionsSendTool {
         }
 
         // Deliver only via internal channel; session is scheduled and will respond. No session DB write.
-        let msg = build_internal_channel_message(
-            "sessions_send",
-            session_id.as_str(),
-            content,
-        );
+        let msg = build_internal_channel_message("sessions_send", session_id.as_str(), content);
         match dispatch_internal_message(msg).await {
             Ok(()) => Ok(ToolResult {
                 success: true,

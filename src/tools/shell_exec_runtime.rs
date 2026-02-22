@@ -168,7 +168,13 @@ impl InMemoryExecRunStore {
         self.runs.lock().get(run_id).cloned()
     }
 
-    fn append_item(&self, run_id: &str, item_type: &str, payload: &str, meta_json: Option<&str>) -> i64 {
+    fn append_item(
+        &self,
+        run_id: &str,
+        item_type: &str,
+        payload: &str,
+        meta_json: Option<&str>,
+    ) -> i64 {
         let now = now_iso();
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let item = ExecRunItem {
@@ -179,14 +185,16 @@ impl InMemoryExecRunStore {
             meta_json: meta_json.map(ToOwned::to_owned),
             created_at: now,
         };
-        self.items
-            .lock()
-            .get_mut(run_id)
-            .map(|vec| vec.push(item));
+        self.items.lock().get_mut(run_id).map(|vec| vec.push(item));
         seq
     }
 
-    fn load_items_since(&self, run_id: &str, since_seq: Option<i64>, limit: u32) -> Vec<ExecRunItem> {
+    fn load_items_since(
+        &self,
+        run_id: &str,
+        since_seq: Option<i64>,
+        limit: u32,
+    ) -> Vec<ExecRunItem> {
         let items = self.items.lock();
         let vec = match items.get(run_id) {
             Some(v) => v,
@@ -199,7 +207,13 @@ impl InMemoryExecRunStore {
             .collect()
     }
 
-    fn mark_succeeded(&self, run_id: &str, exit_code: Option<i64>, output_bytes: i64, truncated: bool) {
+    fn mark_succeeded(
+        &self,
+        run_id: &str,
+        exit_code: Option<i64>,
+        output_bytes: i64,
+        truncated: bool,
+    ) {
         let now = now_iso();
         if let Some(run) = self.runs.lock().get_mut(run_id) {
             run.status = ExecRunStatus::Succeeded.as_str().to_string();
@@ -211,7 +225,14 @@ impl InMemoryExecRunStore {
         }
     }
 
-    fn mark_failed(&self, run_id: &str, exit_code: Option<i64>, output_bytes: i64, truncated: bool, error_message: &str) {
+    fn mark_failed(
+        &self,
+        run_id: &str,
+        exit_code: Option<i64>,
+        output_bytes: i64,
+        truncated: bool,
+        error_message: &str,
+    ) {
         let now = now_iso();
         if let Some(run) = self.runs.lock().get_mut(run_id) {
             run.status = ExecRunStatus::Failed.as_str().to_string();
@@ -427,9 +448,7 @@ impl ShellExecRuntime {
             return Ok(None);
         }
         let limit = limit.min(MAX_LOG_LIMIT);
-        let items = self
-            .exec_store
-            .load_items_since(run_id, since_seq, limit);
+        let items = self.exec_store.load_items_since(run_id, since_seq, limit);
         let next_seq = items.last().map_or(since_seq.unwrap_or(0), |item| item.seq);
         let filtered: Vec<ExecRunItem> = match stream_filter {
             Some(ty) => items.into_iter().filter(|i| i.item_type == ty).collect(),
@@ -658,12 +677,8 @@ impl ShellExecRuntime {
         }
 
         if exit_code == Some(0) {
-            self.exec_store.mark_succeeded(
-                run.run_id.as_str(),
-                exit_code,
-                output_bytes,
-                truncated,
-            );
+            self.exec_store
+                .mark_succeeded(run.run_id.as_str(), exit_code, output_bytes, truncated);
             return Ok(());
         }
 
@@ -743,12 +758,8 @@ impl ShellExecRuntime {
         }
 
         if !text.is_empty() {
-            self.exec_store.append_item(
-                run.run_id.as_str(),
-                chunk.stream,
-                text.as_str(),
-                None,
-            );
+            self.exec_store
+                .append_item(run.run_id.as_str(), chunk.stream, text.as_str(), None);
             *output_bytes += text.len() as i64;
         }
 

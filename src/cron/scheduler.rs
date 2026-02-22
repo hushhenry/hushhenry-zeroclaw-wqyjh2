@@ -119,11 +119,7 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
             .source_session_id
             .as_ref()
             .map(|id| SessionId::from_string(id.to_string()))
-            .or_else(|| {
-                store
-                    .get_or_create_active("internal:cron:main")
-                    .ok()
-            }),
+            .or_else(|| store.get_or_create_active("internal:cron:main").ok()),
         SessionTarget::Isolated => store
             .get_or_create_active(&format!("internal:cron:{}", job.id))
             .ok(),
@@ -134,11 +130,8 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
             "agent job enqueue failed: could not resolve target session".to_string(),
         );
     };
-    let msg = build_internal_channel_message(
-        "zeroclaw_scheduler",
-        session_id.as_str(),
-        prefixed_prompt,
-    );
+    let msg =
+        build_internal_channel_message("zeroclaw_scheduler", session_id.as_str(), prefixed_prompt);
     match dispatch_internal_message(msg).await {
         Ok(()) => (true, "agent job enqueued to internal channel".to_string()),
         Err(e) => (false, format!("agent job enqueue failed: {e}")),
@@ -274,9 +267,10 @@ fn resolve_delivery_route(
     delivery: &DeliveryConfig,
 ) -> Result<DeliveryRoute> {
     // Unified reply: delivery target from job config only (delivery.channel + delivery.to).
-    let channel = delivery.channel.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("delivery.channel is required")
-    })?;
+    let channel = delivery
+        .channel
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required"))?;
     let target = delivery
         .to
         .as_deref()

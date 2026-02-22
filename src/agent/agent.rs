@@ -18,12 +18,12 @@ use crate::session::compaction::{
     resolve_keep_recent_messages, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::{SessionId, SessionStore};
-use std::fmt::Write;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
 use std::convert::AsRef;
+use std::fmt::Write;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -216,8 +216,7 @@ impl Agent {
         let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
 
         let history = if let Some(store) = ctx.session_store.as_ref() {
-            let compaction_state =
-                load_compaction_state(store, &session_id).unwrap_or_default();
+            let compaction_state = load_compaction_state(store, &session_id).unwrap_or_default();
             let tail_messages = store
                 .load_messages_after_id(&session_id, compaction_state.after_message_id)
                 .unwrap_or_default();
@@ -408,7 +407,11 @@ impl Agent {
     }
 
     /// /model <provider>/<model>: set session model override.
-    async fn cmd_model_set(&mut self, provider_model: &str, envelope: &AgentWorkItem) -> Result<bool> {
+    async fn cmd_model_set(
+        &mut self,
+        provider_model: &str,
+        envelope: &AgentWorkItem,
+    ) -> Result<bool> {
         let (ch, rt) = self.delivery_target(envelope);
         let store = self
             .ctx
@@ -427,7 +430,10 @@ impl Agent {
             return Ok(false);
         }
         self.on_message(
-            &format!("Model override set to `{}` for this session.", provider_model.trim()),
+            &format!(
+                "Model override set to `{}` for this session.",
+                provider_model.trim()
+            ),
             false,
             &ch,
             &rt,
@@ -495,7 +501,8 @@ impl Agent {
     }
 
     /// Non-blocking drain of message_rx for steer-merge.
-    /// Session context loop: commands and messages; partition steer items so commands are processed first, then messages.
+    /// Session context loop: process items in order. /stop aborts only messages that appeared
+    /// before it in the batch; messages after /stop are executed normally.
     async fn session_context_loop(
         mut self,
         _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
@@ -507,23 +514,27 @@ impl Agent {
         while let Some(first) = self.message_rx.recv().await {
             let mut batch = vec![first];
             batch.extend(drain_agent_queue(&mut self.message_rx));
-            let (commands, messages) = partition_steer_items(batch);
 
-            let mut aborted = false;
-            for (cmd, envelope) in commands {
-                match self.run_command_and_deliver(cmd, &envelope).await {
-                    Ok(true) => aborted = true,
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
+            let mut message_buf: Vec<AgentWorkItem> = Vec::new();
+            for item in batch {
+                match item {
+                    AgentQueueItem::Message(w) => message_buf.push(w),
+                    AgentQueueItem::Command(cmd, envelope) => {
+                        match self.run_command_and_deliver(cmd, &envelope).await {
+                            Ok(true) => {
+                                // /stop: discard only messages before this command
+                                message_buf.clear();
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
+                            }
+                        }
                     }
                 }
             }
-            if aborted {
-                continue;
-            }
 
-            let Some(work) = merge_work_items(messages) else {
+            let Some(work) = merge_work_items(message_buf) else {
                 continue;
             };
 
@@ -534,7 +545,12 @@ impl Agent {
                 Ok(Some((user_content, assistant_content))) => {
                     if let Some(store) = session_store.as_ref() {
                         let _ = store.append_message(&session_id, "user", &user_content, None);
-                        let _ = store.append_message(&session_id, "assistant", &assistant_content, None);
+                        let _ = store.append_message(
+                            &session_id,
+                            "assistant",
+                            &assistant_content,
+                            None,
+                        );
                     }
                 }
                 Ok(None) => {}

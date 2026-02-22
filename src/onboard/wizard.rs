@@ -1,8 +1,8 @@
 use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
+    IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig,
+    SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,

@@ -623,7 +623,8 @@ mod tests {
             .await
             .unwrap();
         assert!(poll_result.success);
-        let poll_payload: serde_json::Value = serde_json::from_str(poll_result.output.as_str()).unwrap();
+        let poll_payload: serde_json::Value =
+            serde_json::from_str(poll_result.output.as_str()).unwrap();
         assert_eq!(poll_payload["session_id"], "session-spawn");
         assert_eq!(poll_payload["status"], ExecRunStatus::Queued.as_str());
     }

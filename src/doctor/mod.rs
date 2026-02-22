@@ -402,7 +402,10 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             .signed_duration_since(ts.with_timezone(&Utc))
             .num_seconds();
         if age <= DAEMON_STALE_SECONDS {
-            items.push(DiagItem::ok(cat, format!("daemon state fresh ({age}s ago)")));
+            items.push(DiagItem::ok(
+                cat,
+                format!("daemon state fresh ({age}s ago)"),
+            ));
         } else {
             items.push(DiagItem::error(
                 cat,
