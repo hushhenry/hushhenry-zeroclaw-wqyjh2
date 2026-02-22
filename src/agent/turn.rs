@@ -31,8 +31,8 @@ pub(crate) async fn run_session_compaction(
         .default_resolved()
         .map_err(anyhow::Error::msg)?;
 
-    let compaction_state = load_compaction_state(session_store.as_ref(), session_id)
-        .unwrap_or_default();
+    let compaction_state =
+        load_compaction_state(session_store.as_ref(), session_id).unwrap_or_default();
     let tail_messages = session_store
         .load_messages_after_id(session_id, compaction_state.after_message_id)
         .unwrap_or_default();

@@ -20,7 +20,6 @@ ZeroClaw uses a strict, tag-based protocol for tool invocation to ensure compati
 ## 3. Memory & Context Management
 - **Trim History**: Once history exceeds the limit, older messages are discarded (hard cap).
 - **Auto-Compaction**: Before trimming, the agent can summarize older messages into a `compaction_summary` (OpenCode-style) to preserve key facts and decisions without ballooning the token count.
-- **Context Loading**: On each turn, relevant entries from the global long-term memory are searched and optionally injected as `[Memory context]`.
 
 ## 4. Observer & Monitoring
 Every stage of the loop (LLM start/finish, tool start/finish) is recorded by an `Observer` for real-time health monitoring, audit logging, and performance analysis.

@@ -670,9 +670,6 @@ impl Default for MemoryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Enable session-first conversation management for channels.
-    #[serde(default)]
-    pub enabled: bool,
     /// Number of recent session messages to load per request.
     #[serde(default = "default_session_history_limit")]
     pub history_limit: u32,
@@ -685,7 +682,6 @@ fn default_session_history_limit() -> u32 {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             history_limit: default_session_history_limit(),
         }
     }

@@ -35,4 +35,4 @@ ZeroClaw supports a rich set of Slash Commands (`/`) to manage sessions, sub-age
 ## 5. Implementation Notes
 - **Channel Support**: Commands are intercepted at the channel layer (`src/channels/mod.rs`) before reaching the agent.
 - **Routing**: Commands are executed "inline"—they do not trigger an LLM turn but return an immediate system response to the user.
-- **Access Control**: Commands are only available on channels where `session.enabled = true`.
+- **Access Control**: Session commands (e.g. `/compact`, `/new`) require a session store to be configured.

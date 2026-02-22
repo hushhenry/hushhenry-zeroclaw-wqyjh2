@@ -51,7 +51,6 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, LazyLock};
@@ -86,7 +85,6 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) observer: Arc<dyn Observer>,
     pub(crate) system_prompt: Arc<String>,
     pub(crate) auto_save_memory: bool,
-    pub(crate) session_enabled: bool,
     pub(crate) session_history_limit: u32,
     pub(crate) session_store: Option<Arc<SessionStore>>,
     pub(crate) session_resolver: SessionResolver,
@@ -399,9 +397,6 @@ pub(crate) fn resolve_agent_spec_policy(
 /// Resolve effective system prompt and optional tool allow-list for a session.
 /// Shared by the agent turn (history + compaction + tool loop) and manual /compact.
 /// Returns (prompt, tool_allow_list); when no session_store or no session_id, tool_allow_list is None.
-///
-/// Both session context and memory context now always provide a session_id (memory context uses an
-/// empty session), so when session_store is present the tool list is resolved from policy for both.
 pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
     ctx: &ChannelRuntimeContext,
     session_id: Option<&SessionId>,
@@ -472,26 +467,6 @@ pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'stat
         ),
         _ => None,
     }
-}
-
-pub(crate) async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    session_id: Option<&str>,
-) -> String {
-    let mut context = String::new();
-
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
-        if !entries.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &entries {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-            }
-            context.push('\n');
-        }
-    }
-
-    context
 }
 
 fn spawn_supervised_listener(
@@ -712,43 +687,26 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     }
 
-    // get_or_create_agent + enqueue; agent loop runs session_context_loop or memory_context_loop.
-    // session_id is always required: session context uses the active session; memory context uses an empty session (no history).
-    let (session_id, use_session_history) = if ctx.session_enabled {
-        let id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
-            internal_target
-        } else {
-            let Some(store) = ctx.session_store.as_ref() else {
-                tracing::error!("Session store missing in session mode");
-                return;
-            };
-            match store.get_or_create_active(&session_key) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
-                    return;
-                }
-            }
-        };
-        (id, true)
+    // get_or_create_agent + enqueue; agent loop runs session context only.
+    let session_id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
+        internal_target
     } else {
-        // Memory context: create or use an empty session (no history loaded) so the agent still has a session_id.
-        let id = ctx
-            .session_store
-            .as_ref()
-            .and_then(|store| store.get_or_create_active(&session_key).ok())
-            .unwrap_or_else(SessionId::new);
-        (id, false)
+        let Some(store) = ctx.session_store.as_ref() else {
+            tracing::error!("Session store missing");
+            return;
+        };
+        match store.get_or_create_active(&session_key) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(session_key = %session_key, "Failed to resolve active session: {e}");
+                return;
+            }
+        }
     };
 
     let work = AgentWorkItem::from_message(&msg);
     let key = agent_registry_key(&session_id, &session_key);
-    let tx = get_or_create_agent(
-        Arc::clone(&ctx),
-        session_id,
-        &session_key,
-        use_session_history,
-    );
+    let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &session_key);
     if tx.send(work).await.is_err() {
         tracing::debug!(agent_key = %key, "Agent queue closed");
     }
@@ -1226,11 +1184,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let session_store = if config.session.enabled {
-        Some(Arc::new(SessionStore::new(&config.workspace_dir)?))
-    } else {
-        None
-    };
+    let session_store = Some(Arc::new(SessionStore::new(&config.workspace_dir)?));
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -1462,7 +1416,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         observer,
         system_prompt: Arc::new(system_prompt),
         auto_save_memory: config.memory.auto_save,
-        session_enabled: config.session.enabled,
         session_history_limit: config.session.history_limit,
         session_store,
         session_resolver: SessionResolver::new(),
@@ -1791,7 +1744,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
@@ -2117,7 +2069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_compact_in_memory_context_returns_unsupported_message() {
+    async fn command_compact_when_session_store_missing_returns_unavailable() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -2138,7 +2090,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: false,
             session_history_limit: 40,
             session_store: None,
             session_resolver: SessionResolver::new(),
@@ -2154,7 +2105,7 @@ mod tests {
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("only supported in session context"));
+        assert!(sent[0].contains("Session store is unavailable"));
     }
 
     #[tokio::test]
@@ -2246,6 +2197,8 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let temp = TempDir::new().unwrap();
+        let session_store = Some(Arc::new(SessionStore::new(temp.path()).unwrap()));
         let provider = Arc::new(ToolCallingProvider) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -2259,9 +2212,8 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: false,
             session_history_limit: 40,
-            session_store: None,
+            session_store: session_store.clone(),
             session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
@@ -2286,15 +2238,16 @@ mod tests {
             },
         )
         .await;
-        // Memory mode: turn runs in spawned task; allow it to complete.
+        // Turn runs in spawned task; allow it to complete.
         tokio::time::sleep(Duration::from_millis(800)).await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-42:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"tool_calls\""));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(!sent_messages.is_empty(), "expected at least one delivery");
+        let last = sent_messages.last().unwrap();
+        assert!(last.starts_with("chat-42:"));
+        assert!(last.contains("BTC is currently around"));
+        assert!(!last.contains("\"tool_calls\""));
+        assert!(!last.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -2305,6 +2258,8 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let temp = TempDir::new().unwrap();
+        let session_store = Some(Arc::new(SessionStore::new(temp.path()).unwrap()));
         let provider = Arc::new(ToolCallingAliasProvider) as Arc<dyn Provider>;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -2318,9 +2273,8 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: false,
             session_history_limit: 40,
-            session_store: None,
+            session_store: session_store.clone(),
             session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
@@ -2345,15 +2299,16 @@ mod tests {
             },
         )
         .await;
-        // Memory mode: turn runs in spawned task; allow it to complete.
+        // Turn runs in spawned task; allow it to complete.
         tokio::time::sleep(Duration::from_millis(800)).await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-84:"));
-        assert!(sent_messages[0].contains("alias-tag flow resolved"));
-        assert!(!sent_messages[0].contains("<toolcall>"));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(!sent_messages.is_empty(), "expected at least one delivery");
+        let last = sent_messages.last().unwrap();
+        assert!(last.starts_with("chat-84:"));
+        assert!(last.contains("alias-tag flow resolved"));
+        assert!(!last.contains("<toolcall>"));
+        assert!(!last.contains("mock_price"));
     }
 
     struct NoopMemory;
@@ -2601,7 +2556,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test".to_string()),
             auto_save_memory: false,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
@@ -2647,8 +2601,8 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key, true);
-        let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id, &key, true);
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
+        let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         drop(tx1);
@@ -2694,7 +2648,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test".to_string()),
             auto_save_memory: false,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
@@ -2740,13 +2693,13 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key, true);
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key);
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         drop(tx1);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let tx2 = get_or_create_agent(ctx, session_id, &key, true);
+        let tx2 = get_or_create_agent(ctx, session_id, &key);
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -2781,7 +2734,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test".to_string()),
             auto_save_memory: false,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store),
             session_resolver: SessionResolver::new(),
@@ -2827,7 +2779,7 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &key, true);
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &key);
         let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2899,7 +2851,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: true,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
@@ -3006,7 +2957,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: true,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver,
@@ -3060,7 +3010,6 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: true,
             session_history_limit: 40,
             session_store: Some(session_store.clone()),
             session_resolver: SessionResolver::new(),
@@ -3107,6 +3056,8 @@ mod tests {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let temp = TempDir::new().unwrap();
+        let session_store = Some(Arc::new(SessionStore::new(temp.path()).unwrap()));
         let provider = Arc::new(SlowProvider {
             delay: Duration::from_millis(250),
         }) as Arc<dyn Provider>;
@@ -3122,9 +3073,8 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             auto_save_memory: false,
-            session_enabled: false,
             session_history_limit: 40,
-            session_store: None,
+            session_store,
             session_resolver: SessionResolver::new(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
@@ -3176,7 +3126,7 @@ mod tests {
             "expected parallel dispatch (<430ms), got {:?}",
             elapsed
         );
-        // Memory mode: turns run in spawned tasks; allow them to complete.
+        // Turns run in spawned tasks; allow them to complete.
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -3531,19 +3481,6 @@ mod tests {
 
         let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
-    }
-
-    #[tokio::test]
-    async fn build_memory_context_includes_recalled_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        let context = build_memory_context(&mem, "age", None).await;
-        assert!(context.contains("[Memory context]"));
-        assert!(context.contains("Age is 45"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

@@ -210,11 +210,7 @@ pub async fn compact_in_memory_history(
         .ok()
         .and_then(|s| s.summary);
     let transcript = build_transcript_from_chat_messages(to_compact);
-    let prompt = build_compaction_prompt(
-        existing_summary.as_deref(),
-        &transcript,
-        system_prompt,
-    );
+    let prompt = build_compaction_prompt(existing_summary.as_deref(), &transcript, system_prompt);
 
     let summary_messages = vec![
         ChatMessage::system("You are a session compaction engine. Return compact durable context."),

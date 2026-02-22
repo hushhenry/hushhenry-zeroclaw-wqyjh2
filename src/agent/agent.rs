@@ -4,34 +4,27 @@
 use crate::agent::command::build_route_metadata;
 use crate::agent::loop_::{
     build_assistant_content_native, find_tool, maybe_bind_source_session_id,
-    maybe_truncate_tool_output, scrub_credentials, tool_results_to_chat_messages, tools_to_specs,
-    ToolExecutionResult, MAX_TOOL_ITERATIONS,
+    maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
 };
 use crate::channels::traits;
 use crate::channels::{
-    build_memory_context, build_session_turn_history_with_tail, conversation_memory_key,
-    normalize_tail_messages, resolve_turn_provider_model_temperature, send_delivery_message,
-    should_deliver_to_external_channel, ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
-    INTERNAL_MESSAGE_CHANNEL,
+    build_session_turn_history_with_tail, normalize_tail_messages, send_delivery_message,
+    should_deliver_to_external_channel, ChannelRuntimeContext, INTERNAL_MESSAGE_CHANNEL,
 };
-use crate::memory::MemoryCategory;
 use crate::observability::ObserverEvent;
 use crate::providers::{ChatMessage, ChatRequest, ToolCall};
 use crate::session::compaction::{
-    compact_in_memory_history, estimate_tokens, load_compaction_state, resolve_keep_recent_messages,
-    SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
+    compact_in_memory_history, estimate_tokens, load_compaction_state,
+    resolve_keep_recent_messages, SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS,
 };
 use crate::session::{SessionId, SessionKey, SessionStore};
 use crate::tools::ToolSpec;
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
 use std::convert::AsRef;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::timeout as timeout_future;
 use uuid::Uuid;
 
 // --- Moved types (from channels/mod.rs) ---
@@ -164,7 +157,7 @@ pub(crate) enum DeliverMessage {
     },
 }
 
-/// Agent registry key: always the session_id (required for both session and memory context).
+/// Agent registry key: always the session_id.
 pub(crate) fn agent_registry_key(session_id: &SessionId, _session_key: &SessionKey) -> String {
     session_id.as_str().to_string()
 }
@@ -182,7 +175,6 @@ pub(crate) struct Agent {
     history: Vec<ChatMessage>,
     /// DB message id per history entry (Some for persisted user/assistant, None for system/summary/tool).
     history_message_ids: Vec<Option<i64>>,
-    use_session_history: bool,
     ctx: Arc<ChannelRuntimeContext>,
     /// When true, deliver_loop also sends Tool variants (verbose).
     verbose_tool_output: bool,
@@ -195,7 +187,6 @@ impl Agent {
         ctx: Arc<ChannelRuntimeContext>,
         session_id: SessionId,
         _session_key: &SessionKey,
-        use_session_history: bool,
         message_rx: mpsc::Receiver<AgentWorkItem>,
         deliver_tx: mpsc::Sender<DeliverMessage>,
         verbose_tool_output: bool,
@@ -206,29 +197,24 @@ impl Agent {
                 Some(&session_id),
                 "", // channel name resolved per-turn in session_context_loop
             );
-        let tool_specs =
-            tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
+        let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
 
-        let (history, history_message_ids) = if use_session_history {
-            if let Some(store) = ctx.session_store.as_ref() {
-                let compaction_state =
-                    load_compaction_state(store, &session_id).unwrap_or_default();
-                let tail_messages = store
-                    .load_messages_after_id(&session_id, compaction_state.after_message_id)
-                    .unwrap_or_default();
-                let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
-                let history = build_session_turn_history_with_tail(
-                    &system_prompt,
-                    &compaction_state,
-                    &tail_chat,
-                    None,
-                );
-                let mut ids = vec![None; history.len().saturating_sub(tail_chat.len())];
-                ids.extend(tail_ids);
-                (history, ids)
-            } else {
-                (vec![], vec![])
-            }
+        let (history, history_message_ids) = if let Some(store) = ctx.session_store.as_ref() {
+            let compaction_state =
+                load_compaction_state(store, &session_id).unwrap_or_default();
+            let tail_messages = store
+                .load_messages_after_id(&session_id, compaction_state.after_message_id)
+                .unwrap_or_default();
+            let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
+            let history = build_session_turn_history_with_tail(
+                &system_prompt,
+                &compaction_state,
+                &tail_chat,
+                None,
+            );
+            let mut ids = vec![None; history.len().saturating_sub(tail_chat.len())];
+            ids.extend(tail_ids);
+            (history, ids)
         } else {
             (vec![], vec![])
         };
@@ -242,26 +228,19 @@ impl Agent {
             deliver_tx,
             history,
             history_message_ids,
-            use_session_history,
             ctx,
             verbose_tool_output,
         })
     }
 
-    /// Entry point: run session_context_loop or memory_context_loop.
-    /// Registry entry for this key is removed here when the loop returns (single place).
+    /// Entry point: run session context loop. Registry entry for this key is removed here when the loop returns.
     pub(crate) async fn run(
         self,
         registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
         key_str: String,
     ) {
-        if self.use_session_history {
-            self.session_context_loop(Arc::clone(&registry), key_str.clone())
-                .await;
-        } else {
-            self.memory_context_loop(Arc::clone(&registry), key_str.clone())
-                .await;
-        }
+        self.session_context_loop(Arc::clone(&registry), key_str.clone())
+            .await;
         registry.lock().remove(&key_str);
     }
 
@@ -332,17 +311,14 @@ impl Agent {
     }
 
     /// Non-blocking drain of message_rx for steer-merge.
-    /// Session context loop: sequential, in-memory history, steer-merge.
+    /// Session context loop: sequential, in-memory history, steer-merge. When session_store is None, no persistence.
     async fn session_context_loop(
         mut self,
         _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
         _key_str: String,
     ) {
         let session_id = self.session_id.clone();
-        let session_store = match self.ctx.session_store.as_ref() {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
+        let session_store = self.ctx.session_store.as_ref().map(Arc::clone);
 
         while let Some(first) = self.message_rx.recv().await {
             let mut batch = vec![first];
@@ -352,19 +328,21 @@ impl Agent {
             };
 
             let msg = work.to_channel_message();
-            if msg.channel != INTERNAL_MESSAGE_CHANNEL {
-                if let Err(e) =
-                    session_store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
-                {
-                    tracing::warn!(
-                        session_id = %session_id.as_str(),
-                        "Failed to persist route metadata: {e}"
-                    );
+            if let Some(ref store) = session_store {
+                if msg.channel != INTERNAL_MESSAGE_CHANNEL {
+                    if let Err(e) =
+                        store.upsert_route_metadata(&session_id, &build_route_metadata(&msg))
+                    {
+                        tracing::warn!(
+                            session_id = %session_id.as_str(),
+                            "Failed to persist route metadata: {e}"
+                        );
+                    }
                 }
             }
 
             if let Err(e) = self
-                .tool_call_loop_session(&session_id, &session_store, &msg)
+                .tool_call_loop_session(&session_id, session_store.as_deref(), &msg)
                 .await
             {
                 tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
@@ -372,11 +350,11 @@ impl Agent {
         }
     }
 
-    /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user; persist user at start, assistant at end only.
+    /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user; persist user at start, assistant at end only when session_store is Some.
     async fn tool_call_loop_session(
         &mut self,
         session_id: &SessionId,
-        session_store: &SessionStore,
+        session_store: Option<&SessionStore>,
         msg: &traits::ChannelMessage,
     ) -> Result<()> {
         let (delivery_channel_name, delivery_reply_target) =
@@ -401,18 +379,23 @@ impl Agent {
             }
         };
 
-        if should_deliver_to_external_channel(self.ctx.session_store.as_ref(), Some(session_id)) {
-            if let Ok(id) = session_store.append_message(session_id, "user", &persist_user_content, None) {
-                if id > 0 && !merged_into_orphan {
-                    if let Some(last) = self.history_message_ids.last_mut() {
-                        *last = Some(id);
+        if let Some(store) = session_store {
+            if should_deliver_to_external_channel(self.ctx.session_store.as_ref(), Some(session_id))
+            {
+                if let Ok(id) =
+                    store.append_message(session_id, "user", &persist_user_content, None)
+                {
+                    if id > 0 && !merged_into_orphan {
+                        if let Some(last) = self.history_message_ids.last_mut() {
+                            *last = Some(id);
+                        }
                     }
                 }
             }
-        }
 
-        if estimate_tokens(&self.history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
-            self.run_compact_in_memory(session_id, session_store).await?;
+            if estimate_tokens(&self.history) > SESSION_COMPACTION_AUTO_THRESHOLD_TOKENS {
+                self.run_compact_in_memory(session_id, store).await?;
+            }
         }
 
         let provider_ctx =
@@ -442,8 +425,9 @@ impl Agent {
                 Err(e) => {
                     let err_str = e.to_string();
                     if is_context_exceeded_error(&err_str) {
-                        self.run_compact_in_memory(session_id, session_store)
-                            .await?;
+                        if let Some(store) = session_store {
+                            self.run_compact_in_memory(session_id, store).await?;
+                        }
                         continue;
                     }
                     return Err(e.into());
@@ -456,12 +440,17 @@ impl Agent {
             if tool_calls.is_empty() {
                 self.history.push(ChatMessage::assistant(text.clone()));
                 self.on_message(&text, false, &delivery_channel_name, &delivery_reply_target)?;
-                if should_deliver_to_external_channel(
-                    self.ctx.session_store.as_ref(),
-                    Some(session_id),
-                ) {
-                    if let Ok(id) = session_store.append_message(session_id, "assistant", &text, None) {
-                        self.history_message_ids.push(if id > 0 { Some(id) } else { None });
+                if let Some(store) = session_store {
+                    if should_deliver_to_external_channel(
+                        self.ctx.session_store.as_ref(),
+                        Some(session_id),
+                    ) {
+                        if let Ok(id) = store.append_message(session_id, "assistant", &text, None) {
+                            self.history_message_ids
+                                .push(if id > 0 { Some(id) } else { None });
+                        } else {
+                            self.history_message_ids.push(None);
+                        }
                     } else {
                         self.history_message_ids.push(None);
                     }
@@ -516,7 +505,12 @@ impl Agent {
                     .to_string(),
                 ));
                 self.history_message_ids.push(None);
-                self.on_message(&output, true, &delivery_channel_name, &delivery_reply_target)?;
+                self.on_message(
+                    &output,
+                    true,
+                    &delivery_channel_name,
+                    &delivery_reply_target,
+                )?;
             }
         }
 
@@ -599,187 +593,6 @@ impl Agent {
             Some(self.tool_specs.as_slice())
         }
     }
-
-    /// Inner loop for memory mode: LLM + tool calls until final text. Returns response or error.
-    async fn tool_call_loop_memory_inner(
-        &self,
-        provider_ctx: &crate::providers::ProviderCtx,
-        history: &mut Vec<ChatMessage>,
-        source_session_id: Option<&str>,
-    ) -> Result<String> {
-        let provider_name = "channel-runtime";
-
-        for _iter in 0..MAX_TOOL_ITERATIONS {
-            self.ctx.observer.record_event(&ObserverEvent::LlmRequest {
-                provider: provider_name.to_string(),
-                model: provider_ctx.model.clone(),
-                messages_count: history.len(),
-            });
-
-            let resp = provider_ctx
-                .provider
-                .chat(
-                    ChatRequest {
-                        messages: history.as_slice(),
-                        tools: self.tool_slice(),
-                    },
-                    &provider_ctx.model,
-                    provider_ctx.temperature,
-                )
-                .await?;
-
-            let text = resp.text_or_empty().to_string();
-            let tool_calls = resp.tool_calls;
-
-            if tool_calls.is_empty() {
-                history.push(ChatMessage::assistant(text.clone()));
-                return Ok(text);
-            }
-
-            let assistant_content = build_assistant_content_native(&text, &tool_calls);
-            let mut execution_results: Vec<ToolExecutionResult> = Vec::with_capacity(tool_calls.len());
-            for call in &tool_calls {
-                let args = serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-                let tool_args =
-                    maybe_bind_source_session_id(&call.name, args, source_session_id);
-                let (output, success) = self.execute_single_tool(call, tool_args).await;
-                let output = maybe_truncate_tool_output(&output);
-                execution_results.push(ToolExecutionResult {
-                    name: call.name.clone(),
-                    output,
-                    success,
-                    tool_call_id: Some(call.id.clone()),
-                });
-            }
-            history.push(ChatMessage::assistant(assistant_content));
-            for m in tool_results_to_chat_messages(&execution_results) {
-                history.push(m);
-            }
-        }
-
-        anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
-    }
-
-    /// Memory-mode turn: build memory context, run tool call loop, deliver response.
-    /// No session history; one turn per message. Uses system_prompt and tool_allow_list from Agent::new.
-    async fn tool_call_loop_memory(&mut self, msg: &traits::ChannelMessage) -> Result<()> {
-        let active_session = &self.session_id;
-        let (delivery_channel_name, delivery_reply_target) =
-            resolve_delivery_target(&self.ctx, Some(active_session), msg);
-
-        let memory_context = build_memory_context(
-            self.ctx.memory.as_ref(),
-            &msg.content,
-            Some(active_session.as_str()),
-        )
-        .await;
-        if self.ctx.auto_save_memory {
-            let autosave_key = conversation_memory_key(msg);
-            let _ = self.ctx.memory
-                .store(
-                    &autosave_key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(active_session.as_str()),
-                )
-                .await;
-        }
-        let enriched_message = if memory_context.is_empty() {
-            msg.content.clone()
-        } else {
-            format!("{memory_context}{}", msg.content)
-        };
-
-        println!("  ⏳ Processing message...");
-        let started_at = Instant::now();
-
-        let mut history = vec![
-            ChatMessage::system(AsRef::<str>::as_ref(&self.system_prompt)),
-            ChatMessage::user(&enriched_message),
-        ];
-
-        let resolved =
-            resolve_turn_provider_model_temperature(self.ctx.as_ref(), Some(active_session));
-
-        let llm_result = timeout_future(
-            Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-            self.tool_call_loop_memory_inner(
-                &resolved,
-                &mut history,
-                Some(active_session.as_str()),
-            ),
-        )
-        .await;
-
-        let deliver = should_deliver_to_external_channel(
-            self.ctx.session_store.as_ref(),
-            Some(active_session),
-        );
-
-        match llm_result {
-            Ok(Ok(response)) => {
-                println!(
-                    "  🤖 Reply ({}ms): {}",
-                    started_at.elapsed().as_millis(),
-                    truncate_with_ellipsis(&response, 80)
-                );
-                if deliver {
-                    let _ = self.on_message(
-                        &response,
-                        false,
-                        &delivery_channel_name,
-                        &delivery_reply_target,
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!(
-                    "  ❌ LLM error after {}ms: {e}",
-                    started_at.elapsed().as_millis()
-                );
-                if deliver {
-                    let _ = self.on_message(
-                        &format!("⚠️ Error: {e}"),
-                        false,
-                        &delivery_channel_name,
-                        &delivery_reply_target,
-                    );
-                }
-            }
-            Err(_) => {
-                eprintln!(
-                    "  ❌ LLM response timed out after {}s (elapsed: {}ms)",
-                    CHANNEL_MESSAGE_TIMEOUT_SECS,
-                    started_at.elapsed().as_millis()
-                );
-                if deliver {
-                    let _ = self.on_message(
-                        "⚠️ Request timed out while waiting for the model. Please try again.",
-                        false,
-                        &delivery_channel_name,
-                        &delivery_reply_target,
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Memory context loop: one tool_call_loop_memory per message (sequential).
-    async fn memory_context_loop(
-        mut self,
-        _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
-        _key_str: String,
-    ) {
-        while let Some(work) = self.message_rx.recv().await {
-            let msg = work.to_channel_message();
-            if let Err(e) = self.tool_call_loop_memory(&msg).await {
-                tracing::error!("Memory turn error: {e}");
-            }
-        }
-    }
 }
 
 /// Resolve delivery channel and reply target from message; use route metadata when on internal channel and session is present.
@@ -814,7 +627,6 @@ pub(crate) fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
     session_id: SessionId,
     session_key: &SessionKey,
-    use_session_history: bool,
 ) -> mpsc::Sender<AgentWorkItem> {
     let key_str = agent_registry_key(&session_id, session_key);
     let registry = agent_registry();
@@ -836,7 +648,6 @@ pub(crate) fn get_or_create_agent(
         Arc::clone(&ctx),
         session_id,
         session_key,
-        use_session_history,
         message_rx,
         deliver_tx,
         false,

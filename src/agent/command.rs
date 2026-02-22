@@ -154,17 +154,6 @@ pub(crate) async fn handle_slash_command(
     session_key: &SessionKey,
     command: SlashCommand,
 ) -> bool {
-    if !ctx.session_enabled {
-        let message = match &command {
-            SlashCommand::Compact => {
-                "`/compact` is only supported in session context. It is not available in memory context.".to_string()
-            }
-            _ => "Session commands require `session.enabled = true`.".to_string(),
-        };
-        send_command_response(target_channel, &msg.reply_target, message).await;
-        return true;
-    }
-
     let Some(session_store) = ctx.session_store.as_ref() else {
         send_command_response(
             target_channel,
