@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -35,6 +35,8 @@ const MAX_LOG_LIMIT: u32 = 500;
 pub const SNIPPET_MAX_CHARS: usize = 4096;
 /// Per-chunk cap for stdout/stderr to avoid huge single-chunk amplification.
 pub const CHUNK_MAX_CHARS: usize = 65536;
+/// Max bytes per send_keys call to avoid abuse.
+const MAX_SEND_KEYS_BYTES: usize = 4096;
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -298,6 +300,8 @@ pub struct LogExecRunResult {
 struct RunningRunControl {
     cancellation: CancellationToken,
     _handle: JoinHandle<()>,
+    /// Sender for action=send_keys; None if run does not accept input (e.g. already finished).
+    input_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -478,6 +482,24 @@ impl ShellExecRuntime {
         Ok(self.exec_store.get_run(run_id))
     }
 
+    /// Send key input to a running run. Returns true if the run is running and accepted the keys.
+    /// Keys are capped at MAX_SEND_KEYS_BYTES. No-op if run is not found or not running.
+    pub async fn send_keys(&self, run_id: &str, keys: &str) -> Result<bool> {
+        let keys_bytes = keys.as_bytes();
+        if keys_bytes.len() > MAX_SEND_KEYS_BYTES {
+            return Ok(false);
+        }
+        let running = self.running.lock().await;
+        let Some(control) = running.get(run_id) else {
+            return Ok(false);
+        };
+        let Some(tx) = &control.input_tx else {
+            return Ok(false);
+        };
+        let sent = tx.try_send(keys_bytes.to_vec()).is_ok();
+        Ok(sent)
+    }
+
     fn start_background_worker(self: &Arc<Self>) {
         if self.worker_started.swap(true, Ordering::AcqRel) {
             return;
@@ -513,6 +535,7 @@ impl ShellExecRuntime {
     async fn spawn_run(self: &Arc<Self>, run: ExecRun) {
         let run_id = run.run_id.clone();
         let cancellation = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(32);
         let runtime = Arc::clone(self);
         let (arm_tx, arm_rx) = oneshot::channel::<()>();
         let cancellation_for_task = cancellation.clone();
@@ -520,7 +543,7 @@ impl ShellExecRuntime {
         let handle = tokio::spawn(async move {
             let _ = arm_rx.await;
             runtime
-                .execute_claimed_run(run, cancellation_for_task)
+                .execute_claimed_run(run, cancellation_for_task, input_rx)
                 .await;
         });
 
@@ -529,14 +552,22 @@ impl ShellExecRuntime {
             RunningRunControl {
                 cancellation,
                 _handle: handle,
+                input_tx: Some(input_tx),
             },
         );
         let _ = arm_tx.send(());
     }
 
-    async fn execute_claimed_run(&self, run: ExecRun, cancellation: CancellationToken) {
+    async fn execute_claimed_run(
+        &self,
+        run: ExecRun,
+        cancellation: CancellationToken,
+        input_rx: mpsc::Receiver<Vec<u8>>,
+    ) {
         let run_id = run.run_id.clone();
-        let result = self.execute_one_run(&run, cancellation.clone()).await;
+        let result = self
+            .execute_one_run(&run, cancellation.clone(), input_rx)
+            .await;
 
         if let Err(err) = result {
             if !self.run_is_canceled(run_id.as_str()).await {
@@ -554,7 +585,18 @@ impl ShellExecRuntime {
         self.worker_notify.notify_waiters();
     }
 
-    async fn execute_one_run(&self, run: &ExecRun, cancellation: CancellationToken) -> Result<()> {
+    async fn execute_one_run(
+        &self,
+        run: &ExecRun,
+        cancellation: CancellationToken,
+        input_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        if run.pty {
+            return self.execute_one_run_pty(run, cancellation, input_rx).await;
+        }
+
+        let mut input_rx = input_rx;
         let mut command = self
             .runtime
             .build_shell_command(run.command.as_str(), &self.security.workspace_dir)?;
@@ -564,11 +606,13 @@ impl ShellExecRuntime {
                 command.env(var, val);
             }
         }
+        command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
         let mut child = command.spawn()?;
 
+        let mut stdin_handle = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -618,6 +662,16 @@ impl ShellExecRuntime {
                     let _ = child.wait().await;
                     break;
                 }
+                maybe_input = input_rx.recv() => {
+                    if let Some(bytes) = maybe_input.as_ref() {
+                        if let Some(ref mut stdin) = stdin_handle {
+                            let _ = stdin.write_all(bytes).await;
+                            let _ = stdin.flush().await;
+                        }
+                    } else {
+                        stdin_handle = None;
+                    }
+                }
                 maybe_chunk = rx.recv() => {
                     match maybe_chunk {
                         Some(chunk) => {
@@ -665,6 +719,164 @@ impl ShellExecRuntime {
         for task in read_tasks {
             task.abort();
         }
+
+        if timed_out {
+            self.exec_store
+                .mark_timed_out(run.run_id.as_str(), output_bytes, truncated);
+            return Ok(());
+        }
+
+        if self.run_is_canceled(run.run_id.as_str()).await {
+            return Ok(());
+        }
+
+        if exit_code == Some(0) {
+            self.exec_store
+                .mark_succeeded(run.run_id.as_str(), exit_code, output_bytes, truncated);
+            return Ok(());
+        }
+
+        self.exec_store.mark_failed(
+            run.run_id.as_str(),
+            exit_code,
+            output_bytes,
+            truncated,
+            "exec run failed",
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn execute_one_run_pty(
+        &self,
+        run: &ExecRun,
+        cancellation: CancellationToken,
+        mut input_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<()> {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+
+        let pty = nix::pty::openpty(None, None).map_err(|e| anyhow!("openpty: {e}"))?;
+        let slave_fd = pty.slave.as_raw_fd();
+        let s1 = nix::unistd::dup(slave_fd).map_err(|e| anyhow!("dup slave: {e}"))?;
+        let s2 = nix::unistd::dup(slave_fd).map_err(|e| anyhow!("dup slave: {e}"))?;
+        let s3 = nix::unistd::dup(slave_fd).map_err(|e| anyhow!("dup slave: {e}"))?;
+        drop(pty.slave);
+
+        let mut command = self
+            .runtime
+            .build_shell_command(run.command.as_str(), &self.security.workspace_dir)?;
+        command.env_clear();
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                command.env(var, val);
+            }
+        }
+        command.stdin(unsafe { std::process::Stdio::from_raw_fd(s1) });
+        command.stdout(unsafe { std::process::Stdio::from_raw_fd(s2) });
+        command.stderr(unsafe { std::process::Stdio::from_raw_fd(s3) });
+
+        let mut child = command.spawn()?;
+
+        let master_fd = pty.master.as_raw_fd();
+        let master_r = nix::unistd::dup(master_fd).map_err(|e| anyhow!("dup master: {e}"))?;
+        let master_w = nix::unistd::dup(master_fd).map_err(|e| anyhow!("dup master: {e}"))?;
+        drop(pty.master);
+
+        let file_r = tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(master_r) });
+        let mut pty_write_handle: Option<tokio::fs::File> =
+            Some(tokio::fs::File::from_std(unsafe {
+                std::fs::File::from_raw_fd(master_w)
+            }));
+
+        let (tx, mut rx) = mpsc::channel::<OutputChunk>(64);
+        let read_task = tokio::spawn(read_output_stream(file_r, "stdout", tx.clone()));
+        drop(tx);
+
+        let mut watchers = compile_watchers(run.watch_json.as_deref())?;
+        let mut output_bytes: i64 = 0;
+        let mut truncated = false;
+        let mut truncation_event_written = false;
+        let mut timed_out = false;
+        let mut recent_snippet = String::new();
+        let sink = Arc::clone(&self.event_sink);
+        let timeout = Duration::from_secs(run.timeout_secs.max(1) as u64);
+        let timeout_sleep = time::sleep(timeout);
+        tokio::pin!(timeout_sleep);
+        let mut exit_code: Option<i64> = None;
+
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    if !self.run_is_canceled(run.run_id.as_str()).await {
+                        self.exec_store.mark_canceled(run.run_id.as_str());
+                    }
+                    break;
+                }
+                _ = &mut timeout_sleep => {
+                    timed_out = true;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    break;
+                }
+                maybe_input = input_rx.recv() => {
+                    if let Some(ref bytes) = maybe_input.as_ref() {
+                        if let Some(ref mut w) = pty_write_handle {
+                            let _ = w.write_all(bytes).await;
+                            let _ = w.flush().await;
+                        }
+                    } else {
+                        pty_write_handle = None;
+                    }
+                }
+                maybe_chunk = rx.recv() => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            self.process_output_chunk(
+                                run,
+                                &chunk,
+                                &mut watchers,
+                                &mut output_bytes,
+                                &mut truncated,
+                                &mut truncation_event_written,
+                                &mut recent_snippet,
+                                &sink,
+                            )?;
+                        }
+                        None => {
+                            if let Some(status) = child.try_wait()? {
+                                exit_code = status.code().map(i64::from);
+                                break;
+                            }
+                            time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+                _ = time::sleep(Duration::from_millis(20)) => {
+                    if let Some(status) = child.try_wait()? {
+                        exit_code = status.code().map(i64::from);
+                        while let Ok(Some(chunk)) =
+                            time::timeout(Duration::from_millis(30), rx.recv()).await
+                        {
+                            self.process_output_chunk(
+                                run,
+                                &chunk,
+                                &mut watchers,
+                                &mut output_bytes,
+                                &mut truncated,
+                                &mut truncation_event_written,
+                                &mut recent_snippet,
+                                &sink,
+                            )?;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        read_task.abort();
 
         if timed_out {
             self.exec_store
