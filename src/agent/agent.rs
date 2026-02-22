@@ -289,7 +289,7 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
         match store.create_new(&self.inbound_key) {
-            Ok(new_session_id) => {
+            Ok(_new_session_id) => {
                 let full_model = self.ctx.provider_manager.default_full_model().to_string();
                 self.send_outbound(
                     &format!("New session started · model: {full_model}"),

@@ -572,7 +572,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
-        let normalized_chat_type = if thread_id.is_some() {
+        let _normalized_chat_type = if thread_id.is_some() {
             ChatType::Thread
         } else {
             ChatType::from_raw(&chat_type)

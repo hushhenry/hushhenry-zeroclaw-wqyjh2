@@ -1,4 +1,4 @@
-use crate::channels::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};

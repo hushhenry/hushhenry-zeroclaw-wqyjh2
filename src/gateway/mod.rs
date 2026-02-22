@@ -10,7 +10,7 @@
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -519,12 +519,18 @@ async fn handle_webhook(
             .await;
     }
 
+    let messages = [ChatMessage::user(message)];
+    let request = ChatRequest {
+        messages: &messages,
+        tools: None,
+    };
     match state
         .provider
-        .simple_chat(message, &state.model, state.temperature)
+        .chat(request, &state.model, state.temperature)
         .await
     {
         Ok(response) => {
+            let response = response.text_or_empty().to_string();
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
@@ -673,12 +679,18 @@ async fn handle_whatsapp_message(
         }
 
         // Call the LLM
+        let messages = [ChatMessage::user(&msg.content)];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
         match state
             .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
+            .chat(request, &state.model, state.temperature)
             .await
         {
             Ok(response) => {
+                let response = response.text_or_empty().to_string();
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(response, &msg.reply_target))

@@ -14,6 +14,7 @@ pub mod telegram;
 pub mod traits;
 pub mod whatsapp;
 
+#[allow(unused_imports)]
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -40,7 +41,7 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, Provider, ProviderCtx, ProviderManagerTrait};
+use crate::providers::{self, ChatMessage, ProviderCtx, ProviderManagerTrait};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session::{
@@ -1552,7 +1553,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::traits::ChatType;
     use crate::config::Config;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
@@ -2103,87 +2103,6 @@ mod tests {
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Session store is unavailable"));
-    }
-
-    #[tokio::test]
-    async fn command_queue_sets_mode_and_rejects_invalid_modes() {
-        let temp = TempDir::new().unwrap();
-        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let runtime_ctx = session_runtime_ctx(session_store.clone(), channel);
-        let base_msg = session_test_message("hello", "seed");
-        let inbound_key = inbound_key(&base_msg);
-        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
-
-        process_channel_message(
-            runtime_ctx.clone(),
-            session_test_message("/queue steer-merge", "cmd-queue-1"),
-        )
-        .await;
-        process_channel_message(
-            runtime_ctx,
-            session_test_message("/queue fifo", "cmd-queue-2"),
-        )
-        .await;
-
-        let stored_mode = decode_session_string_state(
-            session_store
-                .get_state_key(&session_id, crate::agent::command::SESSION_QUEUE_MODE_KEY)
-                .unwrap(),
-        );
-        assert_eq!(stored_mode.as_deref(), Some("steer-merge"));
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2);
-        assert!(sent[0].contains("`steer-merge`"));
-        assert!(sent[1].contains("Unsupported queue mode"));
-    }
-
-    #[tokio::test]
-    async fn command_sessions_lists_current_session_id() {
-        let temp = TempDir::new().unwrap();
-        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let msg = session_test_message("/sessions", "cmd-sessions");
-        let inbound_key = inbound_key(&msg);
-        let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
-
-        process_channel_message(session_runtime_ctx(session_store, channel), msg).await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains(session_id.as_str()));
-        assert!(sent[0].contains("Sessions for key"));
-    }
-
-    #[tokio::test]
-    async fn command_subagents_lists_specs_sessions_and_runs() {
-        let temp = TempDir::new().unwrap();
-        let session_store = Arc::new(SessionStore::new(temp.path()).unwrap());
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let agent = session_store
-            .upsert_agent("reviewer", r#"{"model":"test"}"#)
-            .unwrap();
-        let _subagent_session = session_store
-            .create_subagent_session(Some(agent.agent_id.as_str()), None, None)
-            .unwrap();
-
-        process_channel_message(
-            session_runtime_ctx(session_store, channel),
-            session_test_message("/subagents", "cmd-subagents"),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Subagents"));
-        assert!(sent[0].contains("agents: 1"));
-        assert!(sent[0].contains("sessions: 1"));
     }
 
     #[tokio::test]

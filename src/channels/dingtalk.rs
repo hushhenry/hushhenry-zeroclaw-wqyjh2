@@ -232,7 +232,7 @@ impl Channel for DingTalkChannel {
 
                     // Private chat uses sender ID, group chat uses conversation ID.
                     let chat_id = Self::resolve_chat_id(&data, sender_id);
-                    let chat_type = if Self::is_private_chat(&data) {
+                    let _chat_type = if Self::is_private_chat(&data) {
                         ChatType::Direct
                     } else {
                         ChatType::Group

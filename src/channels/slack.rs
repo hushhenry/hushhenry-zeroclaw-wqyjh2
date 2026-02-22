@@ -162,7 +162,7 @@ impl Channel for SlackChannel {
                         .and_then(|t| t.as_str())
                         .filter(|t| !t.is_empty())
                         .map(ToString::to_string);
-                    let chat_type = if thread_id.is_some() {
+                    let _chat_type = if thread_id.is_some() {
                         ChatType::Thread
                     } else if channel_id.starts_with('D') {
                         ChatType::Direct

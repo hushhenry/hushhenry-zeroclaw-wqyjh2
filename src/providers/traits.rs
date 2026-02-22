@@ -1,6 +1,5 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
@@ -248,29 +247,6 @@ pub trait Provider: Send + Sync {
         }
     }
 
-    /// Simple one-shot chat (single user message, no explicit system prompt).
-    ///
-    /// This is the preferred API for non-agentic direct interactions.
-    async fn simple_chat(
-        &self,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let messages = vec![ChatMessage::user(message)];
-        let response = self
-            .chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                },
-                model,
-                temperature,
-            )
-            .await?;
-        Ok(response.text_or_empty().to_string())
-    }
-
     /// Structured chat API for all provider callers.
     async fn chat(
         &self,
@@ -278,27 +254,6 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse>;
-
-    /// Multi-turn conversation compatibility wrapper.
-    #[deprecated(note = "Use Provider::chat with ChatRequest instead")]
-    async fn chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let response = self
-            .chat(
-                ChatRequest {
-                    messages,
-                    tools: None,
-                },
-                model,
-                temperature,
-            )
-            .await?;
-        Ok(response.text_or_empty().to_string())
-    }
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
@@ -315,24 +270,6 @@ pub trait Provider: Send + Sync {
     /// Default implementation returns false.
     fn supports_streaming(&self) -> bool {
         false
-    }
-
-    /// Streaming chat with history.
-    /// Default implementation returns an error chunk (streaming not supported).
-    fn stream_chat_with_history(
-        &self,
-        _messages: &[ChatMessage],
-        _model: &str,
-        _temperature: f64,
-        _options: StreamOptions,
-    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // For default implementation, we need to convert to owned strings
-        // This is a limitation of the default implementation
-        let provider_name = "unknown".to_string();
-
-        // Create a single empty chunk to indicate not supported
-        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
-        stream::once(async move { Ok(chunk) }).boxed()
     }
 }
 

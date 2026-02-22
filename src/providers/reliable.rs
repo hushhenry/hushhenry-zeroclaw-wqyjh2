@@ -1,7 +1,6 @@
 use super::traits::{ChatRequest, ChatResponse};
 use super::Provider;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -338,8 +337,12 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "ok");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result.text_or_empty(), "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -360,8 +363,12 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "recovered");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result.text_or_empty(), "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -395,8 +402,12 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "from fallback");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result.text_or_empty(), "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
@@ -428,8 +439,9 @@ mod tests {
             1,
         );
 
+        let messages = vec![ChatMessage::user("hello")];
         let err = provider
-            .simple_chat("hello", "test", 0.0)
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
             .await
             .expect_err("all providers should fail");
         let msg = err.to_string();
@@ -484,8 +496,12 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "from fallback");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result.text_or_empty(), "from fallback");
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
@@ -510,10 +526,10 @@ mod tests {
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
         let result = provider
-            .chat_with_history(&messages, "test", 0.0)
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
             .await
             .unwrap();
-        assert_eq!(result, "history ok");
+        assert_eq!(result.text_or_empty(), "history ok");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -549,10 +565,10 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat_with_history(&messages, "test", 0.0)
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
             .await
             .unwrap();
-        assert_eq!(result, "fallback ok");
+        assert_eq!(result.text_or_empty(), "fallback ok");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
@@ -582,11 +598,12 @@ mod tests {
         )
         .with_model_fallbacks(fallbacks);
 
+        let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .simple_chat("hello", "claude-opus", 0.0)
+            .chat(ChatRequest { messages: &messages, tools: None }, "claude-opus", 0.0)
             .await
             .unwrap();
-        assert_eq!(result, "ok from sonnet");
+        assert_eq!(result.text_or_empty(), "ok from sonnet");
 
         let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 2);
@@ -617,8 +634,9 @@ mod tests {
         )
         .with_model_fallbacks(fallbacks);
 
+        let messages = vec![ChatMessage::user("hello")];
         let err = provider
-            .simple_chat("hello", "model-a", 0.0)
+            .chat(ChatRequest { messages: &messages, tools: None }, "model-a", 0.0)
             .await
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
@@ -644,8 +662,12 @@ mod tests {
             1,
         );
         // No model_fallbacks set — should work exactly as before
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
-        assert_eq!(result, "ok");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result.text_or_empty(), "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

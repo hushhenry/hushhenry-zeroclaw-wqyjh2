@@ -262,8 +262,8 @@ struct DeliveryRoute {
 /// Resolve delivery target from session store. Delivery is always by session_id; channel + chat
 /// come from the session's route metadata.
 fn resolve_delivery_route(
-    config: &Config,
-    job: &CronJob,
+    _config: &Config,
+    _job: &CronJob,
     delivery: &DeliveryConfig,
 ) -> Result<DeliveryRoute> {
     // Unified reply: delivery target from job config only (delivery.channel + delivery.to).

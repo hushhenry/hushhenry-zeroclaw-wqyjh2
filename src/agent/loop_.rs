@@ -1,9 +1,16 @@
+#[allow(unused_imports)]
 use crate::observability::{Observer, ObserverEvent};
+#[allow(unused_imports)]
 use crate::providers::{ChatMessage, ChatRequest, ProviderCtx, ToolCall};
-use crate::tools::{self, Tool};
+#[cfg(test)]
+use crate::tools;
+use crate::tools::Tool;
+#[allow(unused_imports)]
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+#[allow(unused_imports)]
 use std::sync::{Arc, LazyLock};
+#[allow(unused_imports)]
 use std::time::Instant;
 use uuid::Uuid;
 

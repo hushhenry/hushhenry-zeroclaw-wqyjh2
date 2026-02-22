@@ -242,12 +242,12 @@ impl SignalChannel {
             .group_info
             .as_ref()
             .and_then(|g| g.group_id.as_deref());
-        let chat_type = if group_id.is_some() {
+        let _chat_type = if group_id.is_some() {
             ChatType::Group
         } else {
             ChatType::Direct
         };
-        let chat_id = group_id.unwrap_or(sender.as_str()).to_string();
+        let _chat_id = group_id.unwrap_or(sender.as_str()).to_string();
 
         let timestamp = data_msg
             .timestamp

@@ -9,8 +9,6 @@ use crate::channels::{
 use crate::session::{SessionId, SessionStore};
 use std::fmt::Write;
 
-pub(crate) const SESSION_QUEUE_MODE_KEY: &str = "queue_mode";
-const DEFAULT_QUEUE_MODE: &str = "steer-merge";
 const COMMAND_LIST_LIMIT: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,9 +16,6 @@ pub enum SlashCommand {
     Stop,
     New,
     Compact,
-    Queue { mode: Option<String> },
-    Subagents,
-    Sessions,
     Agents,
     AgentSwitch { id_or_name: String },
     Models,
@@ -42,11 +37,6 @@ pub fn parse_slash_command(content: &str) -> Option<SlashCommand> {
         "/stop" => Some(SlashCommand::Stop),
         "/new" => Some(SlashCommand::New),
         "/compact" => Some(SlashCommand::Compact),
-        "/queue" => Some(SlashCommand::Queue {
-            mode: parts.next().map(str::to_string),
-        }),
-        "/subagents" => Some(SlashCommand::Subagents),
-        "/sessions" => Some(SlashCommand::Sessions),
         "/agents" => Some(SlashCommand::Agents),
         "/agent" => Some(SlashCommand::AgentSwitch {
             id_or_name: parts.next().map(str::trim).unwrap_or_default().to_string(),
@@ -85,19 +75,9 @@ pub(crate) fn short_session_id(session_id: &SessionId) -> String {
     session_id.as_str().chars().take(8).collect::<String>()
 }
 
-fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> String {
-    crate::channels::decode_session_string_state(
-        session_store
-            .get_state_key(session_id, SESSION_QUEUE_MODE_KEY)
-            .ok()
-            .flatten(),
-    )
-    .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string())
-}
-
 /// Handles a parsed slash command in the context of a channel message. Only processes
-/// global-level commands (e.g. /queue, /sessions, /agents); agent-level commands must be
-/// enqueued to the agent loop by the caller. Returns `true` if the message was consumed.
+/// global-level commands (e.g. /agents); agent-level commands must be enqueued to the
+/// agent loop by the caller. Returns `true` if the message was consumed.
 pub(crate) async fn handle_slash_command(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
@@ -119,110 +99,6 @@ pub(crate) async fn handle_slash_command(
                 "handle_slash_command only handles global commands; agent commands must be enqueued to agent"
             );
         }
-        SlashCommand::Queue { mode } => match session_store.get_or_create_active(inbound_key) {
-            Ok(session_id) => {
-                if let Some(mode) = mode {
-                    if mode != DEFAULT_QUEUE_MODE {
-                        dispatch_reply(
-                            &msg,
-                            format!(
-                                "Unsupported queue mode `{mode}`. Supported modes: `{DEFAULT_QUEUE_MODE}`."
-                            ),
-                        )
-                        .await;
-                        return true;
-                    }
-
-                    if let Err(error) = session_store.set_state_key(
-                        &session_id,
-                        SESSION_QUEUE_MODE_KEY,
-                        &serde_json::to_string(DEFAULT_QUEUE_MODE)
-                            .unwrap_or_else(|_| format!("\"{DEFAULT_QUEUE_MODE}\"")),
-                    ) {
-                        tracing::error!(
-                            "Failed to persist queue mode for session {}: {error}",
-                            session_id.as_str()
-                        );
-                        dispatch_reply(&msg, "⚠️ Failed to persist queue mode.".to_string())
-                            .await;
-                        return true;
-                    }
-                }
-
-                let active_mode = current_queue_mode(session_store, &session_id);
-                dispatch_reply(
-                    &msg,
-                    format!(
-                        "Queue mode for session `{}` is `{active_mode}`.",
-                        short_session_id(&session_id)
-                    ),
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to resolve active session for queue command ({}): {error}",
-                    inbound_key
-                );
-                dispatch_reply(&msg, "⚠️ Failed to configure queue mode.".to_string()).await;
-            }
-        },
-        SlashCommand::Subagents => {
-            let agents = session_store
-                .list_agents(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
-            let sessions = session_store
-                .list_subagent_sessions(COMMAND_LIST_LIMIT)
-                .unwrap_or_default();
-
-            let mut text = String::new();
-            let _ = writeln!(text, "Subagents");
-            let _ = writeln!(text, "agents: {}", agents.len());
-            for agent in agents.iter().take(5) {
-                let _ = writeln!(text, "- {} ({})", agent.name, agent.agent_id);
-            }
-            let _ = writeln!(text, "sessions: {}", sessions.len());
-            for session in sessions.iter().take(5) {
-                let _ = writeln!(
-                    text,
-                    "- {} [{}]",
-                    session.subagent_session_id, session.status
-                );
-            }
-
-            dispatch_reply(&msg, text.trim().to_string()).await;
-        }
-        SlashCommand::Sessions => match session_store.get_or_create_active(inbound_key) {
-            Ok(current_session_id) => {
-                let sessions = session_store
-                    .list_sessions(Some(inbound_key), COMMAND_LIST_LIMIT)
-                    .unwrap_or_default();
-                let mut text = String::new();
-                let _ = writeln!(text, "Current session: `{}`", current_session_id.as_str());
-                let _ = writeln!(text, "Sessions for key `{}`:", inbound_key);
-                for session in sessions.iter().take(10) {
-                    let marker = if session.session_id == current_session_id.as_str() {
-                        "*"
-                    } else {
-                        "-"
-                    };
-                    let _ = writeln!(
-                        text,
-                        "{marker} {} status={} messages={}",
-                        session.session_id, session.status, session.message_count
-                    );
-                }
-
-                dispatch_reply(&msg, text.trim().to_string()).await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to resolve active session for sessions command ({}): {error}",
-                    inbound_key
-                );
-                dispatch_reply(&msg, "⚠️ Failed to list sessions.".to_string()).await;
-            }
-        },
         SlashCommand::Agents => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 let agents = session_store
@@ -345,24 +221,6 @@ mod tests {
             parse_slash_command("   /compact"),
             Some(SlashCommand::Compact)
         );
-        assert_eq!(
-            parse_slash_command("/queue steer-merge"),
-            Some(SlashCommand::Queue {
-                mode: Some("steer-merge".to_string())
-            })
-        );
-        assert_eq!(
-            parse_slash_command("/queue"),
-            Some(SlashCommand::Queue { mode: None })
-        );
-        assert_eq!(
-            parse_slash_command("/subagents"),
-            Some(SlashCommand::Subagents)
-        );
-        assert_eq!(
-            parse_slash_command("/sessions"),
-            Some(SlashCommand::Sessions)
-        );
         assert_eq!(parse_slash_command("/agents"), Some(SlashCommand::Agents));
         assert_eq!(
             parse_slash_command("/agent coder"),
@@ -388,8 +246,6 @@ mod tests {
         assert!(is_agent_command(&SlashCommand::Model {
             provider_model: "p/m".to_string()
         }));
-        assert!(!is_agent_command(&SlashCommand::Queue { mode: None }));
-        assert!(!is_agent_command(&SlashCommand::Sessions));
     }
 
     #[test]

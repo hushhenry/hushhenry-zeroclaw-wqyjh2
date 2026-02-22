@@ -561,7 +561,7 @@ impl Channel for IrcChannel {
                     } else {
                         format!("{IRC_STYLE_PREFIX}{text}")
                     };
-                    let chat_type = if is_channel {
+                    let _chat_type = if is_channel {
                         ChatType::Group
                     } else {
                         ChatType::Direct

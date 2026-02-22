@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, ChatType, SendMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -612,7 +612,7 @@ impl LarkChannel {
             .pointer("/message/chat_id")
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
-        let chat_type = event
+        let _chat_type = event
             .pointer("/message/chat_type")
             .and_then(|c| c.as_str())
             .unwrap_or("p2p");

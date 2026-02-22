@@ -392,12 +392,12 @@ impl Channel for DiscordChannel {
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                    let chat_id = if channel_id.is_empty() {
+                    let _chat_id = if channel_id.is_empty() {
                         author_id.to_string()
                     } else {
                         channel_id.clone()
                     };
-                    let chat_type = if msg_guild.is_some() {
+                    let _chat_type = if msg_guild.is_some() {
                         ChatType::Group
                     } else {
                         ChatType::Direct

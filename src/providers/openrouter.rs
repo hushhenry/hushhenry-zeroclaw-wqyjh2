@@ -346,28 +346,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
 
-    #[tokio::test]
-    async fn chat_with_history_fails_without_key() {
-        let provider = OpenRouterProvider::new(None);
-        let messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: "be concise".into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-            },
-        ];
-
-        let result = provider
-            .chat_with_history(&messages, "anthropic/claude-sonnet-4", 0.7)
-            .await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
-    }
-
     #[test]
     fn chat_request_serializes_with_system_and_user() {
         let request = ChatRequest {
