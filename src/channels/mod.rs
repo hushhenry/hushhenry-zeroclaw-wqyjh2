@@ -398,7 +398,10 @@ pub(crate) fn resolve_agent_spec_policy(
 
 /// Resolve effective system prompt and optional tool allow-list for a session.
 /// Shared by the agent turn (history + compaction + tool loop) and manual /compact.
-/// Returns (prompt, tool_allow_list); when no session/policy, tool_allow_list is None.
+/// Returns (prompt, tool_allow_list); when no session_store or no session_id, tool_allow_list is None.
+///
+/// Both session context and memory context now always provide a session_id (memory context uses an
+/// empty session), so when session_store is present the tool list is resolved from policy for both.
 pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
     ctx: &ChannelRuntimeContext,
     session_id: Option<&SessionId>,
@@ -710,8 +713,9 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     }
 
     // get_or_create_agent + enqueue; agent loop runs session_context_loop or memory_context_loop.
-    let (session_id_opt, use_session_history) = if ctx.session_enabled {
-        let session_id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
+    // session_id is always required: session context uses the active session; memory context uses an empty session (no history).
+    let (session_id, use_session_history) = if ctx.session_enabled {
+        let id = if let Some(internal_target) = parse_internal_target_session_id(&msg) {
             internal_target
         } else {
             let Some(store) = ctx.session_store.as_ref() else {
@@ -726,16 +730,22 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 }
             }
         };
-        (Some(session_id), true)
+        (id, true)
     } else {
-        (None, false)
+        // Memory context: create or use an empty session (no history loaded) so the agent still has a session_id.
+        let id = ctx
+            .session_store
+            .as_ref()
+            .and_then(|store| store.get_or_create_active(&session_key).ok())
+            .unwrap_or_else(SessionId::new);
+        (id, false)
     };
 
     let work = AgentWorkItem::from_message(&msg);
-    let key = agent_registry_key(session_id_opt.as_ref(), &session_key);
+    let key = agent_registry_key(&session_id, &session_key);
     let tx = get_or_create_agent(
         Arc::clone(&ctx),
-        session_id_opt,
+        session_id,
         &session_key,
         use_session_history,
     );
@@ -2637,8 +2647,8 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), Some(session_id.clone()), &key, true);
-        let tx2 = get_or_create_agent(Arc::clone(&ctx), Some(session_id), &key, true);
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key, true);
+        let tx2 = get_or_create_agent(Arc::clone(&ctx), session_id, &key, true);
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         drop(tx1);
@@ -2730,13 +2740,13 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx1 = get_or_create_agent(Arc::clone(&ctx), Some(session_id.clone()), &key, true);
+        let tx1 = get_or_create_agent(Arc::clone(&ctx), session_id.clone(), &key, true);
         let _ = tx1.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         drop(tx1);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let tx2 = get_or_create_agent(ctx, Some(session_id), &key, true);
+        let tx2 = get_or_create_agent(ctx, session_id, &key, true);
         let _ = tx2.send(AgentWorkItem::from_message(&msg2)).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -2817,7 +2827,7 @@ mod tests {
             .unwrap()
             .get_or_create_active(&key)
             .unwrap();
-        let tx = get_or_create_agent(Arc::clone(&ctx), Some(session_id), &key, true);
+        let tx = get_or_create_agent(Arc::clone(&ctx), session_id, &key, true);
         let _ = tx.send(AgentWorkItem::from_message(&msg1)).await;
         tokio::task::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;

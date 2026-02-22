@@ -164,20 +164,15 @@ pub(crate) enum DeliverMessage {
     },
 }
 
-/// Agent key: session_id when session mode, or "memory:{session_key}" when memory mode.
-pub(crate) fn agent_registry_key(
-    session_id: Option<&SessionId>,
-    session_key: &SessionKey,
-) -> String {
-    session_id
-        .map(|s| s.as_str().to_string())
-        .unwrap_or_else(|| format!("memory:{}", session_key.as_str()))
+/// Agent registry key: always the session_id (required for both session and memory context).
+pub(crate) fn agent_registry_key(session_id: &SessionId, _session_key: &SessionKey) -> String {
+    session_id.as_str().to_string()
 }
 
 // --- Agent struct ---
 
 pub(crate) struct Agent {
-    session_id: Option<SessionId>,
+    session_id: SessionId,
     system_prompt: String,
     tool_allow_list: Option<Vec<String>>,
     /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
@@ -198,8 +193,8 @@ impl Agent {
     /// Caller creates (message_tx, message_rx) and (deliver_tx, deliver_rx); we take message_rx and deliver_tx.
     pub(crate) fn new(
         ctx: Arc<ChannelRuntimeContext>,
-        session_id: Option<SessionId>,
-        session_key: &SessionKey,
+        session_id: SessionId,
+        _session_key: &SessionKey,
         use_session_history: bool,
         message_rx: mpsc::Receiver<AgentWorkItem>,
         deliver_tx: mpsc::Sender<DeliverMessage>,
@@ -208,16 +203,18 @@ impl Agent {
         let (system_prompt, tool_allow_list) =
             crate::channels::resolve_effective_system_prompt_and_tool_allow_list(
                 &ctx,
-                session_id.as_ref(),
+                Some(&session_id),
                 "", // channel name resolved per-turn in session_context_loop
             );
-        let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
+        let tool_specs =
+            tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
 
         let (history, history_message_ids) = if use_session_history {
-            if let (Some(store), Some(ref sid)) = (ctx.session_store.as_ref(), &session_id) {
-                let compaction_state = load_compaction_state(store, sid).unwrap_or_default();
+            if let Some(store) = ctx.session_store.as_ref() {
+                let compaction_state =
+                    load_compaction_state(store, &session_id).unwrap_or_default();
                 let tail_messages = store
-                    .load_messages_after_id(sid, compaction_state.after_message_id)
+                    .load_messages_after_id(&session_id, compaction_state.after_message_id)
                     .unwrap_or_default();
                 let (tail_chat, tail_ids) = normalize_tail_messages(&tail_messages);
                 let history = build_session_turn_history_with_tail(
@@ -254,20 +251,12 @@ impl Agent {
     /// Entry point: run session_context_loop or memory_context_loop.
     /// Registry entry for this key is removed here when the loop returns (single place).
     pub(crate) async fn run(
-        mut self,
+        self,
         registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
         key_str: String,
     ) {
         if self.use_session_history {
-            let sid = match self.session_id.take() {
-                Some(s) => s,
-                None => {
-                    tracing::error!(key = %key_str, "session_context_loop requires session_id");
-                    registry.lock().remove(&key_str);
-                    return;
-                }
-            };
-            self.session_context_loop(Arc::clone(&registry), key_str.clone(), sid)
+            self.session_context_loop(Arc::clone(&registry), key_str.clone())
                 .await;
         } else {
             self.memory_context_loop(Arc::clone(&registry), key_str.clone())
@@ -346,10 +335,10 @@ impl Agent {
     /// Session context loop: sequential, in-memory history, steer-merge.
     async fn session_context_loop(
         mut self,
-        registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
-        key_str: String,
-        session_id: SessionId,
+        _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
+        _key_str: String,
     ) {
+        let session_id = self.session_id.clone();
         let session_store = match self.ctx.session_store.as_ref() {
             Some(s) => Arc::clone(s),
             None => return,
@@ -675,24 +664,26 @@ impl Agent {
     /// Memory-mode turn: build memory context, run tool call loop, deliver response.
     /// No session history; one turn per message. Uses system_prompt and tool_allow_list from Agent::new.
     async fn tool_call_loop_memory(&mut self, msg: &traits::ChannelMessage) -> Result<()> {
-        let active_session = self.session_id.as_ref();
+        let active_session = &self.session_id;
         let (delivery_channel_name, delivery_reply_target) =
-            resolve_delivery_target(&self.ctx, active_session, msg);
+            resolve_delivery_target(&self.ctx, Some(active_session), msg);
 
         let memory_context = build_memory_context(
             self.ctx.memory.as_ref(),
             &msg.content,
-            active_session.map(SessionId::as_str),
+            Some(active_session.as_str()),
         )
         .await;
         if self.ctx.auto_save_memory {
             let autosave_key = conversation_memory_key(msg);
-            let _ = self.ctx.memory.store(
-                &autosave_key,
-                &msg.content,
-                MemoryCategory::Conversation,
-                active_session.map(SessionId::as_str),
-            ).await;
+            let _ = self.ctx.memory
+                .store(
+                    &autosave_key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(active_session.as_str()),
+                )
+                .await;
         }
         let enriched_message = if memory_context.is_empty() {
             msg.content.clone()
@@ -709,20 +700,22 @@ impl Agent {
         ];
 
         let resolved =
-            resolve_turn_provider_model_temperature(self.ctx.as_ref(), active_session);
+            resolve_turn_provider_model_temperature(self.ctx.as_ref(), Some(active_session));
 
         let llm_result = timeout_future(
             Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
             self.tool_call_loop_memory_inner(
                 &resolved,
                 &mut history,
-                active_session.map(SessionId::as_str),
+                Some(active_session.as_str()),
             ),
         )
         .await;
 
-        let deliver =
-            should_deliver_to_external_channel(self.ctx.session_store.as_ref(), active_session);
+        let deliver = should_deliver_to_external_channel(
+            self.ctx.session_store.as_ref(),
+            Some(active_session),
+        );
 
         match llm_result {
             Ok(Ok(response)) => {
@@ -819,11 +812,11 @@ fn is_context_exceeded_error(err: &str) -> bool {
 /// Returns a sender to the agent's queue. Spawns deliver_loop and Agent::run.
 pub(crate) fn get_or_create_agent(
     ctx: Arc<ChannelRuntimeContext>,
-    session_id: Option<SessionId>,
+    session_id: SessionId,
     session_key: &SessionKey,
     use_session_history: bool,
 ) -> mpsc::Sender<AgentWorkItem> {
-    let key_str = agent_registry_key(session_id.as_ref(), session_key);
+    let key_str = agent_registry_key(&session_id, session_key);
     let registry = agent_registry();
     {
         let guard = registry.lock();
