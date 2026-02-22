@@ -100,8 +100,9 @@ fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> S
     .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string())
 }
 
-/// Handles a parsed slash command in the context of a channel message. Returns `true`
-/// if the message was consumed by the command (caller should not process as normal message).
+/// Handles a parsed slash command in the context of a channel message. Only processes
+/// global-level commands (e.g. /queue, /sessions, /agents); agent-level commands must be
+/// enqueued to the agent loop by the caller. Returns `true` if the message was consumed.
 pub(crate) async fn handle_slash_command(
     ctx: &ChannelRuntimeContext,
     target_channel: Option<&Arc<dyn Channel>>,
@@ -120,41 +121,15 @@ pub(crate) async fn handle_slash_command(
     };
 
     match command {
-        SlashCommand::Stop => {
-            send_command_response(
-                target_channel,
-                &msg.reply_target,
-                "Agent was aborted.".to_string(),
-            )
-            .await;
-            return true;
+        SlashCommand::Stop
+        | SlashCommand::New
+        | SlashCommand::Compact
+        | SlashCommand::Models
+        | SlashCommand::Model { .. } => {
+            unreachable!(
+                "handle_slash_command only handles global commands; agent commands must be enqueued to agent"
+            );
         }
-        SlashCommand::New => match session_store.create_new(inbound_key) {
-            Ok(session_id) => {
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    format!(
-                        "Started a new session `{}` for this conversation.",
-                        short_session_id(&session_id)
-                    ),
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to create new session for key {}: {error}",
-                    inbound_key
-                );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to create a new session. Please try again.".to_string(),
-                )
-                .await;
-            }
-        },
-        SlashCommand::Compact => unreachable!("Compact is an agent command; handled via agent.cmd_compact -> run_compact_in_memory"),
         SlashCommand::Queue { mode } => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 if let Some(mode) = mode {
@@ -394,99 +369,6 @@ pub(crate) async fn handle_slash_command(
                         target_channel,
                         &msg.reply_target,
                         "⚠️ Failed to switch agent.".to_string(),
-                    )
-                    .await;
-                }
-            }
-        }
-        SlashCommand::Models => match session_store.get_or_create_active(inbound_key) {
-            Ok(session_id) => {
-                let override_val = session_store
-                    .get_state_key(&session_id, SessionStore::MODEL_OVERRIDE_KEY)
-                    .ok()
-                    .flatten()
-                    .and_then(|raw| {
-                        serde_json::from_str::<String>(&raw)
-                            .ok()
-                            .or_else(|| (!raw.is_empty()).then(|| raw))
-                    });
-                let mut text = String::new();
-                let _ = writeln!(
-                    text,
-                    "Model for session `{}`",
-                    short_session_id(&session_id)
-                );
-                let _ = writeln!(
-                    text,
-                    "Override: {}",
-                    override_val
-                        .as_deref()
-                        .unwrap_or("(none — use agent/default)")
-                );
-                let _ = writeln!(text, "Use /model <provider>/<model> to set override (e.g. openrouter/anthropic/claude-sonnet-4).");
-                send_command_response(target_channel, &msg.reply_target, text.trim().to_string())
-                    .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to resolve session for /models ({}): {error}",
-                    inbound_key
-                );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to show model.".to_string(),
-                )
-                .await;
-            }
-        },
-        SlashCommand::Model { provider_model } => {
-            if provider_model.is_empty() {
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "Usage: /model <provider>/<model>. Use /models to see current.".to_string(),
-                )
-                .await;
-                return true;
-            }
-            match session_store.get_or_create_active(inbound_key) {
-                Ok(session_id) => {
-                    let value_json = serde_json::to_string(&provider_model.trim())
-                        .unwrap_or_else(|_| format!("\"{}\"", provider_model.trim()));
-                    if let Err(e) = session_store.set_state_key(
-                        &session_id,
-                        SessionStore::MODEL_OVERRIDE_KEY,
-                        &value_json,
-                    ) {
-                        tracing::error!("Failed to set model_override: {e}");
-                        send_command_response(
-                            target_channel,
-                            &msg.reply_target,
-                            "⚠️ Failed to set model override.".to_string(),
-                        )
-                        .await;
-                        return true;
-                    }
-                    send_command_response(
-                        target_channel,
-                        &msg.reply_target,
-                        format!(
-                            "Model override set to `{}` for this session.",
-                            provider_model.trim()
-                        ),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        "Failed to resolve session for /model ({}): {error}",
-                        inbound_key
-                    );
-                    send_command_response(
-                        target_channel,
-                        &msg.reply_target,
-                        "⚠️ Failed to set model.".to_string(),
                     )
                     .await;
                 }
