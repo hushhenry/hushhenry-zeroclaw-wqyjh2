@@ -100,52 +100,6 @@ fn current_queue_mode(session_store: &SessionStore, session_id: &SessionId) -> S
     .unwrap_or_else(|| DEFAULT_QUEUE_MODE.to_string())
 }
 
-async fn run_manual_session_compaction(
-    ctx: &ChannelRuntimeContext,
-    target_channel: Option<&Arc<dyn Channel>>,
-    reply_target: &str,
-    session_id: &SessionId,
-    msg: &ChannelMessage,
-) {
-    match crate::agent::turn::run_session_compaction(ctx, session_id, &msg.channel).await {
-        Ok(result) => {
-            if let Some(channel) = target_channel {
-                let confirmation = if result.compacted {
-                    format!(
-                        "Session compacted successfully for `{}`.",
-                        short_session_id(session_id)
-                    )
-                } else {
-                    "No compaction needed yet. Session tail is already small.".to_string()
-                };
-                if let Err(error) = channel
-                    .send(&SendMessage::new(confirmation, reply_target))
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to send /compact confirmation on {}: {error}",
-                        channel.name()
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                "Manual session compaction failed for {}: {error}",
-                session_id.as_str()
-            );
-            if let Some(channel) = target_channel {
-                let _ = channel
-                    .send(&SendMessage::new(
-                        "⚠️ Failed to compact this session. Please try again.",
-                        reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-}
-
 /// Handles a parsed slash command in the context of a channel message. Returns `true`
 /// if the message was consumed by the command (caller should not process as normal message).
 pub(crate) async fn handle_slash_command(
@@ -200,30 +154,7 @@ pub(crate) async fn handle_slash_command(
                 .await;
             }
         },
-        SlashCommand::Compact => match session_store.get_or_create_active(inbound_key) {
-            Ok(session_id) => {
-                run_manual_session_compaction(
-                    ctx,
-                    target_channel,
-                    &msg.reply_target,
-                    &session_id,
-                    msg,
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to resolve active session for compact command ({}): {error}",
-                    inbound_key
-                );
-                send_command_response(
-                    target_channel,
-                    &msg.reply_target,
-                    "⚠️ Failed to load the active session for compaction.".to_string(),
-                )
-                .await;
-            }
-        },
+        SlashCommand::Compact => unreachable!("Compact is an agent command; handled via agent.cmd_compact -> run_compact_in_memory"),
         SlashCommand::Queue { mode } => match session_store.get_or_create_active(inbound_key) {
             Ok(session_id) => {
                 if let Some(mode) = mode {

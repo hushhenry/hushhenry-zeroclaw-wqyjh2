@@ -57,7 +57,7 @@ Session 模式下只持久化 **user** 和 **assistant**，**tool** 不入库。
   3. 用 `to_compact` 生成 transcript，LLM 生成新 summary。
   4. 写 state：`after_message_id` = 当前 DB `last_message_id(session_id)`；summary 以 **assistant 消息** 写入 `session_messages`（内容 `[Session Compaction Summary]\n{summary}`）。
   5. 内存更新为 `[system, new_summary_assistant_msg, ...kept_tail]`，summary 位于最后一条 user 之前。
-- **实现**：`compact_in_memory_history`（`src/session/compaction.rs`）；Agent 内通过 `run_compact_in_memory` 调用；手动 `/compact` 通过 `run_session_compaction` 先从 DB 加载再调用同一函数。
+- **实现**：`compact_in_memory_history`（`src/session/compaction.rs`）。`/compact` 调用链：`agent.cmd_compact` → `agent.run_compact_in_memory` → `compact_in_memory_history`。
 
 ---
 
