@@ -45,9 +45,7 @@ mod daemon;
 mod doctor;
 mod gateway;
 mod health;
-mod identity;
 mod memory;
-mod migration;
 mod multi_agent;
 mod observability;
 mod onboard;
@@ -172,26 +170,6 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
-    },
-
-    /// Migrate data from other agent runtimes
-    Migrate {
-        #[command(subcommand)]
-        migrate_command: MigrateCommands,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
-    Openclaw {
-        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        source: Option<std::path::PathBuf>,
-
-        /// Validate and preview migration without writing any data
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -528,10 +506,6 @@ async fn main() -> Result<()> {
 
         Commands::Skills { skill_command } => {
             skills::handle_command(skill_command, &config.workspace_dir)
-        }
-
-        Commands::Migrate { migrate_command } => {
-            migration::handle_command(migrate_command, &config).await
         }
     }
 }

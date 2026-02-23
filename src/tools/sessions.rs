@@ -521,7 +521,9 @@ mod tests {
     async fn sessions_reply_channel_session_uses_inbound_as_outbound() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let session_id = store.get_or_create_active("channel:telegram:chat-99").unwrap();
+        let session_id = store
+            .get_or_create_active("channel:telegram:chat-99")
+            .unwrap();
         let tool = workspace_tool(&tmp);
         // Outbound loop not running in test -> dispatch fails; we only check we don't error earlier (session found, outbound_key derived).
         let result = tool

@@ -1,5 +1,4 @@
 use crate::config::IdentityConfig;
-use crate::identity;
 use crate::skills::Skill;
 use anyhow::Result;
 use chrono::Local;
@@ -78,37 +77,6 @@ impl PromptSection for IdentitySection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut prompt = String::from("## Project Context\n\n");
-        if let Some(config) = ctx.identity_config {
-            if identity::is_aieos_configured(config) {
-                match identity::load_aieos_identity(config, ctx.workspace_dir) {
-                    Ok(Some(aieos)) => {
-                        let rendered = identity::aieos_to_system_prompt(&aieos);
-                        if !rendered.is_empty() {
-                            prompt.push_str(&rendered);
-                            return Ok(prompt);
-                        }
-                    }
-                    Ok(None) => {
-                        let max_chars = ctx
-                            .bootstrap_max_chars
-                            .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);
-                        load_openclaw_bootstrap_files(&mut prompt, ctx.workspace_dir, max_chars);
-                        return Ok(prompt);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                        );
-                        let max_chars = ctx
-                            .bootstrap_max_chars
-                            .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);
-                        load_openclaw_bootstrap_files(&mut prompt, ctx.workspace_dir, max_chars);
-                        return Ok(prompt);
-                    }
-                }
-            }
-        }
-
         let max_chars = ctx
             .bootstrap_max_chars
             .unwrap_or(DEFAULT_BOOTSTRAP_MAX_CHARS);

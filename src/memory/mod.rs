@@ -86,17 +86,6 @@ pub fn create_memory(
     Ok(Box::new(mem))
 }
 
-/// Factory: create memory for migration (sqlite only; "none" is rejected).
-pub fn create_memory_for_migration(
-    backend: &str,
-    workspace_dir: &Path,
-) -> anyhow::Result<Box<dyn Memory>> {
-    if classify_memory_backend(backend) == backend::MemoryBackendKind::None {
-        anyhow::bail!("memory backend 'none' disables persistence; use sqlite before migration");
-    }
-    Ok(Box::new(SqliteMemory::new(workspace_dir)?))
-}
-
 /// Factory: create an optional response cache from config.
 pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
     if !config.response_cache_enabled {
@@ -159,21 +148,5 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
-    }
-
-    #[test]
-    fn migration_factory_returns_sqlite() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("sqlite", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "sqlite");
-    }
-
-    #[test]
-    fn migration_factory_none_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let error = create_memory_for_migration("none", tmp.path())
-            .err()
-            .expect("backend=none should be rejected for migration");
-        assert!(error.to_string().contains("disables persistence"));
     }
 }

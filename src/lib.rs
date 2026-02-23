@@ -47,9 +47,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod gateway;
 pub mod health;
-pub mod identity;
 pub mod memory;
-pub mod migration;
 pub mod multi_agent;
 pub mod observability;
 pub mod onboard;
@@ -125,21 +123,6 @@ pub enum SkillCommands {
     },
 }
 
-/// Migration subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
-    Openclaw {
-        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        source: Option<std::path::PathBuf>,
-
-        /// Validate and preview migration without writing any data
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
@@ -192,4 +175,3 @@ pub enum CronCommands {
         id: String,
     },
 }
-

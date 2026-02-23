@@ -167,9 +167,6 @@ zeroclaw channel bind-telegram 123456789
 zeroclaw service install
 zeroclaw service status
 
-# Migrate memory from OpenClaw (safe preview first)
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
@@ -191,7 +188,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
 | **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
-| **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
+| **Identity** | `IdentityConfig` | Markdown bootstrap files (SOUL, IDENTITY, etc.) | — |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
 | **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
@@ -442,9 +439,7 @@ enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
 entity_id = "default"         # default user_id for Composio tool calls
 
 [identity]
-format = "openclaw"             # "openclaw" (default, markdown files) or "aieos" (JSON)
-# aieos_path = "identity.json"  # path to AIEOS JSON file (relative to workspace or absolute)
-# aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
+# Identity is loaded from workspace markdown files (SOUL.md, IDENTITY.md, etc.)
 ```
 
 ### Ollama Local and Remote Endpoints
@@ -498,73 +493,13 @@ print(result["messages"][-1].content)
 
 See [`python/README.md`](python/README.md) for full documentation.
 
-## Identity System (AIEOS Support)
+## Identity System
 
-ZeroClaw supports **identity-agnostic** AI personas through two formats:
-
-### OpenClaw (Default)
-
-Traditional markdown files in your workspace:
+Identity is loaded from markdown files in your workspace:
 - `IDENTITY.md` — Who the agent is
 - `SOUL.md` — Core personality and values
 - `USER.md` — Who the agent is helping
 - `AGENTS.md` — Behavior guidelines
-
-### AIEOS (AI Entity Object Specification)
-
-[AIEOS](https://aieos.org) is a standardization framework for portable AI identity. ZeroClaw supports AIEOS v1.1 JSON payloads, allowing you to:
-
-- **Import identities** from the AIEOS ecosystem
-- **Export identities** to other AIEOS-compatible systems
-- **Maintain behavioral integrity** across different AI models
-
-#### Enable AIEOS
-
-```toml
-[identity]
-format = "aieos"
-aieos_path = "identity.json"  # relative to workspace or absolute path
-```
-
-Or inline JSON:
-
-```toml
-[identity]
-format = "aieos"
-aieos_inline = '''
-{
-  "identity": {
-    "names": { "first": "Nova", "nickname": "N" }
-  },
-  "psychology": {
-    "neural_matrix": { "creativity": 0.9, "logic": 0.8 },
-    "traits": { "mbti": "ENTP" },
-    "moral_compass": { "alignment": "Chaotic Good" }
-  },
-  "linguistics": {
-    "text_style": { "formality_level": 0.2, "slang_usage": true }
-  },
-  "motivations": {
-    "core_drive": "Push boundaries and explore possibilities"
-  }
-}
-'''
-```
-
-#### AIEOS Schema Sections
-
-| Section | Description |
-|---------|-------------|
-| `identity` | Names, bio, origin, residence |
-| `psychology` | Neural matrix (cognitive weights), MBTI, OCEAN, moral compass |
-| `linguistics` | Text style, formality, catchphrases, forbidden words |
-| `motivations` | Core drive, short/long-term goals, fears |
-| `capabilities` | Skills and tools the agent can access |
-| `physicality` | Visual descriptors for image generation |
-| `history` | Origin story, education, occupation |
-| `interests` | Hobbies, favorites, lifestyle |
-
-See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 ## Gateway API
 
