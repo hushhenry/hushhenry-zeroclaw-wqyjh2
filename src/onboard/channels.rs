@@ -101,45 +101,15 @@ pub fn apply_discord(
 /// Channel list for TUI: (label, configured).
 pub fn channel_list(config: &ChannelsConfig) -> Vec<(String, bool)> {
     vec![
-        (
-            "Telegram".into(),
-            config.telegram.is_some(),
-        ),
-        (
-            "Discord".into(),
-            config.discord.is_some(),
-        ),
-        (
-            "Slack".into(),
-            config.slack.is_some(),
-        ),
-        (
-            "iMessage".into(),
-            config.imessage.is_some(),
-        ),
-        (
-            "Matrix".into(),
-            config.matrix.is_some(),
-        ),
-        (
-            "WhatsApp".into(),
-            config.whatsapp.is_some(),
-        ),
-        (
-            "IRC".into(),
-            config.irc.is_some(),
-        ),
-        (
-            "Webhook".into(),
-            config.webhook.is_some(),
-        ),
-        (
-            "DingTalk".into(),
-            config.dingtalk.is_some(),
-        ),
-        (
-            "QQ Official".into(),
-            config.qq.is_some(),
-        ),
+        ("Telegram".into(), config.telegram.is_some()),
+        ("Discord".into(), config.discord.is_some()),
+        ("Slack".into(), config.slack.is_some()),
+        ("iMessage".into(), config.imessage.is_some()),
+        ("Matrix".into(), config.matrix.is_some()),
+        ("WhatsApp".into(), config.whatsapp.is_some()),
+        ("IRC".into(), config.irc.is_some()),
+        ("Webhook".into(), config.webhook.is_some()),
+        ("DingTalk".into(), config.dingtalk.is_some()),
+        ("QQ Official".into(), config.qq.is_some()),
     ]
 }

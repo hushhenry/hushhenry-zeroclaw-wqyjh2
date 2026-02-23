@@ -3,14 +3,12 @@
 //! Re-entrant: loads existing config when present; only writes config and
 //! persists workspace when the user actually changes something (dirty).
 
-use crate::config::{
-    ChannelsConfig, ComposioConfig, Config, MemoryConfig, SecretsConfig,
-};
+use crate::config::{ChannelsConfig, ComposioConfig, Config, MemoryConfig, SecretsConfig};
 use crate::memory::default_memory_backend_key;
 use crate::onboard::channels::{self, channel_list};
 use crate::onboard::wizard::{
-    memory_config_defaults_for_backend, persist_workspace_selection,
-    scaffold_main_workspace, ProjectContext,
+    memory_config_defaults_for_backend, persist_workspace_selection, scaffold_main_workspace,
+    ProjectContext,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -365,7 +363,9 @@ pub fn run_channels_repair_tui() -> Result<Config> {
                                                 d.allowed_users.join(", "),
                                             )
                                         })
-                                        .unwrap_or_else(|| (String::new(), String::new(), String::new()));
+                                        .unwrap_or_else(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
                                     screen = ChannelsRepairScreen::Input {
                                         channel_index: 1,
                                         fields: vec![token, guild, allowed],
@@ -384,89 +384,87 @@ pub fn run_channels_repair_tui() -> Result<Config> {
                         focused,
                         cursor_pos,
                         error,
-                    } => {
-                        match key.code {
-                            KeyCode::Esc => {
-                                screen = ChannelsRepairScreen::List;
+                    } => match key.code {
+                        KeyCode::Esc => {
+                            screen = ChannelsRepairScreen::List;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            *error = None;
+                            if *focused > 0 {
+                                *focused -= 1;
+                                *cursor_pos = fields[*focused].len().min(*cursor_pos);
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                *error = None;
-                                if *focused > 0 {
-                                    *focused -= 1;
-                                    *cursor_pos = fields[*focused].len().min(*cursor_pos);
-                                }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            *error = None;
+                            if *focused + 1 < fields.len() {
+                                *focused += 1;
+                                *cursor_pos = fields[*focused].len().min(*cursor_pos);
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                *error = None;
-                                if *focused + 1 < fields.len() {
-                                    *focused += 1;
-                                    *cursor_pos = fields[*focused].len().min(*cursor_pos);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                *error = None;
-                                if *channel_index == 0 {
-                                    match channels::apply_telegram(
-                                        &fields[0],
-                                        fields.get(1).map(|s| s.as_str()).unwrap_or(""),
-                                    ) {
-                                        Ok(Some(tc)) => {
-                                            config.channels_config.telegram = Some(tc);
-                                            dirty = true;
-                                            screen = ChannelsRepairScreen::List;
-                                        }
-                                        Ok(None) => {
-                                            config.channels_config.telegram = None;
-                                            dirty = true;
-                                            screen = ChannelsRepairScreen::List;
-                                        }
-                                        Err(e) => *error = Some(e.to_string()),
+                        }
+                        KeyCode::Enter => {
+                            *error = None;
+                            if *channel_index == 0 {
+                                match channels::apply_telegram(
+                                    &fields[0],
+                                    fields.get(1).map(|s| s.as_str()).unwrap_or(""),
+                                ) {
+                                    Ok(Some(tc)) => {
+                                        config.channels_config.telegram = Some(tc);
+                                        dirty = true;
+                                        screen = ChannelsRepairScreen::List;
                                     }
-                                } else if *channel_index == 1 {
-                                    match channels::apply_discord(
-                                        &fields[0],
-                                        fields.get(1).map(|s| s.as_str()).unwrap_or(""),
-                                        fields.get(2).map(|s| s.as_str()).unwrap_or(""),
-                                    ) {
-                                        Ok(Some(dc)) => {
-                                            config.channels_config.discord = Some(dc);
-                                            dirty = true;
-                                            screen = ChannelsRepairScreen::List;
-                                        }
-                                        Ok(None) => {
-                                            config.channels_config.discord = None;
-                                            dirty = true;
-                                            screen = ChannelsRepairScreen::List;
-                                        }
-                                        Err(e) => *error = Some(e.to_string()),
+                                    Ok(None) => {
+                                        config.channels_config.telegram = None;
+                                        dirty = true;
+                                        screen = ChannelsRepairScreen::List;
                                     }
+                                    Err(e) => *error = Some(e.to_string()),
+                                }
+                            } else if *channel_index == 1 {
+                                match channels::apply_discord(
+                                    &fields[0],
+                                    fields.get(1).map(|s| s.as_str()).unwrap_or(""),
+                                    fields.get(2).map(|s| s.as_str()).unwrap_or(""),
+                                ) {
+                                    Ok(Some(dc)) => {
+                                        config.channels_config.discord = Some(dc);
+                                        dirty = true;
+                                        screen = ChannelsRepairScreen::List;
+                                    }
+                                    Ok(None) => {
+                                        config.channels_config.discord = None;
+                                        dirty = true;
+                                        screen = ChannelsRepairScreen::List;
+                                    }
+                                    Err(e) => *error = Some(e.to_string()),
                                 }
                             }
-                            KeyCode::Backspace => {
-                                *error = None;
-                                if *cursor_pos > 0 {
-                                    fields[*focused].remove(*cursor_pos - 1);
-                                    *cursor_pos -= 1;
-                                }
+                        }
+                        KeyCode::Backspace => {
+                            *error = None;
+                            if *cursor_pos > 0 {
+                                fields[*focused].remove(*cursor_pos - 1);
+                                *cursor_pos -= 1;
                             }
-                            KeyCode::Char(c) => {
-                                *error = None;
-                                fields[*focused].insert(*cursor_pos, c);
+                        }
+                        KeyCode::Char(c) => {
+                            *error = None;
+                            fields[*focused].insert(*cursor_pos, c);
+                            *cursor_pos += 1;
+                        }
+                        KeyCode::Left => {
+                            if *cursor_pos > 0 {
+                                *cursor_pos -= 1;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if *cursor_pos < fields[*focused].len() {
                                 *cursor_pos += 1;
                             }
-                            KeyCode::Left => {
-                                if *cursor_pos > 0 {
-                                    *cursor_pos -= 1;
-                                }
-                            }
-                            KeyCode::Right => {
-                                if *cursor_pos < fields[*focused].len() {
-                                    *cursor_pos += 1;
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -485,7 +483,11 @@ fn draw_channels_repair(
 ) {
     let area = f.area();
     let chunks = Layout::default()
-        .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
         .split(area);
 
     let title = Paragraph::new(Line::from(vec![
@@ -493,7 +495,10 @@ fn draw_channels_repair(
             " Channels Repair ",
             Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("— update tokens and allowlists", Style::default().fg(COLOR_GRAY)),
+        Span::styled(
+            "— update tokens and allowlists",
+            Style::default().fg(COLOR_GRAY),
+        ),
     ]))
     .block(
         Block::default()
@@ -510,11 +515,17 @@ fn draw_channels_repair(
                 .enumerate()
                 .map(|(i, (label, configured))| {
                     let status = if *configured { "✅" } else { "—" };
-                    Line::from(format!("{}  {} {}", status, label, if *configured { "connected" } else { "" }))
+                    Line::from(format!(
+                        "{}  {} {}",
+                        status,
+                        label,
+                        if *configured { "connected" } else { "" }
+                    ))
                 })
-                .chain(std::iter::once(Line::from(
-                    Span::styled("Done — save and exit", Style::default().fg(COLOR_GREEN)),
-                )))
+                .chain(std::iter::once(Line::from(Span::styled(
+                    "Done — save and exit",
+                    Style::default().fg(COLOR_GREEN),
+                ))))
                 .collect();
             let list = ratatui::widgets::List::new(items)
                 .block(
@@ -536,9 +547,16 @@ fn draw_channels_repair(
             error,
         } => {
             let labels: Vec<&str> = if *channel_index == 0 {
-                vec!["Bot token (from @BotFather):", "Allowed users (comma or *):"]
+                vec![
+                    "Bot token (from @BotFather):",
+                    "Allowed users (comma or *):",
+                ]
             } else {
-                vec!["Bot token:", "Guild ID (optional):", "Allowed user IDs (comma or *):"]
+                vec![
+                    "Bot token:",
+                    "Guild ID (optional):",
+                    "Allowed user IDs (comma or *):",
+                ]
             };
             let mut lines = Vec::new();
             for (i, (label, value)) in labels.iter().zip(fields.iter()).enumerate() {
@@ -586,7 +604,10 @@ fn draw_channels_repair(
     f.render_widget(hint, chunks[2]);
 }
 
-fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &mut WizardState) -> Result<Option<Config>> {
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut WizardState,
+) -> Result<Option<Config>> {
     let mut step = Step::Welcome;
     let mut list_state = ListState::default();
     list_state.select(Some(0));
@@ -604,104 +625,95 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &m
                 }
 
                 match step {
-                    Step::Welcome => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                            KeyCode::Enter | KeyCode::Down => {
-                                step = Step::Workspace;
-                            }
-                            _ => {}
+                    Step::Welcome => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                        KeyCode::Enter | KeyCode::Down => {
+                            step = Step::Workspace;
                         }
-                    }
+                        _ => {}
+                    },
                     Step::Workspace
                     | Step::Provider
                     | Step::Channels
                     | Step::ToolMode
                     | Step::Memory
-                    | Step::ProjectContext => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                if let Some(prev) = step.prev() {
-                                    step = prev;
-                                } else {
-                                    return Ok(None);
-                                }
-                            }
-                            KeyCode::Enter | KeyCode::Char('n') => {
-                                if let Some(next) = step.next() {
-                                    step = next;
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if let Some(prev) = step.prev() {
-                                    step = prev;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Step::ZeroAi => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                if let Some(prev) = step.prev() {
-                                    step = prev;
-                                } else {
-                                    return Ok(None);
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                let _ = disable_raw_mode();
-                                let _ = stdout().execute(LeaveAlternateScreen);
-                                run_zeroai_proxy_config();
-                                let _ = enable_raw_mode();
-                                let _ = stdout().execute(EnterAlternateScreen);
-                                state.dirty.zeroai = true;
-                            }
-                            KeyCode::Enter | KeyCode::Char('n') => {
-                                if let Some(next) = step.next() {
-                                    step = next;
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if let Some(prev) = step.prev() {
-                                    step = prev;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Step::Summary => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                step = Step::ZeroAi;
-                            }
-                            KeyCode::Enter => {
-                                let should_save =
-                                    state.dirty.any() || !state.reentrant;
-                                if should_save {
-                                    state.build_config().save()?;
-                                    persist_workspace_selection(&state.config_path)?;
-                                    if state.dirty.workspace
-                                        || state.dirty.project_context
-                                        || !state.reentrant
-                                    {
-                                        fs::create_dir_all(&state.workspace_dir)
-                                            .context("create workspace dir")?;
-                                        scaffold_main_workspace(
-                                            &state.workspace_dir,
-                                            &state.project_ctx,
-                                        )?;
-                                    }
-                                    return Ok(Some(state.build_config()));
-                                }
-                                if state.reentrant {
-                                    return Ok(Some(state.build_config()));
-                                }
+                    | Step::ProjectContext => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if let Some(prev) = step.prev() {
+                                step = prev;
+                            } else {
                                 return Ok(None);
                             }
-                            _ => {}
                         }
-                    }
+                        KeyCode::Enter | KeyCode::Char('n') => {
+                            if let Some(next) = step.next() {
+                                step = next;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(prev) = step.prev() {
+                                step = prev;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Step::ZeroAi => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if let Some(prev) = step.prev() {
+                                step = prev;
+                            } else {
+                                return Ok(None);
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            let _ = disable_raw_mode();
+                            let _ = stdout().execute(LeaveAlternateScreen);
+                            run_zeroai_proxy_config();
+                            let _ = enable_raw_mode();
+                            let _ = stdout().execute(EnterAlternateScreen);
+                            state.dirty.zeroai = true;
+                        }
+                        KeyCode::Enter | KeyCode::Char('n') => {
+                            if let Some(next) = step.next() {
+                                step = next;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(prev) = step.prev() {
+                                step = prev;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Step::Summary => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            step = Step::ZeroAi;
+                        }
+                        KeyCode::Enter => {
+                            let should_save = state.dirty.any() || !state.reentrant;
+                            if should_save {
+                                state.build_config().save()?;
+                                persist_workspace_selection(&state.config_path)?;
+                                if state.dirty.workspace
+                                    || state.dirty.project_context
+                                    || !state.reentrant
+                                {
+                                    fs::create_dir_all(&state.workspace_dir)
+                                        .context("create workspace dir")?;
+                                    scaffold_main_workspace(
+                                        &state.workspace_dir,
+                                        &state.project_ctx,
+                                    )?;
+                                }
+                                return Ok(Some(state.build_config()));
+                            }
+                            if state.reentrant {
+                                return Ok(Some(state.build_config()));
+                            }
+                            return Ok(None);
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -710,9 +722,7 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &m
 
 /// Run ZeroAI TUI config (zeroai-proxy config). Blocks until user exits.
 fn run_zeroai_proxy_config() {
-    let status = Command::new("zeroai-proxy")
-        .arg("config")
-        .status();
+    let status = Command::new("zeroai-proxy").arg("config").status();
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {}
@@ -727,12 +737,7 @@ fn run_zeroai_proxy_config() {
     }
 }
 
-fn draw(
-    f: &mut Frame,
-    state: &WizardState,
-    step: Step,
-    _list_state: &ListState,
-) {
+fn draw(f: &mut Frame, state: &WizardState, step: Step, _list_state: &ListState) {
     let area = f.area();
     let chunks = Layout::default()
         .constraints([
@@ -749,10 +754,7 @@ fn draw(
             format!(" [{}] ", step_index + 1),
             Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            step.title(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(step.title(), Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" ({}/{}) ", step_index + 1, step_count),
             Style::default().fg(COLOR_GRAY),
@@ -788,7 +790,10 @@ fn draw(
                 Line::from("Config:"),
                 Line::from(Span::styled(cfg, Style::default().fg(COLOR_GREEN))),
                 Line::from(""),
-                Line::from(Span::styled("Press Enter to continue. Edit in config.toml to change path.", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "Press Enter to continue. Edit in config.toml to change path.",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }
@@ -820,11 +825,7 @@ fn draw(
             let has = state.channels_config.telegram.is_some()
                 || state.channels_config.discord.is_some()
                 || state.channels_config.slack.is_some();
-            let ch = if has {
-                "configured"
-            } else {
-                "none"
-            };
+            let ch = if has { "configured" } else { "none" };
             let lines = vec![
                 Line::from("Channels:"),
                 Line::from(Span::styled(ch, Style::default().fg(COLOR_GREEN))),
@@ -846,7 +847,10 @@ fn draw(
                 Line::from("Tool mode:"),
                 Line::from(Span::styled(mode, Style::default().fg(COLOR_GREEN))),
                 Line::from(""),
-                Line::from(Span::styled("Press Enter to continue.", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "Press Enter to continue.",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }
@@ -854,11 +858,17 @@ fn draw(
             let lines = vec![
                 Line::from("Memory:"),
                 Line::from(Span::styled(
-                    format!("Backend: {} (auto_save: {})", state.memory_config.backend, state.memory_config.auto_save),
+                    format!(
+                        "Backend: {} (auto_save: {})",
+                        state.memory_config.backend, state.memory_config.auto_save
+                    ),
                     Style::default().fg(COLOR_GREEN),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Press Enter to continue.", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "Press Enter to continue.",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }
@@ -866,11 +876,19 @@ fn draw(
             let lines = vec![
                 Line::from("Project context:"),
                 Line::from(Span::styled(
-                    format!("Agent: {}  User: {}  TZ: {}", state.project_ctx.agent_name, state.project_ctx.user_name, state.project_ctx.timezone),
+                    format!(
+                        "Agent: {}  User: {}  TZ: {}",
+                        state.project_ctx.agent_name,
+                        state.project_ctx.user_name,
+                        state.project_ctx.timezone
+                    ),
                     Style::default().fg(COLOR_GREEN),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Press Enter to continue.", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "Press Enter to continue.",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }
@@ -884,7 +902,10 @@ fn draw(
                 )),
                 Line::from("Then use ZeroAI proxy as your API endpoint in zeroclaw config."),
                 Line::from(""),
-                Line::from(Span::styled("r = Run ZeroAI TUI   Enter = continue", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "r = Run ZeroAI TUI   Enter = continue",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }
@@ -901,9 +922,15 @@ fn draw(
                 Line::from(Span::styled(dirty_note, Style::default().fg(COLOR_YELLOW))),
                 Line::from(""),
                 Line::from(format!("Workspace: {}", state.workspace_dir.display())),
-                Line::from(format!("Provider: {}  Model: {}", state.provider, state.model)),
+                Line::from(format!(
+                    "Provider: {}  Model: {}",
+                    state.provider, state.model
+                )),
                 Line::from(""),
-                Line::from(Span::styled("Enter = Save and exit   Esc = Back", Style::default().fg(COLOR_GRAY))),
+                Line::from(Span::styled(
+                    "Enter = Save and exit   Esc = Back",
+                    Style::default().fg(COLOR_GRAY),
+                )),
             ];
             Paragraph::new(lines).wrap(Wrap { trim: true })
         }

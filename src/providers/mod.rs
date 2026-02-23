@@ -1,7 +1,9 @@
 pub mod anthropic;
+pub mod codex;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod gemini_cli;
 pub mod group;
 pub mod ollama;
 pub mod openai;
@@ -267,16 +269,26 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
-/// Resolve API key for a provider from config and environment variables.
+/// Optional credential source: provider credentials file + legacy config.api_key for default provider.
+pub struct CredentialSource<'a> {
+    pub store: &'a crate::config::ProviderCredentialsStore,
+    pub default_provider: Option<&'a str>,
+    pub legacy_api_key: Option<&'a str>,
+}
+
+/// Resolve API key for a provider.
 ///
 /// Resolution order:
-/// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
-/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
-///
-/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
-/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
-fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+/// 1. Explicitly provided `credential_override` (trimmed, filtered if empty)
+/// 2. If `credential_source` is set: store.get(provider_name)
+/// 3. Provider-specific environment variable
+/// 4. Generic fallback (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 5. If `credential_source` is set and provider == default_provider: legacy_api_key
+fn resolve_provider_credential(
+    name: &str,
+    credential_override: Option<&str>,
+    credential_source: Option<&CredentialSource<'_>>,
+) -> Option<String> {
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
@@ -284,10 +296,17 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
     }
 
+    if let Some(src) = credential_source {
+        if let Some(cred) = src.store.get(name) {
+            return Some(cred);
+        }
+    }
+
     let provider_env_candidates: Vec<&str> = match name {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
+        "codex" => vec!["CODEX_ACCESS_TOKEN", "OPENAI_OAUTH_TOKEN", "OPENAI_API_KEY"],
         "ollama" => vec!["OLLAMA_API_KEY"],
         "venice" => vec!["VENICE_API_KEY"],
         "groq" => vec!["GROQ_API_KEY"],
@@ -310,6 +329,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "gemini-cli" => vec![], // credential from providers.json only (token + project_id)
         _ => vec![],
     };
 
@@ -327,6 +347,17 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());
+            }
+        }
+    }
+
+    if let Some(src) = credential_source {
+        if src.default_provider == Some(name) {
+            if let Some(legacy) = src.legacy_api_key {
+                let trimmed = legacy.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
             }
         }
     }
@@ -359,17 +390,19 @@ fn parse_custom_provider_url(
 
 /// Factory: create the right provider from config (without custom URL)
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
-    create_provider_with_url(name, api_key, None)
+    create_provider_with_url(name, api_key, None, None)
 }
 
-/// Factory: create the right provider from config with optional custom base URL
+/// Factory: create the right provider from config with optional custom base URL.
+/// Pass `credential_source` when using the separate providers credentials file (and optional legacy config.api_key).
 #[allow(clippy::too_many_lines)]
 pub fn create_provider_with_url(
     name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
+    credential_source: Option<&CredentialSource<'_>>,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let resolved_credential = resolve_provider_credential(name, api_key);
+    let resolved_credential = resolve_provider_credential(name, api_key, credential_source);
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
@@ -377,10 +410,15 @@ pub fn create_provider_with_url(
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(key))),
+        "codex" => Ok(Box::new(codex::CodexProvider::new(key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(api_url, key))),
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
+        }
+        "gemini-cli" => {
+            let cred = key.and_then(|s| gemini_cli::parse_gemini_cli_credential(s));
+            Ok(Box::new(gemini_cli::GeminiCliProvider::new(cred)))
         }
 
         // ── OpenAI-compatible providers ──────────────────────
@@ -542,12 +580,13 @@ pub fn create_resilient_provider(
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
+    credential_source: Option<&CredentialSource<'_>>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
     providers.push((
         primary_name.to_string(),
-        create_provider_with_url(primary_name, api_key, api_url)?,
+        create_provider_with_url(primary_name, api_key, api_url, credential_source)?,
     ));
 
     for fallback in &reliability.fallback_providers {
@@ -556,7 +595,7 @@ pub fn create_resilient_provider(
         }
 
         // Fallback providers don't use the custom api_url (it's specific to primary)
-        match create_provider(fallback, api_key) {
+        match create_provider_with_url(fallback, api_key, None, credential_source) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -611,7 +650,13 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "openai",
-            display_name: "OpenAI",
+            display_name: "OpenAI (API key)",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "codex",
+            display_name: "OpenAI Codex (OAuth)",
             aliases: &[],
             local: false,
         },
@@ -623,8 +668,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "gemini",
-            display_name: "Google Gemini",
+            display_name: "Google Gemini (API key)",
             aliases: &["google", "google-gemini"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "gemini-cli",
+            display_name: "Google Gemini CLI (OAuth)",
+            aliases: &[],
             local: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
@@ -781,7 +832,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
-        let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
+        let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "), None);
         assert_eq!(resolved, Some("explicit-key".to_string()));
     }
 
@@ -1210,6 +1261,7 @@ mod tests {
             Some("provider-test-credential"),
             None,
             &reliability,
+            None,
         );
         assert!(provider.is_ok());
     }
@@ -1222,20 +1274,26 @@ mod tests {
             Some("provider-test-credential"),
             None,
             &reliability,
+            None,
         );
         assert!(provider.is_err());
     }
 
     #[test]
     fn ollama_with_custom_url() {
-        let provider = create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
+        let provider =
+            create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"), None);
         assert!(provider.is_ok());
     }
 
     #[test]
     fn ollama_cloud_with_custom_url() {
-        let provider =
-            create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
+        let provider = create_provider_with_url(
+            "ollama",
+            Some("ollama-key"),
+            Some("https://ollama.com"),
+            None,
+        );
         assert!(provider.is_ok());
     }
 
@@ -1319,8 +1377,13 @@ mod tests {
     #[test]
     fn listed_providers_and_aliases_are_constructible() {
         for provider in list_providers() {
+            let credential = match provider.name {
+                "codex" => Some("codex-oauth-token"),
+                "gemini-cli" => Some(r#"{"token":"t","projectId":"proj"}"#),
+                _ => Some("provider-test-credential"),
+            };
             assert!(
-                create_provider(provider.name, Some("provider-test-credential")).is_ok(),
+                create_provider(provider.name, credential).is_ok(),
                 "Canonical provider id should be constructible: {}",
                 provider.name
             );

@@ -3,9 +3,7 @@ pub mod tui;
 pub mod wizard;
 
 pub use tui::{run_channels_repair_tui, run_wizard_tui};
-pub use wizard::{
-    run_models_refresh, run_quick_setup, scaffold_agent_workspace,
-};
+pub use wizard::{run_models_refresh, run_quick_setup, scaffold_agent_workspace};
 
 #[cfg(test)]
 mod tests {

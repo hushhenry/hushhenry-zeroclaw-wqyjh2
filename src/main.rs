@@ -491,25 +491,44 @@ async fn main() -> Result<()> {
             println!("Supported providers ({} total):\n", providers.len());
             println!("  ID (use in config)  DESCRIPTION");
             println!("  ─────────────────── ───────────");
+            // TUI-only grouping: show OpenAI (openai, codex) and Gemini (gemini, gemini-cli) under headers
+            fn display_family(id: &str) -> Option<&'static str> {
+                match id {
+                    "openai" | "codex" => Some("OpenAI"),
+                    "gemini" | "gemini-cli" => Some("Gemini"),
+                    _ => None,
+                }
+            }
+            let mut by_family: std::collections::BTreeMap<Option<&str>, Vec<_>> =
+                std::collections::BTreeMap::new();
             for p in &providers {
-                let is_active = p.name.eq_ignore_ascii_case(&current)
-                    || p.aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(&current));
-                let marker = if is_active { " (active)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                let aliases = if p.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (aliases: {})", p.aliases.join(", "))
-                };
-                println!(
-                    "  {:<19} {}{}{}{}",
-                    p.name, p.display_name, local_tag, marker, aliases
-                );
+                by_family.entry(display_family(p.name)).or_default().push(p);
+            }
+            for (family, list) in &by_family {
+                if let Some(fam) = family {
+                    println!("  ── {} ──", fam);
+                }
+                for p in list {
+                    let is_active = p.name.eq_ignore_ascii_case(&current)
+                        || p.aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(&current));
+                    let marker = if is_active { " (active)" } else { "" };
+                    let local_tag = if p.local { " [local]" } else { "" };
+                    let aliases = if p.aliases.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  (aliases: {})", p.aliases.join(", "))
+                    };
+                    println!(
+                        "  {:<19} {}{}{}{}",
+                        p.name, p.display_name, local_tag, marker, aliases
+                    );
+                }
             }
             println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
             println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
+            println!("\n  Provider credentials: store in config_dir/providers.json (not in config.toml).");
             Ok(())
         }
 

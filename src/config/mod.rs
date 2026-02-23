@@ -1,5 +1,10 @@
+pub mod provider_credentials;
 pub mod schema;
 
+#[allow(unused_imports)]
+pub use provider_credentials::{
+    ProviderCredentialValue, ProviderCredentialsFile, ProviderCredentialsStore,
+};
 #[allow(unused_imports)]
 pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,

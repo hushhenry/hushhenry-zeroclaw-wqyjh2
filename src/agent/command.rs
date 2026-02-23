@@ -3,8 +3,7 @@
 
 use crate::channels::traits::ChannelMessage;
 use crate::channels::{
-    dispatch_outbound_message, outbound_key_from_parts, SendMessage,
-    ChannelRuntimeContext,
+    dispatch_outbound_message, outbound_key_from_parts, ChannelRuntimeContext, SendMessage,
 };
 use crate::multi_agent;
 use crate::session::SessionId;
@@ -33,7 +32,9 @@ pub enum SlashCommand {
         temperature_str: Option<String>,
     },
     Models,
-    Model { provider_model: String },
+    Model {
+        provider_model: String,
+    },
 }
 
 /// Parses a slash command from message content. Returns `None` if the content
@@ -213,7 +214,9 @@ pub(crate) async fn handle_slash_command(
             provider_model,
             temperature_str,
         } => {
-            let temperature = temperature_str.as_deref().and_then(|s| s.parse::<f64>().ok());
+            let temperature = temperature_str
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok());
             match crate::channels::handle_setup_agent_command(
                 ctx,
                 &msg,

@@ -313,7 +313,9 @@ impl SessionStore {
                 return Ok(raw);
             }
         }
-        let from_row = self.get_agent_id_for_session(session_id)?.unwrap_or_else(|| "main".into());
+        let from_row = self
+            .get_agent_id_for_session(session_id)?
+            .unwrap_or_else(|| "main".into());
         Ok(from_row)
     }
 
@@ -629,9 +631,7 @@ impl SessionStore {
     pub fn list_workspace_agent_ids(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT agent_id FROM agents WHERE agent_id = name ORDER BY agent_id",
-            )
+            .prepare("SELECT agent_id FROM agents WHERE agent_id = name ORDER BY agent_id")
             .context("Failed to prepare list_workspace_agent_ids query")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))

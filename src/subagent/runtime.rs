@@ -61,7 +61,10 @@ mod tests {
         let store = Arc::new(SessionStore::new(workspace.path()).unwrap());
         let runtime = SubagentRuntime::new(store);
 
-        let session = runtime.store.create_subagent_session(None, None, None).unwrap();
+        let session = runtime
+            .store
+            .create_subagent_session(None, None, None)
+            .unwrap();
         assert!(!session.subagent_session_id.is_empty());
         assert_eq!(session.status, "active");
     }

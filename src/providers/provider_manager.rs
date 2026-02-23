@@ -3,12 +3,12 @@
 //! the fully-qualified name (e.g. `openrouter/anthropic/claude-sonnet-4` or `group/<group_name>`).
 //! Caches providers so repeated get() for the same model returns the same instance.
 //!
-//! `get()` and `default_resolved()` return a [ProviderCtx]: one object carrying provider,
-//! model (for API), and temperature so callers never hold provider and model separately.
+//! Credentials are resolved from: providers.json (if present), then env, then legacy config.api_key for default provider.
 
 use super::create_resilient_provider;
 use super::group::{GroupProvider, GroupStrategy};
 use super::traits::{ChatRequest, ChatResponse, Provider, ProviderCapabilities};
+use super::CredentialSource;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -79,6 +79,7 @@ impl Provider for ModelBoundProvider {
 
 /// Global provider manager. Build from config once; call `get(full_model, temperature)` to obtain
 /// a provider (cached). Supports single providers and `group/<name>` for provider groups.
+/// Loads provider credentials from config_dir/providers.json when present.
 pub struct ProviderManager {
     api_key: Option<String>,
     api_url: Option<String>,
@@ -87,6 +88,8 @@ pub struct ProviderManager {
     default_full_model: String,
     default_temperature: f64,
     cache: RwLock<HashMap<String, Arc<dyn Provider>>>,
+    credential_store: Arc<crate::config::ProviderCredentialsStore>,
+    default_provider_name: String,
 }
 
 impl ProviderManager {
@@ -96,10 +99,16 @@ impl ProviderManager {
         api_key: Option<&str>,
         api_url: Option<&str>,
         reliability: &crate::config::ReliabilityConfig,
+        credential_source: Option<&CredentialSource<'_>>,
     ) -> anyhow::Result<Arc<dyn Provider>> {
         let (provider_name, model_for_api) = parse_full_model(full_model.trim())?;
-        let box_provider =
-            create_resilient_provider(&provider_name, api_key, api_url, reliability)?;
+        let box_provider = create_resilient_provider(
+            &provider_name,
+            api_key,
+            api_url,
+            reliability,
+            credential_source,
+        )?;
         Ok(Arc::new(ModelBoundProvider {
             inner: box_provider,
             model_for_api,
@@ -107,6 +116,7 @@ impl ProviderManager {
     }
 
     /// Build the manager from config. Creates and caches the default provider.
+    /// Loads provider credentials from config_dir/providers.json when present.
     pub fn new(config: &crate::config::Config) -> anyhow::Result<Self> {
         let default_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
         let default_model = config
@@ -116,11 +126,34 @@ impl ProviderManager {
         let default_full_model = format!("{}/{}", default_provider_name, default_model);
         let default_temperature = config.default_temperature;
 
+        let credentials_path = config
+            .config_path
+            .parent()
+            .map(|p| crate::config::ProviderCredentialsStore::default_path(p))
+            .unwrap_or_else(|| std::path::PathBuf::from("providers.json"));
+        let credential_store =
+            match crate::config::ProviderCredentialsStore::load(&credentials_path) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::debug!(
+                        path = %credentials_path.display(),
+                        "Could not load provider credentials file: {e}; using env and legacy config"
+                    );
+                    Arc::new(crate::config::ProviderCredentialsStore::default())
+                }
+            };
+        let credential_source = CredentialSource {
+            store: credential_store.as_ref(),
+            default_provider: config.default_provider.as_deref(),
+            legacy_api_key: config.api_key.as_deref(),
+        };
+
         let default_provider = Self::create_provider_for_full_model(
             &default_full_model,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
+            Some(&credential_source),
         )
         .map_err(|e| {
             anyhow::anyhow!(
@@ -139,9 +172,11 @@ impl ProviderManager {
             api_url: config.api_url.clone(),
             reliability: config.reliability.clone(),
             provider_groups: config.provider_groups.clone(),
-            default_full_model,
+            default_full_model: default_full_model.clone(),
             default_temperature,
             cache,
+            credential_store,
+            default_provider_name: default_provider_name.to_string(),
         })
     }
 
@@ -201,11 +236,17 @@ impl ProviderManager {
                 GroupStrategy::from(group_config.strategy),
             )) as Arc<dyn Provider>
         } else {
+            let credential_source = CredentialSource {
+                store: self.credential_store.as_ref(),
+                default_provider: Some(&self.default_provider_name),
+                legacy_api_key: self.api_key.as_deref(),
+            };
             Self::create_provider_for_full_model(
                 full,
                 self.api_key.as_deref(),
                 self.api_url.as_deref(),
                 &self.reliability,
+                Some(&credential_source),
             )?
         };
         building.remove(full);

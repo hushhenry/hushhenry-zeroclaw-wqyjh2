@@ -129,8 +129,19 @@ impl AnthropicProvider {
         }
     }
 
+    /// True if credential is from `claude setup-token` (sk-ant-oat01-) or Claude Code session (sk-ant-sid).
+    /// These must use Authorization: Bearer; x-api-key is rejected (401).
     fn is_setup_token(token: &str) -> bool {
         token.starts_with("sk-ant-oat01-")
+    }
+
+    /// Session token (Claude Code / OAuth session) — same auth as setup-token but different beta header.
+    fn is_session_token(token: &str) -> bool {
+        token.contains("sk-ant-sid")
+    }
+
+    fn is_setup_or_session_token(token: &str) -> bool {
+        Self::is_setup_token(token) || Self::is_session_token(token)
     }
 
     fn apply_auth(
@@ -138,16 +149,71 @@ impl AnthropicProvider {
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
-            request
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
+        if !Self::is_setup_or_session_token(credential) {
+            return request.header("x-api-key", credential);
+        }
+        let req = request.header("Authorization", format!("Bearer {credential}"));
+        if Self::is_session_token(credential) {
+            req.header(
+                "anthropic-beta",
+                "claude-code-20250219,interleaved-thinking-2025-05-14",
+            )
+            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
         } else {
-            request.header("x-api-key", credential)
+            req.header("anthropic-beta", "oauth-2025-04-20")
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    // ── Claude Code tool name mapping (PascalCase for official tools when using setup/session token) ──
+
+    fn claude_code_official_tools() -> &'static [&'static str] {
+        &[
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Grep",
+            "Glob",
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "KillShell",
+            "NotebookEdit",
+            "Skill",
+            "Task",
+            "TaskOutput",
+            "TodoWrite",
+            "WebFetch",
+            "WebSearch",
+        ]
+    }
+
+    /// Map our tool name to Claude Code PascalCase when sending to API (setup/session token only).
+    fn to_claude_code_name(name: &str) -> String {
+        let lower = name.to_lowercase();
+        for official in Self::claude_code_official_tools() {
+            if official.to_lowercase() == lower {
+                return (*official).to_string();
+            }
+        }
+        name.to_string()
+    }
+
+    /// Map Claude Code response tool name back to our requested tool name (setup/session token only).
+    fn from_claude_code_name(name: &str, requested_tools: &[ToolSpec]) -> String {
+        let lower = name.to_lowercase();
+        for tool in requested_tools {
+            if tool.name.to_lowercase() == lower {
+                return tool.name.clone();
+            }
+        }
+        name.to_string()
+    }
+
+    fn convert_tools(
+        tools: Option<&[ToolSpec]>,
+        is_setup_or_session: bool,
+    ) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
@@ -156,7 +222,11 @@ impl AnthropicProvider {
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
-                    name: tool.name.clone(),
+                    name: if is_setup_or_session {
+                        Self::to_claude_code_name(&tool.name)
+                    } else {
+                        tool.name.clone()
+                    },
                     description: tool.description.clone(),
                     input_schema: tool.parameters.clone(),
                 })
@@ -164,7 +234,10 @@ impl AnthropicProvider {
         )
     }
 
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<NativeContentOut>> {
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        is_setup_or_session: bool,
+    ) -> Option<Vec<NativeContentOut>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -184,9 +257,14 @@ impl AnthropicProvider {
         for call in tool_calls {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            let name = if is_setup_or_session {
+                Self::to_claude_code_name(&call.name)
+            } else {
+                call.name
+            };
             blocks.push(NativeContentOut::ToolUse {
                 id: call.id,
-                name: call.name,
+                name,
                 input,
             });
         }
@@ -213,7 +291,10 @@ impl AnthropicProvider {
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<NativeMessage>) {
+    fn convert_messages(
+        messages: &[ChatMessage],
+        is_setup_or_session: bool,
+    ) -> (Option<String>, Vec<NativeMessage>) {
         let mut system_prompt = None;
         let mut native_messages = Vec::new();
 
@@ -225,7 +306,9 @@ impl AnthropicProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, is_setup_or_session)
+                    {
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: blocks,
@@ -274,7 +357,11 @@ impl AnthropicProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
-    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+    fn parse_native_response(
+        response: NativeChatResponse,
+        is_setup_or_session: bool,
+        requested_tools: Option<&[ToolSpec]>,
+    ) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
@@ -288,9 +375,14 @@ impl AnthropicProvider {
                     }
                 }
                 "tool_use" => {
-                    let name = block.name.unwrap_or_default();
+                    let mut name = block.name.unwrap_or_default();
                     if name.is_empty() {
                         continue;
+                    }
+                    if is_setup_or_session {
+                        if let Some(tools) = requested_tools {
+                            name = Self::from_claude_code_name(&name, tools);
+                        }
                     }
                     let arguments = block
                         .input
@@ -330,14 +422,16 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
-        let (system_prompt, messages) = Self::convert_messages(request.messages);
+        let is_setup_or_session = Self::is_setup_or_session_token(credential);
+        let (system_prompt, messages) =
+            Self::convert_messages(request.messages, is_setup_or_session);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
             system: system_prompt,
             messages,
             temperature,
-            tools: Self::convert_tools(request.tools),
+            tools: Self::convert_tools(request.tools, is_setup_or_session),
         };
 
         let req = self
@@ -353,7 +447,11 @@ impl Provider for AnthropicProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        Ok(Self::parse_native_response(
+            native_response,
+            is_setup_or_session,
+            request.tools,
+        ))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -444,6 +542,27 @@ mod tests {
     }
 
     #[test]
+    fn session_token_detection_works() {
+        assert!(AnthropicProvider::is_session_token(
+            "prefix-sk-ant-sid-suffix"
+        ));
+        assert!(!AnthropicProvider::is_session_token("sk-ant-oat01-only"));
+    }
+
+    #[test]
+    fn setup_or_session_token_uses_bearer() {
+        assert!(AnthropicProvider::is_setup_or_session_token(
+            "sk-ant-oat01-x"
+        ));
+        assert!(AnthropicProvider::is_setup_or_session_token(
+            "sk-ant-sid-abc"
+        ));
+        assert!(!AnthropicProvider::is_setup_or_session_token(
+            "sk-ant-api03-key"
+        ));
+    }
+
+    #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
         let provider = AnthropicProvider::new(None);
         let request = provider
@@ -472,6 +591,33 @@ mod tests {
     }
 
     #[test]
+    fn apply_auth_uses_claude_code_beta_for_session_tokens() {
+        let provider = AnthropicProvider::new(None);
+        let request = provider
+            .apply_auth(
+                provider.client.get("https://api.anthropic.com/v1/models"),
+                "sk-ant-sid-session-token",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("claude-code-20250219,interleaved-thinking-2025-05-14")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
+            Some("claude-cli/2.1.2 (external, cli)")
+        );
+    }
+
+    #[test]
     fn apply_auth_uses_x_api_key_for_regular_tokens() {
         let provider = AnthropicProvider::new(None);
         let request = provider
@@ -491,6 +637,16 @@ mod tests {
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn to_claude_code_name_maps_official_tools_to_pascal_case() {
+        assert_eq!(AnthropicProvider::to_claude_code_name("read"), "Read");
+        assert_eq!(AnthropicProvider::to_claude_code_name("bash"), "Bash");
+        assert_eq!(
+            AnthropicProvider::to_claude_code_name("web_fetch"),
+            "web_fetch"
+        );
     }
 
     #[tokio::test]

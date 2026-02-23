@@ -1698,9 +1698,9 @@ impl Config {
                 }
             }
         }
-        let contents =
-            fs::read_to_string(config_path).context("Failed to read config file")?;
-        let mut config: Config = toml::from_str(&contents).context("Failed to parse config file")?;
+        let contents = fs::read_to_string(config_path).context("Failed to read config file")?;
+        let mut config: Config =
+            toml::from_str(&contents).context("Failed to parse config file")?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir.to_path_buf();
         let store = crate::security::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
@@ -1720,13 +1720,16 @@ impl Config {
 
     /// Load config if it exists (same resolution as load_or_init). Never creates. For re-entrant onboard.
     pub fn load_if_exists() -> Option<Self> {
-        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs().ok()?;
+        let (default_zeroclaw_dir, default_workspace_dir) =
+            default_config_and_workspace_dirs().ok()?;
         let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
             Ok(custom_workspace) if !custom_workspace.is_empty() => {
                 let workspace = PathBuf::from(custom_workspace);
                 (resolve_config_dir_for_workspace(&workspace), workspace)
             }
-            _ => load_persisted_workspace_dirs(&default_zeroclaw_dir).ok().flatten()
+            _ => load_persisted_workspace_dirs(&default_zeroclaw_dir)
+                .ok()
+                .flatten()
                 .unwrap_or((default_zeroclaw_dir, default_workspace_dir)),
         };
         let config_path = zeroclaw_dir.join("config.toml");

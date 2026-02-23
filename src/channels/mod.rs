@@ -34,9 +34,7 @@ pub use whatsapp::WhatsAppChannel;
 use crate::agent::agent::{agent_registry_key, get_or_create_agent, AgentQueueItem, AgentWorkItem};
 #[cfg(test)]
 use crate::agent::agent::{drain_agent_queue, merge_work_items, partition_steer_items};
-use crate::agent::command::{
-    handle_slash_command, is_agent_command, parse_slash_command,
-};
+use crate::agent::command::{handle_slash_command, is_agent_command, parse_slash_command};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory};
@@ -126,7 +124,8 @@ pub(crate) struct ChannelRuntimeContext {
     /// Runtime adapter for building per-agent tools.
     pub(crate) runtime: Arc<dyn runtime::RuntimeAdapter>,
     /// Per-agent tool cache: agent_id -> tools (with that agent's workspace SecurityPolicy).
-    pub(crate) tools_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>,
+    pub(crate) tools_cache:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>,
 }
 
 impl ChannelRuntimeContext {
@@ -165,7 +164,9 @@ impl ChannelRuntimeContext {
             Arc::clone(&self.memory),
             &workspace_dir,
         ));
-        self.tools_cache.lock().insert(id.to_string(), Arc::clone(&tools));
+        self.tools_cache
+            .lock()
+            .insert(id.to_string(), Arc::clone(&tools));
         tools
     }
 }
@@ -288,9 +289,7 @@ pub fn parse_outbound_key_to_delivery_parts(outbound_key: &str) -> Result<(Strin
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         match parts.as_slice() {
             [name, target] => return Ok(((*name).to_string(), (*target).to_string())),
-            _ => anyhow::bail!(
-                "invalid channel outbound_key: expected channel:name:reply_target"
-            ),
+            _ => anyhow::bail!("invalid channel outbound_key: expected channel:name:reply_target"),
         }
     }
     anyhow::bail!("outbound_key must start with internal: or channel:");
@@ -604,8 +603,8 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list_impl(
         channel_delivery_instructions(channel_name),
     );
     let workspace_dir = workspace_dir_override.unwrap_or(ctx.config.workspace_dir.as_path());
-    let tools_slice: &[Box<dyn Tool>] = tools_override
-        .unwrap_or_else(|| ctx.tools_registry.as_slice());
+    let tools_slice: &[Box<dyn Tool>] =
+        tools_override.unwrap_or_else(|| ctx.tools_registry.as_slice());
 
     let (Some(store), Some(sid)) = (ctx.session_store.as_ref(), session_id) else {
         if workspace_dir_override.is_some() {
@@ -627,8 +626,10 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list_impl(
                 Some(&ctx.config.identity),
                 bootstrap_max_chars,
             );
-            let merged =
-                build_merged_system_prompt(&base_prompt, channel_delivery_instructions(channel_name));
+            let merged = build_merged_system_prompt(
+                &base_prompt,
+                channel_delivery_instructions(channel_name),
+            );
             return (merged, None);
         }
         return (default_merged, None);
@@ -943,8 +944,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
             return;
         }
-        let handled =
-            handle_slash_command(&ctx, &msg, &inbound_key, command).await;
+        let handled = handle_slash_command(&ctx, &msg, &inbound_key, command).await;
         if handled {
             return;
         }
@@ -1670,8 +1670,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Global outbound channel: dispatch_outbound_message writes here; this loop performs the actual send
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundRequest>(256);
     set_outbound_sender(Some(outbound_tx.clone()));
-    let outbound_handle =
-        tokio::spawn(run_outbound_message_loop(outbound_rx, Arc::clone(&channels_by_name)));
+    let outbound_handle = tokio::spawn(run_outbound_message_loop(
+        outbound_rx,
+        Arc::clone(&channels_by_name),
+    ));
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -2113,7 +2115,10 @@ mod tests {
             session_id: None,
         };
         let work = AgentWorkItem::from_message(&msg);
-        assert_eq!(work.outbound_key.as_deref(), Some("channel:telegram:chat-99"));
+        assert_eq!(
+            work.outbound_key.as_deref(),
+            Some("channel:telegram:chat-99")
+        );
         let back = work.to_channel_message();
         assert_eq!(back.content, "hello world");
         assert_eq!(back.reply_target, "chat-99");

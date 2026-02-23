@@ -208,10 +208,7 @@ pub fn build_tools_for_workspace(
     memory: Arc<dyn Memory>,
     workspace_dir: &std::path::Path,
 ) -> Vec<Box<dyn Tool>> {
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace_dir));
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),

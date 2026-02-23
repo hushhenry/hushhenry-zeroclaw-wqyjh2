@@ -339,7 +339,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "ok");
@@ -365,7 +372,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "recovered");
@@ -404,7 +418,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "from fallback");
@@ -441,7 +462,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let err = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .expect_err("all providers should fail");
         let msg = err.to_string();
@@ -498,7 +526,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "from fallback");
@@ -526,7 +561,14 @@ mod tests {
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "history ok");
@@ -565,7 +607,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "fallback ok");
@@ -600,7 +649,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "claude-opus", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "claude-opus",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "ok from sonnet");
@@ -636,7 +692,14 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let err = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "model-a", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "model-a",
+                0.0,
+            )
             .await
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
@@ -664,7 +727,14 @@ mod tests {
         // No model_fallbacks set — should work exactly as before
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest { messages: &messages, tools: None }, "test", 0.0)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "test",
+                0.0,
+            )
             .await
             .unwrap();
         assert_eq!(result.text_or_empty(), "ok");

@@ -3,15 +3,14 @@
 
 use crate::agent::command::{short_session_id, SlashCommand};
 use crate::agent::loop_::{
-    build_assistant_content_native, bind_custom_tool_args, find_tool,
-    maybe_truncate_tool_output, scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
+    bind_custom_tool_args, build_assistant_content_native, find_tool, maybe_truncate_tool_output,
+    scrub_credentials, tools_to_specs, MAX_TOOL_ITERATIONS,
 };
 use crate::channels::traits;
 use crate::channels::{
-    build_session_turn_history_with_tail, normalize_tail_messages,
-    dispatch_outbound_message, outbound_key_from_parts,
-    parse_outbound_key_to_delivery_parts, INTERNAL_MESSAGE_CHANNEL, SendMessage,
-    ChannelRuntimeContext,
+    build_session_turn_history_with_tail, dispatch_outbound_message, normalize_tail_messages,
+    outbound_key_from_parts, parse_outbound_key_to_delivery_parts, ChannelRuntimeContext,
+    SendMessage, INTERNAL_MESSAGE_CHANNEL,
 };
 use crate::observability::ObserverEvent;
 use crate::providers::{ChatMessage, ChatRequest, ToolCall};
@@ -290,16 +289,14 @@ impl Agent {
         if is_tool && !self.verbose_tool_output {
             return Ok(());
         }
-        let key = outbound_key
-            .map(String::from)
-            .or_else(|| {
-                self.ctx.session_store.as_ref().and_then(|store| {
-                    store
-                        .get_outbound_key_for_session(self.session_id.as_str())
-                        .ok()
-                        .flatten()
-                })
-            });
+        let key = outbound_key.map(String::from).or_else(|| {
+            self.ctx.session_store.as_ref().and_then(|store| {
+                store
+                    .get_outbound_key_for_session(self.session_id.as_str())
+                    .ok()
+                    .flatten()
+            })
+        });
         let Some(ref key) = key else {
             tracing::debug!("send_outbound: no outbound_key (work item or session), skipping");
             return Ok(());
@@ -307,13 +304,19 @@ impl Agent {
         let (_, reply_target) = parse_outbound_key_to_delivery_parts(key)
             .map_err(|e| anyhow::anyhow!("invalid outbound_key: {e}"))?;
         let msg = SendMessage::new(content, reply_target);
-        dispatch_outbound_message(key.as_str(), msg).await.map_err(Into::into)
+        dispatch_outbound_message(key.as_str(), msg)
+            .await
+            .map_err(Into::into)
     }
 
     /// /stop: abort current turn. Delivers "Agent was aborted.", returns AbortBatch.
     async fn cmd_stop(&mut self, envelope: &AgentWorkItem) -> Result<AgentLoopAction> {
-        self.send_outbound("Agent was aborted.", false, envelope.outbound_key.as_deref())
-            .await?;
+        self.send_outbound(
+            "Agent was aborted.",
+            false,
+            envelope.outbound_key.as_deref(),
+        )
+        .await?;
         Ok(AgentLoopAction::AbortBatch)
     }
 
@@ -499,14 +502,24 @@ impl Agent {
         )?;
 
         if let Ok(Some(wa)) = store.get_workspace_agent(&agent_id_to_set) {
-            let config: serde_json::Value = serde_json::from_str(&wa.config_json).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            let config: serde_json::Value = serde_json::from_str(&wa.config_json)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
             if let Some(obj) = config.as_object() {
                 if let Some(serde_json::Value::String(provider_model)) = obj.get("provider_model") {
-                    let model_json = serde_json::to_string(provider_model).unwrap_or_else(|_| format!("\"{provider_model}\""));
-                    let _ = store.set_state_key(&self.session_id, SessionStore::MODEL_OVERRIDE_KEY, &model_json);
+                    let model_json = serde_json::to_string(provider_model)
+                        .unwrap_or_else(|_| format!("\"{provider_model}\""));
+                    let _ = store.set_state_key(
+                        &self.session_id,
+                        SessionStore::MODEL_OVERRIDE_KEY,
+                        &model_json,
+                    );
                 }
                 if let Some(t) = obj.get("temperature").and_then(|v| v.as_f64()) {
-                    let _ = store.set_state_key(&self.session_id, SessionStore::TEMPERATURE_OVERRIDE_KEY, &t.to_string());
+                    let _ = store.set_state_key(
+                        &self.session_id,
+                        SessionStore::TEMPERATURE_OVERRIDE_KEY,
+                        &t.to_string(),
+                    );
                 }
             }
         }
@@ -547,7 +560,10 @@ impl Agent {
             SlashCommand::AgentSwitch {
                 id_or_name,
                 set_default,
-            } => self.cmd_agent_switch(&id_or_name, set_default, envelope).await,
+            } => {
+                self.cmd_agent_switch(&id_or_name, set_default, envelope)
+                    .await
+            }
             _ => Err(anyhow::anyhow!(
                 "run_command_and_deliver called with non-agent command"
             )),
@@ -713,7 +729,8 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 self.history.push(ChatMessage::assistant(text.clone()));
-                self.send_outbound(&text, false, delivery_outbound_key.as_deref()).await?;
+                self.send_outbound(&text, false, delivery_outbound_key.as_deref())
+                    .await?;
                 let last_user_content = self
                     .history
                     .iter()
@@ -721,11 +738,15 @@ impl Agent {
                     .find(|m| m.role == "user")
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
-                return Ok(SessionTurnOutcome::Completed(Some((last_user_content, text))));
+                return Ok(SessionTurnOutcome::Completed(Some((
+                    last_user_content,
+                    text,
+                ))));
             }
 
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
-            self.send_outbound(&text, false, delivery_outbound_key.as_deref()).await?;
+            self.send_outbound(&text, false, delivery_outbound_key.as_deref())
+                .await?;
             self.history.push(ChatMessage::assistant(assistant_content));
 
             for (idx, call) in tool_calls.iter().enumerate() {
@@ -765,8 +786,7 @@ impl Agent {
 
                 let args = serde_json::from_str(&call.arguments)
                     .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-                let tool_args =
-                    bind_custom_tool_args(&call.name, args, Some(session_id.as_str()));
+                let tool_args = bind_custom_tool_args(&call.name, args, Some(session_id.as_str()));
                 let (output, _success) = self.execute_single_tool(&call, tool_args).await;
                 let output = maybe_truncate_tool_output(&output);
                 self.history.push(ChatMessage::tool(
