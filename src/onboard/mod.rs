@@ -1,6 +1,9 @@
 pub mod wizard;
 
-pub use wizard::{run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard};
+pub use wizard::{
+    run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard,
+    scaffold_agent_workspace,
+};
 
 #[cfg(test)]
 mod tests {

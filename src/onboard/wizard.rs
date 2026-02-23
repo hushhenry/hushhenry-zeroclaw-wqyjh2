@@ -91,7 +91,7 @@ pub fn run_wizard() -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(7, 7, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx)?;
+    scaffold_main_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -352,7 +352,7 @@ pub fn run_quick_setup(
     config.save()?;
     persist_workspace_selection(&config.config_path)?;
 
-    // Scaffold minimal workspace files
+    // Scaffold minimal workspace files for main agent (workspace/main)
     let default_ctx = ProjectContext {
         user_name: std::env::var("USER").unwrap_or_else(|_| "User".into()),
         timezone: "UTC".into(),
@@ -361,7 +361,7 @@ pub fn run_quick_setup(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx)?;
+    scaffold_main_workspace(&workspace_dir, &default_ctx)?;
 
     println!(
         "  {} Workspace:  {}",
@@ -3236,8 +3236,28 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
 // ── Scaffold workspace files ─────────────────────────────
 
+/// Scaffold PROMPT and directory layout for the main agent under workspace_base/main.
+/// Reuses the same file layout as scaffold_agent_workspace. Call this from onboard.
+pub fn scaffold_main_workspace(workspace_base: &Path, ctx: &ProjectContext) -> Result<()> {
+    let main_dir = workspace_base.join(crate::multi_agent::DEFAULT_AGENT_ID);
+    fs::create_dir_all(&main_dir).context("Failed to create workspace/main directory")?;
+    scaffold_workspace(&main_dir, ctx)
+}
+
+/// Scaffold PROMPT and directory layout for a workspace agent (used by onboard for main and by /setup_agent for others).
+/// Uses agent_id as the agent name in the generated files. Same file layout as scaffold_workspace.
+pub fn scaffold_agent_workspace(workspace_dir: &Path, agent_id: &str) -> Result<()> {
+    let ctx = ProjectContext {
+        agent_name: agent_id.to_string(),
+        user_name: "User".to_string(),
+        timezone: "UTC".to_string(),
+        communication_style: "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".to_string(),
+    };
+    scaffold_workspace(workspace_dir, &ctx)
+}
+
 #[allow(clippy::too_many_lines)]
-fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -3662,6 +3682,20 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    // ── scaffold_main_workspace: creates workspace/main ───────────
+
+    #[test]
+    fn scaffold_main_workspace_creates_under_main() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_main_workspace(tmp.path(), &ctx).unwrap();
+
+        let main_dir = tmp.path().join(crate::multi_agent::DEFAULT_AGENT_ID);
+        assert!(main_dir.is_dir(), "workspace/main should exist");
+        assert!(main_dir.join("IDENTITY.md").exists());
+        assert!(main_dir.join("AGENTS.md").exists());
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────

@@ -51,6 +51,7 @@ pub mod identity;
 pub mod integrations;
 pub mod memory;
 pub mod migration;
+pub mod multi_agent;
 pub mod observability;
 pub mod onboard;
 pub mod providers;

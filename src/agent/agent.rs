@@ -27,10 +27,28 @@ use std::collections::HashMap;
 use std::convert::AsRef;
 use std::fmt::Write;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 // --- Moved types (from channels/mod.rs) ---
+
+/// Outcome of running an agent-level slash command in the session loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentLoopAction {
+    /// Continue; process any buffered messages.
+    Continue,
+    /// Abort current batch (e.g. /stop); do not process buffered messages this round.
+    AbortBatch,
+    /// Exit the agent loop so the agent is dropped and can be recreated (e.g. after /agent switch).
+    ExitLoop,
+}
+
+/// Outcome of one session turn (tool call loop).
+pub(crate) enum SessionTurnOutcome {
+    Completed(Option<(String, String)>),
+    ExitLoop,
+}
 
 /// One unit of work for an agent's internal queue (user message only).
 /// Delivery is via a single outbound_key (internal:{session_id} or channel:{name}:{reply_target}).
@@ -182,8 +200,10 @@ pub(crate) struct Agent {
     inbound_key: String,
     system_prompt: String,
     tool_allow_list: Option<Vec<String>>,
-    /// Tool specs for chat requests; computed once in new() from tools_registry + tool_allow_list.
+    /// Tool specs for chat requests; computed once in new() from agent_tools + tool_allow_list.
     tool_specs: Vec<ToolSpec>,
+    /// Per-agent tools (workspace-scoped SecurityPolicy).
+    agent_tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
     message_rx: mpsc::Receiver<AgentQueueItem>,
     history: Vec<ChatMessage>,
     ctx: Arc<ChannelRuntimeContext>,
@@ -192,21 +212,36 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// Initialize agent: resolve prompt/tools. Caller creates (message_tx, message_rx); we take message_rx.
+    /// Initialize agent: resolve prompt/tools for the session's effective workspace agent.
     pub(crate) fn new(
         ctx: Arc<ChannelRuntimeContext>,
         session_id: SessionId,
         inbound_key: &str,
         message_rx: mpsc::Receiver<AgentQueueItem>,
         verbose_tool_output: bool,
+        effective_agent_id: &str,
     ) -> Result<Self> {
+        let config_dir = ctx
+            .config
+            .config_path
+            .parent()
+            .unwrap_or_else(|| ctx.config.workspace_dir.as_path());
+        let default_agent_id = crate::multi_agent::get_default_agent_id(config_dir);
+        let workspace_dir = crate::multi_agent::workspace_dir_for_agent(
+            ctx.config.workspace_dir.as_path(),
+            effective_agent_id,
+            default_agent_id.as_deref(),
+        );
+        let agent_tools = ctx.get_tools_for_agent(effective_agent_id);
         let (system_prompt, tool_allow_list) =
-            crate::channels::resolve_effective_system_prompt_and_tool_allow_list(
+            crate::channels::resolve_effective_system_prompt_and_tool_allow_list_impl(
                 &ctx,
                 Some(&session_id),
-                "", // channel name resolved per-turn in session_context_loop
+                "",
+                Some(workspace_dir.as_path()),
+                Some(agent_tools.as_slice()),
             );
-        let tool_specs = tools_to_specs(ctx.tools_registry.as_ref(), tool_allow_list.as_deref());
+        let tool_specs = tools_to_specs(agent_tools.as_ref(), tool_allow_list.as_deref());
 
         let history = if let Some(store) = ctx.session_store.as_ref() {
             let compaction_state = load_compaction_state(store, &session_id).unwrap_or_default();
@@ -225,6 +260,7 @@ impl Agent {
             system_prompt,
             tool_allow_list,
             tool_specs,
+            agent_tools,
             message_rx,
             history,
             ctx,
@@ -274,48 +310,15 @@ impl Agent {
         dispatch_outbound_message(key.as_str(), msg).await.map_err(Into::into)
     }
 
-    /// /stop: abort current turn. Delivers "Agent was aborted.", returns true.
-    async fn cmd_stop(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+    /// /stop: abort current turn. Delivers "Agent was aborted.", returns AbortBatch.
+    async fn cmd_stop(&mut self, envelope: &AgentWorkItem) -> Result<AgentLoopAction> {
         self.send_outbound("Agent was aborted.", false, envelope.outbound_key.as_deref())
             .await?;
-        Ok(true)
-    }
-
-    /// /new: create new session, deliver "New session started · model: <provider>/<model>".
-    async fn cmd_new(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
-        let store = self
-            .ctx
-            .session_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
-        match store.create_new(&self.inbound_key) {
-            Ok(_new_session_id) => {
-                let full_model = self.ctx.provider_manager.default_full_model().to_string();
-                self.send_outbound(
-                    &format!("New session started · model: {full_model}"),
-                    false,
-                    envelope.outbound_key.as_deref(),
-                )
-                .await?;
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to create new session for key {}: {e}",
-                    self.inbound_key.as_str()
-                );
-                self.send_outbound(
-                    "⚠️ Failed to create a new session. Please try again.",
-                    false,
-                    envelope.outbound_key.as_deref(),
-                )
-                .await?;
-            }
-        }
-        Ok(false)
+        Ok(AgentLoopAction::AbortBatch)
     }
 
     /// /compact: compact this agent's in-memory history, then deliver confirmation.
-    async fn cmd_compact(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+    async fn cmd_compact(&mut self, envelope: &AgentWorkItem) -> Result<AgentLoopAction> {
         let store = Arc::clone(
             self.ctx
                 .session_store
@@ -336,11 +339,11 @@ impl Agent {
         };
         self.send_outbound(&msg, false, envelope.outbound_key.as_deref())
             .await?;
-        Ok(false)
+        Ok(AgentLoopAction::Continue)
     }
 
     /// /model (no args): show current model from session override or default (uses agent's ctx + session_id).
-    async fn cmd_model_show(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+    async fn cmd_model_show(&mut self, envelope: &AgentWorkItem) -> Result<AgentLoopAction> {
         let current = self
             .ctx
             .session_store
@@ -355,7 +358,7 @@ impl Agent {
             .unwrap_or_else(|| self.ctx.provider_manager.default_full_model().to_string());
         self.send_outbound(&current, false, envelope.outbound_key.as_deref())
             .await?;
-        Ok(false)
+        Ok(AgentLoopAction::Continue)
     }
 
     /// /model <provider>/<model>: set session model override.
@@ -363,7 +366,7 @@ impl Agent {
         &mut self,
         provider_model: &str,
         envelope: &AgentWorkItem,
-    ) -> Result<bool> {
+    ) -> Result<AgentLoopAction> {
         let store = self
             .ctx
             .session_store
@@ -383,7 +386,7 @@ impl Agent {
                 envelope.outbound_key.as_deref(),
             )
             .await?;
-            return Ok(false);
+            return Ok(AgentLoopAction::Continue);
         }
         self.send_outbound(
             &format!(
@@ -394,11 +397,11 @@ impl Agent {
             envelope.outbound_key.as_deref(),
         )
         .await?;
-        Ok(false)
+        Ok(AgentLoopAction::Continue)
     }
 
     /// /models: show model info for this session (override + hint).
-    async fn cmd_models(&mut self, envelope: &AgentWorkItem) -> Result<bool> {
+    async fn cmd_models(&mut self, envelope: &AgentWorkItem) -> Result<AgentLoopAction> {
         let store = self
             .ctx
             .session_store
@@ -429,18 +432,109 @@ impl Agent {
         );
         self.send_outbound(text.trim(), false, envelope.outbound_key.as_deref())
             .await?;
-        Ok(false)
+        Ok(AgentLoopAction::Continue)
     }
 
-    /// Execute one agent command using agent state; deliver reply. Returns true if /stop (abort turn).
+    /// /agent <agent_id> [default]: stop current session, set session's agent_id and params from agent config, then exit loop to rebuild agent.
+    async fn cmd_agent_switch(
+        &mut self,
+        id_or_name: &str,
+        set_default: bool,
+        envelope: &AgentWorkItem,
+    ) -> Result<AgentLoopAction> {
+        let store = self
+            .ctx
+            .session_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+        let id = id_or_name.trim();
+        if id.is_empty() {
+            self.send_outbound(
+                "Usage: /agent <agent_id> [default]. Use /agents to list.",
+                false,
+                envelope.outbound_key.as_deref(),
+            )
+            .await?;
+            return Ok(AgentLoopAction::Continue);
+        }
+        let agent_id_to_set: String = {
+            let workspace_ids = store.list_workspace_agent_ids().unwrap_or_default();
+            if workspace_ids.iter().any(|a| a == id) {
+                id.to_string()
+            } else if let Ok(Some(agent)) = store.get_agent_by_id(id) {
+                agent.agent_id
+            } else if let Ok(Some(agent)) = store.get_agent_by_name(id) {
+                agent.agent_id
+            } else {
+                id.to_string()
+            }
+        };
+
+        let config_dir = self
+            .ctx
+            .config
+            .config_path
+            .parent()
+            .unwrap_or_else(|| self.ctx.config.workspace_dir.as_path());
+        if set_default {
+            if let Err(e) = crate::multi_agent::set_default_agent_id(config_dir, &agent_id_to_set) {
+                tracing::error!("Failed to set default agent: {e}");
+                self.send_outbound(
+                    "⚠️ Failed to set default agent.",
+                    false,
+                    envelope.outbound_key.as_deref(),
+                )
+                .await?;
+                return Ok(AgentLoopAction::Continue);
+            }
+        }
+
+        store.update_session_agent_id(&self.session_id, &agent_id_to_set)?;
+        let value_json = serde_json::to_string(&agent_id_to_set)
+            .unwrap_or_else(|_| format!("\"{agent_id_to_set}\""));
+        store.set_state_key(
+            &self.session_id,
+            SessionStore::ACTIVE_AGENT_ID_KEY,
+            &value_json,
+        )?;
+
+        if let Ok(Some(wa)) = store.get_workspace_agent(&agent_id_to_set) {
+            let config: serde_json::Value = serde_json::from_str(&wa.config_json).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = config.as_object() {
+                if let Some(serde_json::Value::String(provider_model)) = obj.get("provider_model") {
+                    let model_json = serde_json::to_string(provider_model).unwrap_or_else(|_| format!("\"{provider_model}\""));
+                    let _ = store.set_state_key(&self.session_id, SessionStore::MODEL_OVERRIDE_KEY, &model_json);
+                }
+                if let Some(t) = obj.get("temperature").and_then(|v| v.as_f64()) {
+                    let _ = store.set_state_key(&self.session_id, SessionStore::TEMPERATURE_OVERRIDE_KEY, &t.to_string());
+                }
+            }
+        }
+
+        let mut msg = format!("Switched to agent `{agent_id_to_set}`. Session params updated. Next message will use the new agent.");
+        if set_default {
+            if agent_id_to_set == crate::multi_agent::DEFAULT_AGENT_ID {
+                msg = "Default agent cleared. Main has full workspace access again.".to_string();
+            } else {
+                msg = format!(
+                    "{msg} Default agent set: main uses workspace/main; {} has full workspace.",
+                    agent_id_to_set
+                );
+            }
+        }
+        self.send_outbound(&msg, false, envelope.outbound_key.as_deref())
+            .await?;
+        Ok(AgentLoopAction::ExitLoop)
+    }
+
+    /// Execute one agent command using agent state; deliver reply.
     async fn run_command_and_deliver(
         &mut self,
         command: SlashCommand,
         envelope: &AgentWorkItem,
-    ) -> Result<bool> {
+    ) -> Result<AgentLoopAction> {
         match command {
             SlashCommand::Stop => self.cmd_stop(envelope).await,
-            SlashCommand::New => self.cmd_new(envelope).await,
             SlashCommand::Compact => self.cmd_compact(envelope).await,
             SlashCommand::Models => self.cmd_models(envelope).await,
             SlashCommand::Model { provider_model } => {
@@ -450,6 +544,10 @@ impl Agent {
                     self.cmd_model_set(provider_model.as_str(), envelope).await
                 }
             }
+            SlashCommand::AgentSwitch {
+                id_or_name,
+                set_default,
+            } => self.cmd_agent_switch(&id_or_name, set_default, envelope).await,
             _ => Err(anyhow::anyhow!(
                 "run_command_and_deliver called with non-agent command"
             )),
@@ -459,6 +557,7 @@ impl Agent {
     /// Non-blocking drain of message_rx for steer-merge.
     /// Session context loop: process items in order. /stop aborts only messages that appeared
     /// before it in the batch; messages after /stop are executed normally.
+    /// Exits after idle TTL (session.agent_idle_ttl_secs) with no messages when set; 0 = no timeout.
     async fn session_context_loop(
         mut self,
         _registry: Arc<ParkingMutex<HashMap<String, AgentHandle>>>,
@@ -466,8 +565,26 @@ impl Agent {
     ) {
         let session_id = self.session_id.clone();
         let session_store = self.ctx.session_store.as_ref().map(Arc::clone);
+        let idle_ttl_secs = self.ctx.config.session.agent_idle_ttl_secs;
 
-        while let Some(first) = self.message_rx.recv().await {
+        loop {
+            let first = if idle_ttl_secs == 0 {
+                self.message_rx.recv().await
+            } else {
+                tokio::select! {
+                    biased;
+                    msg = self.message_rx.recv() => msg,
+                    _ = tokio::time::sleep(Duration::from_secs(idle_ttl_secs)) => {
+                        tracing::debug!(session_id = %session_id, idle_ttl_secs, "Agent loop idle TTL reached");
+                        break;
+                    }
+                }
+            };
+
+            let Some(first) = first else {
+                break;
+            };
+
             let mut batch = vec![first];
             batch.extend(drain_agent_queue(&mut self.message_rx));
 
@@ -477,11 +594,14 @@ impl Agent {
                     AgentQueueItem::Message(w) => message_buf.push(w),
                     AgentQueueItem::Command(cmd, envelope) => {
                         match self.run_command_and_deliver(cmd, &envelope).await {
-                            Ok(true) => {
-                                // /stop: discard only messages before this command
+                            Ok(AgentLoopAction::AbortBatch) => {
                                 message_buf.clear();
                             }
-                            Ok(false) => {}
+                            Ok(AgentLoopAction::ExitLoop) => {
+                                message_buf.clear();
+                                return;
+                            }
+                            Ok(AgentLoopAction::Continue) => {}
                             Err(e) => {
                                 tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
                             }
@@ -498,7 +618,7 @@ impl Agent {
                 .tool_call_loop_session(&session_id, session_store.as_deref(), &work)
                 .await
             {
-                Ok(Some((user_content, assistant_content))) => {
+                Ok(SessionTurnOutcome::Completed(Some((user_content, assistant_content)))) => {
                     if let Some(store) = session_store.as_ref() {
                         let _ = store.append_message(&session_id, "user", &user_content, None);
                         let _ = store.append_message(
@@ -509,7 +629,8 @@ impl Agent {
                         );
                     }
                 }
-                Ok(None) => {}
+                Ok(SessionTurnOutcome::Completed(None)) => {}
+                Ok(SessionTurnOutcome::ExitLoop) => return,
                 Err(e) => {
                     tracing::error!(session_id = %session_id.as_str(), "Agent turn error: {e}");
                 }
@@ -518,13 +639,13 @@ impl Agent {
     }
 
     /// Tool call loop for session mode: no DB read after init; trailing orphan user merged with new user.
-    /// Returns Ok(Some((user, assistant))) on successful turn (persist both after return); Ok(None) on abort (e.g. /stop).
+    /// Returns Ok(Completed(Some((user, assistant)))) on successful turn; Ok(Completed(None)) on abort (e.g. /stop); Ok(ExitLoop) when /agent switch requested.
     async fn tool_call_loop_session(
         &mut self,
         session_id: &SessionId,
         session_store: Option<&SessionStore>,
         work: &AgentWorkItem,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<SessionTurnOutcome> {
         let delivery_outbound_key = work.outbound_key.clone();
 
         let new_content = work.content.clone();
@@ -600,7 +721,7 @@ impl Agent {
                     .find(|m| m.role == "user")
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
-                return Ok(Some((last_user_content, text)));
+                return Ok(SessionTurnOutcome::Completed(Some((last_user_content, text))));
             }
 
             let assistant_content = build_assistant_content_native(&text, &tool_calls);
@@ -613,8 +734,11 @@ impl Agent {
 
                 for (cmd, envelope) in steer_commands {
                     match self.run_command_and_deliver(cmd, &envelope).await {
-                        Ok(true) => return Ok(None),
-                        Ok(false) => {}
+                        Ok(AgentLoopAction::AbortBatch) => {
+                            return Ok(SessionTurnOutcome::Completed(None));
+                        }
+                        Ok(AgentLoopAction::ExitLoop) => return Ok(SessionTurnOutcome::ExitLoop),
+                        Ok(AgentLoopAction::Continue) => {}
                         Err(e) => {
                             tracing::error!(session_id = %session_id.as_str(), "Command error: {e}");
                         }
@@ -710,7 +834,7 @@ impl Agent {
                 false,
             );
         }
-        let Some(tool) = find_tool(self.ctx.tools_registry.as_ref(), &call.name) else {
+        let Some(tool) = find_tool(self.agent_tools.as_ref(), &call.name) else {
             return (format!("Unknown tool: {}", call.name), false);
         };
         match tool.execute(tool_args).await {
@@ -758,6 +882,11 @@ pub(crate) fn get_or_create_agent(
             return handle.tx.clone();
         }
     }
+    let effective_agent_id = ctx
+        .session_store
+        .as_ref()
+        .and_then(|store| store.effective_workspace_agent_id(&session_id).ok())
+        .unwrap_or_else(|| crate::multi_agent::DEFAULT_AGENT_ID.to_string());
     let (message_tx, message_rx) = mpsc::channel::<AgentQueueItem>(64);
 
     match Agent::new(
@@ -766,6 +895,7 @@ pub(crate) fn get_or_create_agent(
         inbound_key,
         message_rx,
         false,
+        &effective_agent_id,
     ) {
         Ok(agent) => {
             let reg = agent_registry();

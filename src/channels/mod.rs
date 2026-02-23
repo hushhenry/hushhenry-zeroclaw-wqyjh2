@@ -113,6 +113,7 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     pub(crate) provider_manager: Arc<dyn ProviderManagerTrait>,
     pub(crate) memory: Arc<dyn Memory>,
+    /// Default tools (main agent). Kept for backward compat; per-agent tools from tools_cache preferred.
     pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
     pub(crate) observer: Arc<dyn Observer>,
     pub(crate) system_prompt: Arc<String>,
@@ -123,6 +124,70 @@ pub(crate) struct ChannelRuntimeContext {
     pub(crate) config: Arc<Config>,
     /// All skills (for per-agent filtering in Milestone 2).
     pub(crate) all_skills: Arc<Vec<crate::skills::Skill>>,
+    /// Runtime adapter for building per-agent tools.
+    pub(crate) runtime: Arc<dyn runtime::RuntimeAdapter>,
+    /// Per-agent tool cache: agent_id -> tools (with that agent's workspace SecurityPolicy).
+    pub(crate) tools_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>,
+}
+
+impl ChannelRuntimeContext {
+    /// Returns tools for the given workspace agent_id (main or subdir). Caches per agent_id.
+    /// When cache is empty for "main", uses ctx.tools_registry if non-empty (e.g. tests with mock tools).
+    pub(crate) fn get_tools_for_agent(&self, agent_id: &str) -> Arc<Vec<Box<dyn Tool>>> {
+        let id = agent_id.trim();
+        let id = if id.is_empty() { "main" } else { id };
+        {
+            let guard = self.tools_cache.lock();
+            if let Some(tools) = guard.get(id) {
+                return Arc::clone(tools);
+            }
+        }
+        if id == "main" && !self.tools_registry.is_empty() {
+            self.tools_cache
+                .lock()
+                .insert("main".to_string(), Arc::clone(&self.tools_registry));
+            return Arc::clone(&self.tools_registry);
+        }
+        let config_dir = self
+            .config
+            .config_path
+            .parent()
+            .unwrap_or_else(|| self.config.workspace_dir.as_path());
+        let default_agent_id = crate::multi_agent::get_default_agent_id(config_dir);
+        let workspace_dir = crate::multi_agent::workspace_dir_for_agent(
+            self.config.workspace_dir.as_path(),
+            id,
+            default_agent_id.as_deref(),
+        );
+        let _ = std::fs::create_dir_all(&workspace_dir);
+        let security = Arc::new(SecurityPolicy::from_config(
+            &self.config.autonomy,
+            &workspace_dir,
+        ));
+        let (composio_key, composio_entity_id) = if self.config.composio.enabled {
+            (
+                self.config.composio.api_key.as_deref(),
+                Some(self.config.composio.entity_id.as_str()),
+            )
+        } else {
+            (None, None)
+        };
+        let tools = tools::all_tools_with_runtime(
+            Arc::clone(&self.config),
+            &security,
+            Arc::clone(&self.runtime),
+            Arc::clone(&self.memory),
+            composio_key,
+            composio_entity_id,
+            &self.config.browser,
+            &self.config.http_request,
+            &workspace_dir,
+            self.config.as_ref(),
+        );
+        let tools = Arc::new(tools);
+        self.tools_cache.lock().insert(id.to_string(), Arc::clone(&tools));
+        tools
+    }
 }
 
 fn internal_dispatch_sender() -> Arc<ParkingMutex<Option<mpsc::Sender<traits::ChannelMessage>>>> {
@@ -151,7 +216,7 @@ fn outbound_sender() -> Arc<ParkingMutex<Option<mpsc::Sender<OutboundRequest>>>>
     OUTBOUND.clone()
 }
 
-fn set_outbound_sender(sender: Option<mpsc::Sender<OutboundRequest>>) {
+pub(crate) fn set_outbound_sender(sender: Option<mpsc::Sender<OutboundRequest>>) {
     let registry = outbound_sender();
     let mut guard = registry.lock();
     *guard = sender;
@@ -424,6 +489,7 @@ fn parse_agent_spec_policy(config_json: &str) -> AgentSpecPolicy {
 }
 
 /// Session (provider, model, temperature). Returns Some only when model_override is set and contains '/' (parsed to provider/model).
+/// Temperature comes from session temperature_override when set, else config default.
 fn get_session_model_temperature(
     store: &SessionStore,
     session_id: &SessionId,
@@ -442,7 +508,13 @@ fn get_session_model_temperature(
     if provider.is_empty() || model.is_empty() {
         return None;
     }
-    Some((provider, model, config.default_temperature))
+    let temp = store
+        .get_state_key(session_id, SessionStore::TEMPERATURE_OVERRIDE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<f64>(t.trim()).ok())
+        .unwrap_or(config.default_temperature);
+    Some((provider, model, temp))
 }
 
 /// Agent (provider, model, temperature) from active AgentSpec defaults. Returns Some only when all three are set.
@@ -539,27 +611,67 @@ pub(crate) fn resolve_agent_spec_policy(
 }
 
 /// Resolve effective system prompt and optional tool allow-list for a session.
-/// Shared by the agent turn (history + compaction + tool loop) and manual /compact.
-/// Returns (prompt, tool_allow_list); when no session_store or no session_id, tool_allow_list is None.
+/// When workspace_dir_override and tools_override are set (multi-agent), prompt and tool list use that workspace/tools.
 pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
     ctx: &ChannelRuntimeContext,
     session_id: Option<&SessionId>,
     channel_name: &str,
 ) -> (String, Option<Vec<String>>) {
+    resolve_effective_system_prompt_and_tool_allow_list_impl(
+        ctx,
+        session_id,
+        channel_name,
+        None,
+        None,
+    )
+}
+
+/// Internal implementation with optional per-agent workspace and tools.
+pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list_impl(
+    ctx: &ChannelRuntimeContext,
+    session_id: Option<&SessionId>,
+    channel_name: &str,
+    workspace_dir_override: Option<&std::path::Path>,
+    tools_override: Option<&[Box<dyn Tool>]>,
+) -> (String, Option<Vec<String>>) {
     let default_merged = build_merged_system_prompt(
         ctx.system_prompt.as_str(),
         channel_delivery_instructions(channel_name),
     );
+    let workspace_dir = workspace_dir_override.unwrap_or(ctx.config.workspace_dir.as_path());
+    let tools_slice: &[Box<dyn Tool>] = tools_override
+        .unwrap_or_else(|| ctx.tools_registry.as_slice());
+
     let (Some(store), Some(sid)) = (ctx.session_store.as_ref(), session_id) else {
+        if workspace_dir_override.is_some() {
+            let tool_entries: Vec<(&str, &str)> = tools_slice
+                .iter()
+                .map(|t| (t.name(), t.description()))
+                .collect();
+            let skills = crate::skills::load_skills(workspace_dir);
+            let bootstrap_max_chars = if ctx.config.agent.compact_context {
+                Some(6000)
+            } else {
+                None
+            };
+            let base_prompt = build_system_prompt(
+                workspace_dir,
+                ctx.provider_manager.default_full_model(),
+                &tool_entries,
+                &skills,
+                Some(&ctx.config.identity),
+                bootstrap_max_chars,
+            );
+            let merged =
+                build_merged_system_prompt(&base_prompt, channel_delivery_instructions(channel_name));
+            return (merged, None);
+        }
         return (default_merged, None);
     };
-    let Some(policy) = resolve_agent_spec_policy(store, sid) else {
-        return (default_merged, None);
-    };
-    let allowed_tools = policy.tools.clone();
-    let allowed_skills = policy.skills;
-    let tool_entries: Vec<(&str, &str)> = ctx
-        .tools_registry
+    let policy = resolve_agent_spec_policy(store, sid);
+    let allowed_tools = policy.as_ref().and_then(|p| p.tools.clone());
+    let allowed_skills = policy.and_then(|p| p.skills);
+    let tool_entries: Vec<(&str, &str)> = tools_slice
         .iter()
         .filter(|tool| match allowed_tools.as_ref() {
             Some(allow) => allow.iter().any(|name| name == tool.name()),
@@ -573,6 +685,8 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
             .filter(|skill| allow.iter().any(|name| name == &skill.name))
             .cloned()
             .collect()
+    } else if workspace_dir_override.is_some() {
+        crate::skills::load_skills(workspace_dir)
     } else {
         ctx.all_skills.to_vec()
     };
@@ -582,7 +696,7 @@ pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
         None
     };
     let base_prompt = build_system_prompt(
-        &ctx.config.workspace_dir,
+        workspace_dir,
         ctx.provider_manager.default_full_model(),
         &tool_entries,
         &filtered_skills_vec,
@@ -601,6 +715,89 @@ pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'stat
         ),
         _ => None,
     }
+}
+
+/// Setup workspace agent: DB-first. If agent exists in DB, only update default params; else create dir, scaffold, insert.
+/// Returns a message to send to the user.
+pub(crate) async fn handle_setup_agent_command(
+    ctx: &ChannelRuntimeContext,
+    _msg: &traits::ChannelMessage,
+    _inbound_key: &str,
+    agent_id: &str,
+    provider_model: Option<&str>,
+    temperature: Option<f64>,
+) -> Result<String> {
+    use crate::multi_agent::{is_valid_new_agent_id, workspace_dir_for_agent};
+    use crate::onboard::scaffold_agent_workspace;
+
+    if !is_valid_new_agent_id(agent_id) {
+        anyhow::bail!(
+            "Invalid agent_id \"{}\". Use only letters (a–z, A–Z), underscore, or hyphen; \"main\" is reserved.",
+            agent_id
+        );
+    }
+    let config_dir = ctx
+        .config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| ctx.config.workspace_dir.as_path());
+    let default_agent_id = crate::multi_agent::get_default_agent_id(config_dir);
+    let base = ctx.config.workspace_dir.as_path();
+    let agent_path = workspace_dir_for_agent(base, agent_id, default_agent_id.as_deref());
+
+    let mut config = serde_json::Map::new();
+    if let Some(pm) = provider_model {
+        config.insert(
+            "provider_model".to_string(),
+            serde_json::Value::String(pm.to_string()),
+        );
+    }
+    if let Some(t) = temperature {
+        config.insert("temperature".to_string(), serde_json::Value::from(t));
+    }
+    let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+
+    let store = ctx
+        .session_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
+    let existing = store.get_workspace_agent(agent_id)?;
+
+    if let Some(_) = existing {
+        store.upsert_workspace_agent(agent_id, &config_json)?;
+        return Ok(format!(
+            "Agent `{}` already exists; default params updated.",
+            agent_id
+        ));
+    }
+
+    if agent_path.exists() {
+        store.upsert_workspace_agent(agent_id, &config_json)?;
+        return Ok(format!(
+            "Agent `{}` directory already present; registered in DB and default params updated.",
+            agent_id
+        ));
+    }
+
+    std::fs::create_dir_all(&agent_path)
+        .with_context(|| format!("Failed to create agent directory {}", agent_path.display()))?;
+    scaffold_agent_workspace(&agent_path, agent_id)?;
+    store.upsert_workspace_agent(agent_id, &config_json)?;
+
+    let extra = if config.is_empty() {
+        String::new()
+    } else {
+        " Default params saved.".to_string()
+    };
+    let list = store.list_workspace_agent_ids()?;
+    Ok(format!(
+        "Agent `{}` created at {}.{} Use /agent {} to switch. Agents: {}.",
+        agent_id,
+        agent_path.display(),
+        extra,
+        agent_id,
+        list.join(", ")
+    ))
 }
 
 fn spawn_supervised_listener(
@@ -1307,7 +1504,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
-        runtime,
+        Arc::clone(&runtime),
         Arc::clone(&mem),
         composio_key,
         composio_entity_id,
@@ -1316,6 +1513,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &workspace,
         &config,
     ));
+    let mut tools_cache = std::collections::HashMap::new();
+    tools_cache.insert(
+        crate::multi_agent::DEFAULT_AGENT_ID.to_string(),
+        Arc::clone(&tools_registry),
+    );
+    let tools_cache = Arc::new(parking_lot::Mutex::new(tools_cache));
 
     let skills = crate::skills::load_skills(&workspace);
 
@@ -1535,6 +1738,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         session_store,
         config: Arc::new(config.clone()),
         all_skills: Arc::new(skills),
+        runtime,
+        tools_cache,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1858,7 +2063,20 @@ mod tests {
             session_store: Some(session_store),
             config: Arc::new(config),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// Start outbound message loop so agent replies are delivered to the context's channels.
+    /// Returns a guard that clears the sender on drop. Use in tests that expect delivery.
+    fn start_outbound_loop_for_test(
+        ctx: &ChannelRuntimeContext,
+    ) -> (mpsc::Sender<OutboundRequest>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(256);
+        set_outbound_sender(Some(tx.clone()));
+        let handle = tokio::spawn(run_outbound_message_loop(rx, ctx.channels_by_name.clone()));
+        (tx, handle)
     }
 
     #[test]
@@ -2027,8 +2245,11 @@ mod tests {
         let inbound_key = inbound_key(&msg);
         let previous_session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
-        process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+        let ctx = session_runtime_ctx(session_store.clone(), channel);
+        let (_tx, _handle) = start_outbound_loop_for_test(&ctx);
+        process_channel_message(ctx, msg).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
+        set_outbound_sender(None);
 
         let active_after = session_store.get_or_create_active(&inbound_key).unwrap();
         assert_ne!(active_after.as_str(), previous_session_id.as_str());
@@ -2056,8 +2277,11 @@ mod tests {
         let inbound_key = inbound_key(&msg);
         let session_id = session_store.get_or_create_active(&inbound_key).unwrap();
 
-        process_channel_message(session_runtime_ctx(session_store.clone(), channel), msg).await;
+        let ctx = session_runtime_ctx(session_store.clone(), channel);
+        let (_tx, _handle) = start_outbound_loop_for_test(&ctx);
+        process_channel_message(ctx, msg).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
+        set_outbound_sender(None);
 
         let messages = session_store.load_recent_messages(&session_id, 10).unwrap();
         assert!(messages.is_empty());
@@ -2092,13 +2316,18 @@ mod tests {
             session_store: None,
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
+        let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
         process_channel_message(
             runtime_ctx,
             session_test_message("/compact", "cmd-compact-mem"),
         )
         .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        set_outbound_sender(None);
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
@@ -2132,8 +2361,11 @@ mod tests {
             session_store: session_store.clone(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
+        let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
@@ -2150,6 +2382,7 @@ mod tests {
         .await;
         // Turn runs in spawned task; allow it to complete.
         tokio::time::sleep(Duration::from_millis(800)).await;
+        set_outbound_sender(None);
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert!(!sent_messages.is_empty(), "expected at least one delivery");
@@ -2187,8 +2420,11 @@ mod tests {
             session_store: session_store.clone(),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
+        let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
@@ -2205,6 +2441,7 @@ mod tests {
         .await;
         // Turn runs in spawned task; allow it to complete.
         tokio::time::sleep(Duration::from_millis(800)).await;
+        set_outbound_sender(None);
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert!(!sent_messages.is_empty(), "expected at least one delivery");
@@ -2464,6 +2701,8 @@ mod tests {
             session_store: Some(session_store),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2549,6 +2788,8 @@ mod tests {
             session_store: Some(session_store),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2572,6 +2813,7 @@ mod tests {
             session_id: None,
         };
 
+        let (_ob_tx, _ob_handle) = start_outbound_loop_for_test(&ctx);
         let key = inbound_key(&msg1);
         let session_id = ctx
             .session_store
@@ -2592,6 +2834,7 @@ mod tests {
             .send(AgentQueueItem::Message(AgentWorkItem::from_message(&msg2)))
             .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
+        set_outbound_sender(None);
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(
@@ -2628,6 +2871,8 @@ mod tests {
             session_store: Some(session_store),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2651,6 +2896,7 @@ mod tests {
             session_id: None,
         };
 
+        let (_ob_tx, _ob_handle) = start_outbound_loop_for_test(&ctx);
         let key = inbound_key(&msg1);
         let session_id = ctx
             .session_store
@@ -2669,6 +2915,7 @@ mod tests {
                 .await;
         });
         tokio::time::sleep(Duration::from_millis(600)).await;
+        set_outbound_sender(None);
 
         let sent = channel_impl.sent_messages.lock().await;
         assert!(
@@ -2732,6 +2979,8 @@ mod tests {
             session_store: Some(session_store.clone()),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -2832,6 +3081,8 @@ mod tests {
             session_store: Some(session_store.clone()),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -2884,6 +3135,8 @@ mod tests {
             session_store: Some(session_store.clone()),
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         process_channel_message(
@@ -2937,6 +3190,8 @@ mod tests {
             session_store,
             config: Arc::new(Config::default()),
             all_skills: Arc::new(vec![]),
+            runtime: Arc::from(runtime::native::NativeRuntime::new()),
+            tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2966,6 +3221,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
+        let (_ob_tx, _ob_handle) = start_outbound_loop_for_test(&runtime_ctx);
         let started = Instant::now();
         run_message_dispatch_loop(rx, runtime_ctx, 2).await;
         let elapsed = started.elapsed();
@@ -2977,6 +3233,7 @@ mod tests {
         );
         // Turns run in spawned tasks; allow them to complete.
         tokio::time::sleep(Duration::from_millis(600)).await;
+        set_outbound_sender(None);
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2);

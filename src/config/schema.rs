@@ -670,16 +670,25 @@ pub struct SessionConfig {
     /// Number of recent session messages to load per request.
     #[serde(default = "default_session_history_limit")]
     pub history_limit: u32,
+
+    /// Idle TTL in seconds: agent loop exits after this long with no messages. 0 = disabled (no timeout).
+    #[serde(default = "default_agent_idle_ttl_secs")]
+    pub agent_idle_ttl_secs: u64,
 }
 
 fn default_session_history_limit() -> u32 {
     40
 }
 
+fn default_agent_idle_ttl_secs() -> u64 {
+    300
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             history_limit: default_session_history_limit(),
+            agent_idle_ttl_secs: default_agent_idle_ttl_secs(),
         }
     }
 }

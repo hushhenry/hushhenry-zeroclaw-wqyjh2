@@ -49,6 +49,7 @@ mod identity;
 mod integrations;
 mod memory;
 mod migration;
+mod multi_agent;
 mod observability;
 mod onboard;
 mod providers;

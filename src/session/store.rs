@@ -79,7 +79,7 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 10;
+const SESSION_SCHEMA_VERSION: i64 = 12;
 
 /// Subagent session: backed by sessions table (session_id, agent_id, status, outbound_key, ...).
 #[derive(Debug, Clone)]
@@ -93,7 +93,8 @@ pub struct SubagentSession {
     pub outbound_key: Option<String>,
 }
 
-/// Agent profile (main or subagent): model defaults + policies. Stored in agents table.
+/// Agent (workspace or profile): agent_id, name, config. Stored in agents table.
+/// Workspace agents use agent_id = name = directory name; main is not stored.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub agent_id: String,
@@ -139,6 +140,20 @@ impl SessionStore {
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
+        let current_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("Failed to read user_version")?;
+        if current_version == 11 {
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (agent_id, name, config_json, created_at, updated_at)
+                 SELECT agent_id, agent_id, config_json, created_at, updated_at FROM workspace_agents",
+                [],
+            )
+            .context("Failed to migrate workspace_agents into agents")?;
+            conn.execute("DROP TABLE IF EXISTS workspace_agents", [])
+                .context("Failed to drop workspace_agents")?;
+        }
+
         conn.execute_batch(
             "             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
@@ -230,12 +245,19 @@ impl SessionStore {
         Ok(session_id)
     }
 
-    pub fn create_new(&self, inbound_key: &str) -> Result<SessionId> {
+    /// Create a new session for the inbound key. If agent_id is None, uses "main".
+    pub fn create_new(&self, inbound_key: &str, agent_id: Option<&str>) -> Result<SessionId> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("Failed to start session transaction")?;
         let now = Self::now();
+        let agent_id_val = agent_id.unwrap_or("main").trim();
+        let agent_id_val = if agent_id_val.is_empty() {
+            "main"
+        } else {
+            agent_id_val
+        };
 
         tx.execute(
             "UPDATE sessions SET status = 'inactive' WHERE inbound_key = ?1",
@@ -246,14 +268,53 @@ impl SessionStore {
         let session_id = SessionId::new();
         tx.execute(
             "INSERT INTO sessions (session_id, inbound_key, agent_id, status, title, created_at, updated_at, meta_json)
-             VALUES (?1, ?2, 'main', 'active', NULL, ?3, ?3, NULL)",
-            params![session_id.as_str(), inbound_key, now],
+             VALUES (?1, ?2, ?3, 'active', NULL, ?4, ?4, NULL)",
+            params![session_id.as_str(), inbound_key, agent_id_val, now],
         )
         .context("Failed to insert new active session")?;
 
         tx.commit()
             .context("Failed to commit create_new transaction")?;
         Ok(session_id)
+    }
+
+    /// Returns the agent_id stored for this session (from sessions table).
+    pub fn get_agent_id_for_session(&self, session_id: &SessionId) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id FROM sessions WHERE session_id = ?1",
+            params![session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("Failed to query agent_id for session")
+    }
+
+    /// Update the session's agent_id in the sessions table (used when switching agent).
+    pub fn update_session_agent_id(&self, session_id: &SessionId, agent_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "UPDATE sessions SET agent_id = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![agent_id.trim(), now, session_id.as_str()],
+        )
+        .context("Failed to update session agent_id")?;
+        Ok(())
+    }
+
+    /// Effective workspace agent for a session: state active_agent_id override, else session's agent_id, else "main".
+    pub fn effective_workspace_agent_id(&self, session_id: &SessionId) -> Result<String> {
+        if let Some(raw) = self.get_state_key(session_id, Self::ACTIVE_AGENT_ID_KEY)? {
+            let parsed: Option<String> = serde_json::from_str(&raw).ok();
+            if let Some(id) = parsed.filter(|s| !s.is_empty()) {
+                return Ok(id);
+            }
+            if !raw.is_empty() && !raw.starts_with('"') {
+                return Ok(raw);
+            }
+        }
+        let from_row = self.get_agent_id_for_session(session_id)?.unwrap_or_else(|| "main".into());
+        Ok(from_row)
     }
 
     /// Appends a message and returns the inserted row id for compaction boundary tracking.
@@ -467,6 +528,8 @@ impl SessionStore {
     pub const ACTIVE_AGENT_ID_KEY: &'static str = "active_agent_id";
     /// Session state key for model override (e.g. "openrouter/anthropic/claude-sonnet-4").
     pub const MODEL_OVERRIDE_KEY: &'static str = "model_override";
+    /// Session state key for temperature override (f64 as JSON number).
+    pub const TEMPERATURE_OVERRIDE_KEY: &'static str = "temperature_override";
 
     pub fn list_agents(&self, limit: u32) -> Result<Vec<Agent>> {
         let conn = self.conn.lock();
@@ -560,6 +623,55 @@ impl SessionStore {
         drop(conn);
         self.get_agent_by_id(&resolved_id)?
             .ok_or_else(|| anyhow::anyhow!("Agent missing after upsert for name '{name}'"))
+    }
+
+    /// List workspace agent ids: "main" plus agent_id from agents where agent_id = name (workspace agents).
+    pub fn list_workspace_agent_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id FROM agents WHERE agent_id = name ORDER BY agent_id",
+            )
+            .context("Failed to prepare list_workspace_agent_ids query")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to query agents for workspace list")?;
+        let mut ids: Vec<String> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode workspace agent ids")?;
+        let mut out = vec![crate::multi_agent::DEFAULT_AGENT_ID.to_string()];
+        out.append(&mut ids);
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Get workspace agent by agent_id (same as get_agent_by_id; main is not stored).
+    pub fn get_workspace_agent(&self, agent_id: &str) -> Result<Option<Agent>> {
+        if agent_id.trim().is_empty() || agent_id == crate::multi_agent::DEFAULT_AGENT_ID {
+            return Ok(None);
+        }
+        self.get_agent_by_id(agent_id)
+    }
+
+    /// Insert or update workspace agent in agents table (agent_id = name = directory name).
+    pub fn upsert_workspace_agent(&self, agent_id: &str, config_json: &str) -> Result<()> {
+        if agent_id.trim().is_empty() || agent_id == crate::multi_agent::DEFAULT_AGENT_ID {
+            anyhow::bail!("Cannot upsert workspace agent 'main'");
+        }
+        let conn = self.conn.lock();
+        let now = Self::now();
+        conn.execute(
+            "INSERT INTO agents (agent_id, name, config_json, created_at, updated_at)
+             VALUES (?1, ?1, ?2, ?3, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at,
+                name = excluded.name",
+            params![agent_id, config_json, now],
+        )
+        .context("Failed to upsert workspace agent in agents table")?;
+        Ok(())
     }
 
     pub fn create_subagent_session(
@@ -701,7 +813,7 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
 
-        let newer_session = store.create_new(inbound_key).unwrap();
+        let newer_session = store.create_new(inbound_key, None).unwrap();
         assert_ne!(newer_session.as_str(), session_id.as_str());
 
         let active = store.get_or_create_active(inbound_key).unwrap();
@@ -731,7 +843,7 @@ mod tests {
         assert!(id2.is_some());
         assert!(id2.unwrap() >= id1.unwrap());
 
-        let other_session = store.create_new("channel:test:other").unwrap();
+        let other_session = store.create_new("channel:test:other", None).unwrap();
         assert!(store.last_message_id(&other_session).unwrap().is_none());
     }
 
