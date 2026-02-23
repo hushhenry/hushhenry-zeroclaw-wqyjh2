@@ -592,21 +592,6 @@ pub(crate) fn resolve_agent_spec_policy(
 
 /// Resolve effective system prompt and optional tool allow-list for a session.
 /// When workspace_dir_override and tools_override are set (multi-agent), prompt and tool list use that workspace/tools.
-pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list(
-    ctx: &ChannelRuntimeContext,
-    session_id: Option<&SessionId>,
-    channel_name: &str,
-) -> (String, Option<Vec<String>>) {
-    resolve_effective_system_prompt_and_tool_allow_list_impl(
-        ctx,
-        session_id,
-        channel_name,
-        None,
-        None,
-    )
-}
-
-/// Internal implementation with optional per-agent workspace and tools.
 pub(crate) fn resolve_effective_system_prompt_and_tool_allow_list_impl(
     ctx: &ChannelRuntimeContext,
     session_id: Option<&SessionId>,
