@@ -199,6 +199,41 @@ pub fn all_tools_with_runtime(
     tools
 }
 
+/// Build full tool registry for a workspace: creates security from config + workspace path,
+/// derives Composio settings from config, then calls `all_tools_with_runtime`.
+/// Shared by channel runtime (start_channels and get_tools_for_agent).
+pub fn build_tools_for_workspace(
+    config: Arc<Config>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    workspace_dir: &std::path::Path,
+) -> Vec<Box<dyn Tool>> {
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        workspace_dir,
+    ));
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    all_tools_with_runtime(
+        Arc::clone(&config),
+        &security,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        workspace_dir,
+        config.as_ref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

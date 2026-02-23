@@ -43,7 +43,6 @@ use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ProviderCtx, ProviderManagerTrait};
 use crate::runtime;
-use crate::security::SecurityPolicy;
 use crate::session::{
     compaction::build_merged_system_prompt, SessionId, SessionMessage, SessionMessageRole,
     SessionStore,
@@ -160,31 +159,12 @@ impl ChannelRuntimeContext {
             default_agent_id.as_deref(),
         );
         let _ = std::fs::create_dir_all(&workspace_dir);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &self.config.autonomy,
-            &workspace_dir,
-        ));
-        let (composio_key, composio_entity_id) = if self.config.composio.enabled {
-            (
-                self.config.composio.api_key.as_deref(),
-                Some(self.config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-        let tools = tools::all_tools_with_runtime(
+        let tools = Arc::new(tools::build_tools_for_workspace(
             Arc::clone(&self.config),
-            &security,
             Arc::clone(&self.runtime),
             Arc::clone(&self.memory),
-            composio_key,
-            composio_entity_id,
-            &self.config.browser,
-            &self.config.http_request,
             &workspace_dir,
-            self.config.as_ref(),
-        );
-        let tools = Arc::new(tools);
+        ));
         self.tools_cache.lock().insert(id.to_string(), Arc::clone(&tools));
         tools
     }
@@ -1481,37 +1461,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
     let session_store = Some(Arc::new(SessionStore::new(&config.workspace_dir)?));
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::build_tools_for_workspace(
         Arc::new(config.clone()),
-        &security,
         Arc::clone(&runtime),
         Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &workspace,
-        &config,
+        workspace.as_path(),
     ));
     let mut tools_cache = std::collections::HashMap::new();
     tools_cache.insert(
