@@ -1,7 +1,8 @@
 //! Subagent tool: action-based API (spawn, send, stop) for subagent sessions.
 //!
 //! - **spawn**: create a subagent session (agent_id, optional parent_session_id for outbound).
-//! - **send**: send a message to a subagent via internal channel.
+//! - **send**: send a message **as inbound input** to a subagent session (the agent will process it).
+//!   Contrast with the sessions tool's **reply** action, which delivers to the session's outbound.
 //! - **stop**: send /stop to a subagent via internal channel.
 
 use super::traits::{Tool, ToolResult};
@@ -33,7 +34,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Subagent session control: spawn a session, send input, or stop (action: spawn | send | stop)"
+        "Subagent session control: spawn, send input to a subagent (inbound — agent processes it), or stop. Use sessions reply to send to a session's outbound (e.g. channel)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

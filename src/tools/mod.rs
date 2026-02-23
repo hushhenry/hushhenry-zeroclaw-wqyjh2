@@ -1,27 +1,17 @@
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
-pub mod cron_add;
-pub mod cron_list;
-pub mod cron_remove;
-pub mod cron_run;
-pub mod cron_runs;
-pub mod cron_update;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod http_request;
 pub mod image_info;
-pub mod memory_forget;
-pub mod memory_recall;
-pub mod memory_store;
+pub mod memory;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
-pub mod sessions_history;
-pub mod sessions_list;
-pub mod sessions_send;
+pub mod sessions;
 pub mod shell;
 mod shell_exec_runtime;
 pub mod subagent;
@@ -30,28 +20,18 @@ pub mod traits;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
-pub use cron_add::CronAddTool;
-pub use cron_list::CronListTool;
-pub use cron_remove::CronRemoveTool;
-pub use cron_run::CronRunTool;
-pub use cron_runs::CronRunsTool;
-pub use cron_update::CronUpdateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
-pub use memory_forget::MemoryForgetTool;
-pub use memory_recall::MemoryRecallTool;
-pub use memory_store::MemoryStoreTool;
+pub use memory::MemoryTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
-pub use sessions_history::SessionsHistoryTool;
-pub use sessions_list::SessionsListTool;
-pub use sessions_send::SessionsSendTool;
+pub use sessions::SessionsTool;
 pub use shell::ShellTool;
 pub use subagent::SubagentTool;
 pub use traits::Tool;
@@ -126,16 +106,9 @@ pub fn all_tools_with_runtime(
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
-        Box::new(CronAddTool::new(config.clone(), security.clone())),
-        Box::new(CronListTool::new(config.clone())),
-        Box::new(CronRemoveTool::new(config.clone())),
-        Box::new(CronUpdateTool::new(config.clone(), security.clone())),
-        Box::new(CronRunTool::new(config.clone())),
-        Box::new(CronRunsTool::new(config.clone())),
-        Box::new(MemoryStoreTool::new(memory.clone())),
-        Box::new(MemoryRecallTool::new(memory.clone())),
-        Box::new(MemoryForgetTool::new(memory)),
         Box::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Box::new(MemoryTool::new(memory)),
+        Box::new(SessionsTool::new(workspace_dir.to_path_buf())),
         Box::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -144,9 +117,6 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Box::new(SessionsListTool::new(workspace_dir.to_path_buf())),
-        Box::new(SessionsHistoryTool::new(workspace_dir.to_path_buf())),
-        Box::new(SessionsSendTool::new(workspace_dir.to_path_buf())),
         Box::new(SubagentTool::new(config)),
     ];
 
@@ -286,10 +256,9 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"memory"));
+        assert!(names.contains(&"sessions"));
         assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"sessions_list"));
-        assert!(names.contains(&"sessions_history"));
-        assert!(names.contains(&"sessions_send"));
         assert!(names.contains(&"subagent"));
     }
 
@@ -327,9 +296,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"pushover"));
-        assert!(names.contains(&"sessions_list"));
-        assert!(names.contains(&"sessions_history"));
-        assert!(names.contains(&"sessions_send"));
+        assert!(names.contains(&"sessions"));
         assert!(names.contains(&"subagent"));
     }
 

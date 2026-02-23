@@ -27,7 +27,7 @@ impl Tool for ScheduleTool {
     }
 
     fn description(&self) -> &str {
-        "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume"
+        "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume/run/runs"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -36,7 +36,7 @@ impl Tool for ScheduleTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "add", "once", "list", "get", "cancel", "remove", "pause", "resume"],
+                    "enum": ["create", "add", "once", "list", "get", "cancel", "remove", "pause", "resume", "run", "runs"],
                     "description": "Action to perform"
                 },
                 "expression": {
@@ -57,7 +57,11 @@ impl Tool for ScheduleTool {
                 },
                 "id": {
                     "type": "string",
-                    "description": "Task ID. Required for get/cancel/remove/pause/resume."
+                    "description": "Task ID. Required for get/cancel/remove/pause/resume/run/runs."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max run history entries for runs action (default: 10)."
                 },
                 "source_session_id": {
                     "type": "string",
@@ -123,11 +127,33 @@ impl Tool for ScheduleTool {
                     .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for resume action"))?;
                 Ok(self.handle_pause_resume(id, false))
             }
+            "run" => {
+                if let Some(blocked) = self.enforce_mutation_allowed(action) {
+                    return Ok(blocked);
+                }
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for run action"))?;
+                self.handle_run(id).await
+            }
+            "runs" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter for runs action"))?;
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(10);
+                Ok(self.handle_runs(id, limit))
+            }
             other => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume."
+                    "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume/run/runs."
                 )),
             }),
         }
@@ -398,12 +424,123 @@ impl ScheduleTool {
             },
         }
     }
+
+    async fn handle_run(&self, id: &str) -> Result<ToolResult> {
+        if !self.config.cron.enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+            });
+        }
+
+        let job = match cron::get_job(&self.config, id) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        let started_at = Utc::now();
+        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
+        let finished_at = Utc::now();
+        let duration_ms = (finished_at - started_at).num_milliseconds();
+        let status = if success { "ok" } else { "error" };
+
+        let _ = cron::record_run(
+            &self.config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            Some(&output),
+            duration_ms,
+        );
+        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
+
+        Ok(ToolResult {
+            success,
+            output: serde_json::to_string_pretty(&json!({
+                "job_id": job.id,
+                "status": status,
+                "duration_ms": duration_ms,
+                "output": output
+            }))?,
+            error: if success {
+                None
+            } else {
+                Some("cron job execution failed".to_string())
+            },
+        })
+    }
+
+    fn handle_runs(&self, id: &str, limit: usize) -> ToolResult {
+        if !self.config.cron.enabled {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+            };
+        }
+
+        const MAX_RUN_OUTPUT_CHARS: usize = 500;
+        fn truncate(input: &str, max_chars: usize) -> String {
+            if input.chars().count() <= max_chars {
+                return input.to_string();
+            }
+            let mut out: String = input.chars().take(max_chars).collect();
+            out.push_str("...");
+            out
+        }
+
+        match cron::list_runs(&self.config, id, limit) {
+            Ok(runs) => {
+                let views: Vec<_> = runs
+                    .into_iter()
+                    .map(|run| {
+                        json!({
+                            "id": run.id,
+                            "job_id": run.job_id,
+                            "started_at": run.started_at.to_rfc3339(),
+                            "finished_at": run.finished_at.to_rfc3339(),
+                            "status": run.status,
+                            "output": run.output.as_ref().map(|o| truncate(o, MAX_RUN_OUTPUT_CHARS)),
+                            "duration_ms": run.duration_ms
+                        })
+                    })
+                    .collect();
+                match serde_json::to_string_pretty(&views) {
+                    Ok(output) => ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    },
+                    Err(e) => ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    },
+                }
+            }
+            Err(e) => ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron;
     use crate::security::AutonomyLevel;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
@@ -558,5 +695,138 @@ mod tests {
         let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn run_action_executes_job_and_records_history() {
+        let (_tmp, config, security) = test_setup();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo run-now").unwrap();
+        let tool = ScheduleTool::new(security, config.clone());
+
+        let result = tool
+            .execute(json!({ "action": "run", "id": job.id }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("run-now"));
+        assert!(result.output.contains("ok"));
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_action_missing_id_returns_error() {
+        let (_tmp, config, security) = test_setup();
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool.execute(json!({ "action": "run" })).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id"));
+    }
+
+    #[tokio::test]
+    async fn run_action_nonexistent_job_returns_error() {
+        let (_tmp, config, security) = test_setup();
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool
+            .execute(json!({ "action": "run", "id": "missing-job-id" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn runs_action_returns_run_history() {
+        let (_tmp, config, security) = test_setup();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let finished = Utc::now();
+        let _ = cron::record_run(
+            &config,
+            &job.id,
+            started,
+            finished,
+            "ok",
+            Some("output"),
+            100,
+        );
+
+        let tool = ScheduleTool::new(security, config);
+        let result = tool
+            .execute(json!({ "action": "runs", "id": job.id, "limit": 5 }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("ok"));
+        assert!(result.output.contains("output"));
+    }
+
+    #[tokio::test]
+    async fn runs_action_missing_id_returns_error() {
+        let (_tmp, config, security) = test_setup();
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool.execute(json!({ "action": "runs" })).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id"));
+    }
+
+    #[tokio::test]
+    async fn schedule_cron_disabled_run_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+
+        let tool = ScheduleTool::new(security, config);
+        let result = tool
+            .execute(json!({ "action": "run", "id": "any" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("cron is disabled"));
+    }
+
+    #[tokio::test]
+    async fn schedule_cron_disabled_runs_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+
+        let tool = ScheduleTool::new(security, config);
+        let result = tool
+            .execute(json!({ "action": "runs", "id": "any" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("cron is disabled"));
     }
 }

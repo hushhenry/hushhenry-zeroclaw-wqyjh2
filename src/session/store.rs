@@ -743,6 +743,20 @@ impl SessionStore {
         Ok(opt.flatten())
     }
 
+    /// Returns inbound_key for a session (for deriving outbound when outbound_key is not stored).
+    pub fn get_inbound_key_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let opt: Option<String> = conn
+            .query_row(
+                "SELECT inbound_key FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query inbound_key from sessions")?;
+        Ok(opt)
+    }
+
     pub fn list_subagent_sessions(&self, limit: u32) -> Result<Vec<SubagentSession>> {
         let conn = self.conn.lock();
         let mut stmt = conn
