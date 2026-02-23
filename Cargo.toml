@@ -80,9 +80,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 cron = "0.12"
 
-# Interactive CLI prompts
+# Interactive CLI prompts (still used by quick-setup and fallbacks)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.15"
+
+# TUI for onboard interactive wizard
+crossterm = "0.28"
+ratatui = "0.28"
+
+# Optional: ZeroAI OAuth and provider config (onboard step: zeroai-proxy config)
+zeroai = { git = "https://github.com/hushhenry/zeroai", optional = true }
 
 glob = "0.3"
 
@@ -120,6 +127,8 @@ landlock = { version = "0.4", optional = true }
 
 [features]
 default = []
+# ZeroAI: OAuth and provider config (~/.zeroai). Enables zeroai-proxy config step in onboard.
+zeroai = ["dep:zeroai"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations

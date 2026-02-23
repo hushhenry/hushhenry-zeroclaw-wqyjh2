@@ -368,9 +368,9 @@ async fn main() -> Result<()> {
 
         let config = tokio::task::spawn_blocking(move || {
             if channels_only {
-                onboard::run_channels_repair_wizard()
+                onboard::run_channels_repair_tui()
             } else if interactive {
-                onboard::run_wizard()
+                onboard::run_wizard_tui()
             } else {
                 onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
             }

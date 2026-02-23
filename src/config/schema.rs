@@ -1677,6 +1677,66 @@ fn encrypt_optional_secret(
 }
 
 impl Config {
+    /// Load config from an existing file (no create). Used for re-entrant onboard.
+    fn load_from_path(
+        config_path: &Path,
+        zeroclaw_dir: &Path,
+        workspace_dir: &Path,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(config_path) {
+                if meta.permissions().mode() & 0o004 != 0 {
+                    tracing::warn!(
+                        "Config file {:?} is world-readable (mode {:o}). \
+                         Consider restricting with: chmod 600 {:?}",
+                        config_path,
+                        meta.permissions().mode() & 0o777,
+                        config_path,
+                    );
+                }
+            }
+        }
+        let contents =
+            fs::read_to_string(config_path).context("Failed to read config file")?;
+        let mut config: Config = toml::from_str(&contents).context("Failed to parse config file")?;
+        config.config_path = config_path.to_path_buf();
+        config.workspace_dir = workspace_dir.to_path_buf();
+        let store = crate::security::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
+        decrypt_optional_secret(
+            &store,
+            &mut config.composio.api_key,
+            "config.composio.api_key",
+        )?;
+        decrypt_optional_secret(
+            &store,
+            &mut config.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+        Ok(config)
+    }
+
+    /// Load config if it exists (same resolution as load_or_init). Never creates. For re-entrant onboard.
+    pub fn load_if_exists() -> Option<Self> {
+        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs().ok()?;
+        let (zeroclaw_dir, workspace_dir) = match std::env::var("ZEROCLAW_WORKSPACE") {
+            Ok(custom_workspace) if !custom_workspace.is_empty() => {
+                let workspace = PathBuf::from(custom_workspace);
+                (resolve_config_dir_for_workspace(&workspace), workspace)
+            }
+            _ => load_persisted_workspace_dirs(&default_zeroclaw_dir).ok().flatten()
+                .unwrap_or((default_zeroclaw_dir, default_workspace_dir)),
+        };
+        let config_path = zeroclaw_dir.join("config.toml");
+        if config_path.exists() {
+            Self::load_from_path(&config_path, &zeroclaw_dir, &workspace_dir).ok()
+        } else {
+            None
+        }
+    }
+
     pub fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -1699,50 +1759,13 @@ impl Config {
         fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
         if config_path.exists() {
-            // Warn if config file is world-readable (may contain API keys)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&config_path) {
-                    if meta.permissions().mode() & 0o004 != 0 {
-                        tracing::warn!(
-                            "Config file {:?} is world-readable (mode {:o}). \
-                             Consider restricting with: chmod 600 {:?}",
-                            config_path,
-                            meta.permissions().mode() & 0o777,
-                            config_path,
-                        );
-                    }
-                }
-            }
-
-            let contents =
-                fs::read_to_string(&config_path).context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
-            // Set computed paths that are skipped during serialization
-            config.config_path = config_path.clone();
-            config.workspace_dir = workspace_dir;
-            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
-            decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.composio.api_key,
-                "config.composio.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.browser.computer_use.api_key,
-                "config.browser.computer_use.api_key",
-            )?;
-
+            let mut config = Self::load_from_path(&config_path, &zeroclaw_dir, &workspace_dir)?;
             config.apply_env_overrides();
             Ok(config)
         } else {
             let mut config = Config::default();
             config.config_path = config_path.clone();
-            config.workspace_dir = workspace_dir;
+            config.workspace_dir = workspace_dir.clone();
             config.save()?;
 
             // Restrict permissions on newly created config file (may contain API keys)
