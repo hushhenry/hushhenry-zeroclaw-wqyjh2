@@ -46,7 +46,6 @@ mod doctor;
 mod gateway;
 mod health;
 mod identity;
-mod integrations;
 mod memory;
 mod migration;
 mod multi_agent;
@@ -167,12 +166,6 @@ enum Commands {
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
-    },
-
-    /// Browse 50+ integrations
-    Integrations {
-        #[command(subcommand)]
-        integration_command: IntegrationCommands,
     },
 
     /// Manage skills (user-defined capabilities)
@@ -307,15 +300,6 @@ enum SkillCommands {
     /// Remove an installed skill
     Remove {
         /// Skill name
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IntegrationCommands {
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
         name: String,
     },
 }
@@ -541,10 +525,6 @@ async fn main() -> Result<()> {
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config),
         },
-
-        Commands::Integrations {
-            integration_command,
-        } => integrations::handle_command(integration_command, &config),
 
         Commands::Skills { skill_command } => {
             skills::handle_command(skill_command, &config.workspace_dir)

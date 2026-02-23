@@ -163,9 +163,6 @@ zeroclaw channel doctor
 # Bind a Telegram identity into allowlist
 zeroclaw channel bind-telegram 123456789
 
-# Get integration setup details
-zeroclaw integrations info Telegram
-
 # Manage background service
 zeroclaw service install
 zeroclaw service status
@@ -198,7 +195,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
 | **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
-| **Integrations** | Registry | 50+ integrations across 9 categories | Plugin system |
+| **Integrations** | [docs/integrations.md](docs/integrations.md) | 50+ integrations across 9 categories | Plugin system |
 
 ### Runtime support (current)
 
@@ -594,7 +591,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `status` | Show full system status |
 | `channel doctor` | Run health checks for configured channels |
 | `channel bind-telegram <IDENTITY>` | Add one Telegram username/user ID to allowlist |
-| `integrations info <name>` | Show setup/status details for one integration |
+| *(doc)* [Integrations](docs/integrations.md) | Supported and planned integrations (chat, AI, tools, etc.) |
 
 ## Development
 

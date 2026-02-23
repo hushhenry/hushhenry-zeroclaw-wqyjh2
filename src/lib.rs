@@ -48,7 +48,6 @@ pub mod doctor;
 pub mod gateway;
 pub mod health;
 pub mod identity;
-pub mod integrations;
 pub mod memory;
 pub mod migration;
 pub mod multi_agent;
@@ -194,12 +193,3 @@ pub enum CronCommands {
     },
 }
 
-/// Integration subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IntegrationCommands {
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
-        name: String,
-    },
-}
