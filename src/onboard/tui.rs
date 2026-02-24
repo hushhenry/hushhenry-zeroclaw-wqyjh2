@@ -722,6 +722,11 @@ fn run_tui_loop(
     let mut project_focused = 0u8;
 
     loop {
+        // Zeroai-style: check OAuth result every iteration so we transition to model select as soon as login completes (no extra key press).
+        if step == Step::Provider {
+            try_oauth_done_transition(state, &mut provider_screen, &mut model_list_state);
+        }
+
         terminal.draw(|f| {
             draw(
                 f,
@@ -872,22 +877,15 @@ fn run_tui_loop(
     }
 }
 
-fn handle_provider_step(
-    key: crossterm::event::KeyEvent,
+/// Zeroai-style: check OAuth result and transition to model select when login completes. Call every loop iteration so no extra key press is needed.
+fn try_oauth_done_transition(
     state: &mut WizardState,
-    step: &mut Step,
     provider_screen: &mut ProviderScreen,
-    providers: &[ProviderInfo],
-    provider_list_state: &mut ListState,
     model_list_state: &mut ListState,
 ) {
-    use crossterm::event::KeyCode;
-
-    // If we're in OAuth and result just arrived, handle it once
-    let oauth_done_result = if let ProviderScreen::OAuth {
+    let (done, error_msg) = if let ProviderScreen::OAuth {
         provider_id,
         oauth_result,
-        error,
         ..
     } = provider_screen
     {
@@ -901,35 +899,51 @@ fn handle_provider_step(
         match taken {
             Some(Ok(creds)) => {
                 let pid = provider_id.clone();
-                if let Err(e) = save_oauth_credentials(&state.config_path, &pid, &creds) {
-                    *error = Some(e.to_string());
-                    None
-                } else if let Some(provider) = oauth_provider_for_id(&pid) {
-                    state.api_key = provider.get_api_key(&creds);
-                    state.dirty.provider = true;
-                    let models = curated_models_for_provider(&state.provider);
-                    let idx = models
-                        .iter()
-                        .position(|(id, _)| id == &state.model)
-                        .unwrap_or(0);
-                    model_list_state.select(Some(idx));
-                    Some(())
-                } else {
-                    None
+                match save_oauth_credentials(&state.config_path, &pid, &creds) {
+                    Err(e) => (false, Some(e.to_string())),
+                    Ok(()) => {
+                        if let Some(provider) = oauth_provider_for_id(&pid) {
+                            state.api_key = provider.get_api_key(&creds);
+                            state.dirty.provider = true;
+                            let models = curated_models_for_provider(&state.provider);
+                            let idx = models
+                                .iter()
+                                .position(|(id, _)| id == &state.model)
+                                .unwrap_or(0);
+                            model_list_state.select(Some(idx));
+                            (true, None)
+                        } else {
+                            (false, None)
+                        }
+                    }
                 }
             }
-            Some(Err(e)) => {
-                *error = Some(e.to_string());
-                None
-            }
-            None => None,
+            Some(Err(e)) => (false, Some(e.to_string())),
+            None => (false, None),
         }
     } else {
-        None
+        return;
     };
-    if oauth_done_result.is_some() {
+    if let Some(msg) = error_msg {
+        if let ProviderScreen::OAuth { error, .. } = provider_screen {
+            *error = Some(msg);
+        }
+    }
+    if done {
         *provider_screen = ProviderScreen::ModelSelect;
     }
+}
+
+fn handle_provider_step(
+    key: crossterm::event::KeyEvent,
+    state: &mut WizardState,
+    step: &mut Step,
+    provider_screen: &mut ProviderScreen,
+    providers: &[ProviderInfo],
+    provider_list_state: &mut ListState,
+    model_list_state: &mut ListState,
+) {
+    use crossterm::event::KeyCode;
 
     match provider_screen {
         ProviderScreen::List => match key.code {
