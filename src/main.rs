@@ -49,6 +49,7 @@ mod health;
 mod memory;
 mod multi_agent;
 mod observability;
+mod oauth;
 mod onboard;
 mod providers;
 mod runtime;

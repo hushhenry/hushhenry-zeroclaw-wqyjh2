@@ -271,7 +271,8 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
 
-fn default_model_for_provider(provider: &str) -> String {
+/// Default model for a provider (used by onboard TUI and quick setup).
+pub fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
@@ -283,6 +284,41 @@ fn default_model_for_provider(provider: &str) -> String {
         "deepseek" => "deepseek-chat".into(),
         "gemini" => "gemini-2.5-pro".into(),
         _ => "anthropic/claude-sonnet-4.5".into(),
+    }
+}
+
+/// Curated (model_id, display_name) list for onboard TUI model selection. Falls back to default if unknown provider.
+pub fn curated_models_for_provider(provider: &str) -> Vec<(String, String)> {
+    let canon = canonical_provider_name(provider);
+    match canon {
+        "openrouter" => vec![
+            ("anthropic/claude-sonnet-4.6".into(), "Claude Sonnet 4.6 (recommended)".into()),
+            ("openai/gpt-5.2".into(), "GPT-5.2".into()),
+            ("google/gemini-2.5-pro".into(), "Gemini 2.5 Pro".into()),
+            ("deepseek/deepseek-chat".into(), "DeepSeek Chat".into()),
+        ],
+        "anthropic" => vec![
+            ("claude-sonnet-4-5-20250929".into(), "Claude Sonnet 4.5 (recommended)".into()),
+            ("claude-opus-4-6".into(), "Claude Opus 4.6".into()),
+            ("claude-haiku-4-5-20251001".into(), "Claude Haiku 4.5".into()),
+        ],
+        "openai" => vec![
+            ("gpt-5.2".into(), "GPT-5.2".into()),
+            ("gpt-5-mini".into(), "GPT-5 mini".into()),
+        ],
+        "ollama" => vec![
+            ("llama3.2".into(), "Llama 3.2".into()),
+            ("mistral".into(), "Mistral 7B".into()),
+            ("codellama".into(), "Code Llama".into()),
+        ],
+        "gemini" => vec![
+            ("gemini-2.5-pro".into(), "Gemini 2.5 Pro".into()),
+            ("gemini-2.5-flash".into(), "Gemini 2.5 Flash".into()),
+        ],
+        _ => {
+            let default = default_model_for_provider(provider);
+            vec![(default.clone(), format!("{} (default)", default))]
+        }
     }
 }
 

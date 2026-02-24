@@ -50,6 +50,7 @@ pub mod health;
 pub mod memory;
 pub mod multi_agent;
 pub mod observability;
+pub mod oauth;
 pub mod onboard;
 pub mod providers;
 pub mod runtime;
