@@ -17,7 +17,7 @@ pub use provider_manager::{ProviderCtx, ProviderManager, ProviderManagerTrait};
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, TokenUsage, ToolCall,
     ToolResultMessage,
 };
 

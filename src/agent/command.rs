@@ -7,6 +7,7 @@ use crate::channels::{
 };
 use crate::multi_agent;
 use crate::session::SessionId;
+use chrono::{Datelike, NaiveDate, Utc};
 use std::fmt::Write;
 
 const COMMAND_LIST_LIMIT: u32 = 20;
@@ -34,6 +35,13 @@ pub enum SlashCommand {
     Models,
     Model {
         provider_model: String,
+    },
+    /// Usage/cost query: /usage [summary|daily|monthly] [args]. Default summary.
+    Usage {
+        /// summary | daily | monthly
+        dimension: String,
+        /// For daily: one optional YYYY-MM-DD. For monthly: optional year, optional month (1-12).
+        args: Vec<String>,
     },
 }
 
@@ -104,6 +112,19 @@ pub fn parse_slash_command(content: &str) -> Option<SlashCommand> {
         "/model" => Some(SlashCommand::Model {
             provider_model: parts.next().map(str::trim).unwrap_or_default().to_string(),
         }),
+        "/usage" => {
+            let dimension = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("session")
+                .to_lowercase();
+            let args: Vec<String> = parts
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(SlashCommand::Usage { dimension, args })
+        }
         _ => None,
     }
 }
@@ -132,6 +153,75 @@ async fn dispatch_reply(msg: &ChannelMessage, content: String) {
 /// Short display form of a session id (first 8 chars).
 pub(crate) fn short_session_id(session_id: &SessionId) -> String {
     session_id.as_str().chars().take(8).collect::<String>()
+}
+
+/// Build usage/cost reply for /usage slash command. Dimension: session | summary | daily | monthly.
+fn format_usage_reply(
+    tracker: &crate::cost::CostTracker,
+    dimension: &str,
+    args: Vec<String>,
+) -> Result<String, String> {
+    match dimension {
+        "session" => {
+            let summary = tracker.get_summary().map_err(|e| e.to_string())?;
+            let mut text = String::new();
+            let _ = writeln!(text, "Session cost: ${:.4}", summary.session_cost_usd);
+            let _ = writeln!(text, "Tokens: {} ({} requests)", summary.total_tokens, summary.request_count);
+            if !summary.by_model.is_empty() {
+                for (model, stats) in &summary.by_model {
+                    let _ = writeln!(text, "  {}  ${:.4}  {} tokens", model, stats.cost_usd, stats.total_tokens);
+                }
+            }
+            Ok(text.trim().to_string())
+        }
+        "summary" => {
+            let summary = tracker.get_summary().map_err(|e| e.to_string())?;
+            let mut text = String::new();
+            let _ = writeln!(text, "Cost (UTC) — Session ${:.4} · Daily ${:.4} · Monthly ${:.4}", summary.session_cost_usd, summary.daily_cost_usd, summary.monthly_cost_usd);
+            let _ = writeln!(text, "Tokens: {} ({} requests)", summary.total_tokens, summary.request_count);
+            if !summary.by_model.is_empty() {
+                for (model, stats) in &summary.by_model {
+                    let _ = writeln!(text, "  {}  ${:.4}  {} tokens", model, stats.cost_usd, stats.total_tokens);
+                }
+            }
+            Ok(text.trim().to_string())
+        }
+        "daily" => {
+            let day = match args.first().map(String::as_str) {
+                None => Utc::now().date_naive(),
+                Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| format!("Invalid date (use YYYY-MM-DD): {s}"))?,
+            };
+            let cost = tracker.get_daily_cost(day).map_err(|e| e.to_string())?;
+            Ok(format!("Daily cost (UTC) {}: ${:.4}", day, cost))
+        }
+        "monthly" => {
+            let (y, m) = match (args.get(0), args.get(1)) {
+                (None, None) => {
+                    let now = Utc::now();
+                    (now.year(), now.month())
+                }
+                (Some(yr), Some(mo)) => {
+                    let y: i32 = yr.parse().map_err(|_| format!("Invalid year: {yr}"))?;
+                    let m: u32 = mo.parse().map_err(|_| format!("Invalid month: {mo}"))?;
+                    if !(1..=12).contains(&m) {
+                        return Err(format!("Month must be 1–12, got {m}"));
+                    }
+                    (y, m)
+                }
+                (Some(yr), None) => (yr.parse().map_err(|_| format!("Invalid year: {yr}"))?, Utc::now().month()),
+                (None, Some(mo)) => {
+                    let m: u32 = mo.parse().map_err(|_| format!("Invalid month: {mo}"))?;
+                    if !(1..=12).contains(&m) {
+                        return Err(format!("Month must be 1–12, got {m}"));
+                    }
+                    (Utc::now().year(), m)
+                }
+            };
+            let cost = tracker.get_monthly_cost(y, m).map_err(|e| e.to_string())?;
+            Ok(format!("Monthly cost (UTC) {y}-{m:02}: ${cost:.4}"))
+        }
+        _ => Err(format!("Unknown dimension: {dimension}. Use: session, summary, daily, monthly")),
+    }
 }
 
 /// Handles a parsed slash command in the context of a channel message. Only processes
@@ -234,6 +324,19 @@ pub(crate) async fn handle_slash_command(
                 }
             }
         }
+        SlashCommand::Usage { dimension, args } => {
+            let reply = match ctx.cost_tracker.as_ref() {
+                None => "Cost tracking is disabled.".to_string(),
+                Some(tracker) => match format_usage_reply(tracker, &dimension, args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Usage command error: {e}");
+                        format!("⚠️ Usage: {e}")
+                    }
+                },
+            };
+            dispatch_reply(&msg, reply).await;
+        }
     }
 
     true
@@ -290,6 +393,34 @@ mod tests {
                 provider_model: "openrouter/anthropic/claude-sonnet-4".to_string()
             })
         );
+        assert_eq!(
+            parse_slash_command("/usage"),
+            Some(SlashCommand::Usage {
+                dimension: "session".to_string(),
+                args: vec![],
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/usage summary"),
+            Some(SlashCommand::Usage {
+                dimension: "summary".to_string(),
+                args: vec![],
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/usage daily 2025-02-23"),
+            Some(SlashCommand::Usage {
+                dimension: "daily".to_string(),
+                args: vec!["2025-02-23".to_string()],
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/usage monthly 2025 2"),
+            Some(SlashCommand::Usage {
+                dimension: "monthly".to_string(),
+                args: vec!["2025".to_string(), "2".to_string()],
+            })
+        );
     }
 
     #[test]
@@ -313,5 +444,13 @@ mod tests {
         assert_eq!(parse_slash_command("/new-session"), None);
         assert_eq!(parse_slash_command("/sessionss"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
+    }
+
+    #[test]
+    fn is_agent_command_returns_false_for_usage() {
+        assert!(!is_agent_command(&SlashCommand::Usage {
+            dimension: "session".to_string(),
+            args: vec![],
+        }));
     }
 }

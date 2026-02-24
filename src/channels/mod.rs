@@ -126,6 +126,8 @@ pub(crate) struct ChannelRuntimeContext {
     /// Per-agent tool cache: agent_id -> tools (with that agent's workspace SecurityPolicy).
     pub(crate) tools_cache:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>,
+    /// Cost tracker when config.cost.enabled; used to record token usage per LLM call.
+    pub(crate) cost_tracker: Option<Arc<crate::cost::CostTracker>>,
 }
 
 impl ChannelRuntimeContext {
@@ -1672,6 +1674,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Arc::clone(&channels_by_name),
     ));
 
+    let cost_tracker = if config.cost.enabled {
+        match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider_manager: Arc::clone(&provider_manager),
@@ -1686,6 +1700,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         all_skills: Arc::new(skills),
         runtime,
         tools_cache,
+        cost_tracker,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1827,6 +1842,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(format!("echo: {message}")),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
@@ -1854,6 +1870,7 @@ mod tests {
                         "BTC is currently around $65,000 based on latest tool output.".to_string(),
                     ),
                     tool_calls: vec![],
+                    usage: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -1863,6 +1880,7 @@ mod tests {
                         name: "mock_price".to_string(),
                         arguments: r#"{"symbol":"BTC"}"#.to_string(),
                     }],
+                    usage: None,
                 })
             }
         }
@@ -1889,6 +1907,7 @@ mod tests {
                 Ok(ChatResponse {
                     text: Some("BTC alias-tag flow resolved to final text output.".to_string()),
                     tool_calls: vec![],
+                    usage: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -1898,6 +1917,7 @@ mod tests {
                         name: "mock_price".to_string(),
                         arguments: r#"{"symbol":"BTC"}"#.to_string(),
                     }],
+                    usage: None,
                 })
             }
         }
@@ -2011,6 +2031,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         })
     }
 
@@ -2267,6 +2288,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
@@ -2312,6 +2334,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
@@ -2371,6 +2394,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let (_tx, _handle) = start_outbound_loop_for_test(&runtime_ctx);
@@ -2545,6 +2569,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some("ok".to_string()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
@@ -2598,26 +2623,31 @@ mod tests {
                         name: "mock_price".to_string(),
                         arguments: r#"{"symbol":"BTC"}"#.to_string(),
                     }],
+                    usage: None,
                 })
             } else if last_user.contains("<messages>") {
                 Ok(ChatResponse {
                     text: Some("reply to steer merge".to_string()),
                     tool_calls: vec![],
+                    usage: None,
                 })
             } else if has_tool_results {
                 Ok(ChatResponse {
                     text: Some("reply to tool results".to_string()),
                     tool_calls: vec![],
+                    usage: None,
                 })
             } else if last_user.contains("trigger tool") {
                 Ok(ChatResponse {
                     text: Some("reply to trigger tool".to_string()),
                     tool_calls: vec![],
+                    usage: None,
                 })
             } else {
                 Ok(ChatResponse {
                     text: Some("reply to new priority".to_string()),
                     tool_calls: vec![],
+                    usage: None,
                 })
             }
         }
@@ -2652,6 +2682,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2739,6 +2770,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2822,6 +2854,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let msg1 = traits::ChannelMessage {
@@ -2930,6 +2963,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -3032,6 +3066,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         process_channel_message(runtime_ctx, msg).await;
@@ -3086,6 +3121,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         process_channel_message(
@@ -3141,6 +3177,7 @@ mod tests {
             all_skills: Arc::new(vec![]),
             runtime: Arc::from(runtime::native::NativeRuntime::new()),
             tools_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cost_tracker: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

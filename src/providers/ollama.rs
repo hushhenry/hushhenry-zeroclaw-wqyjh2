@@ -1,7 +1,7 @@
 use crate::providers::prompt_guided;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -74,6 +74,12 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+    /// Token count for prompt (Ollama API).
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    /// Token count for completion (Ollama API).
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +407,15 @@ impl OllamaProvider {
     }
 }
 
+fn ollama_usage_from_response(response: &ApiChatResponse) -> Option<TokenUsage> {
+    let prompt = response.prompt_eval_count.unwrap_or(0);
+    let completion = response.eval_count.unwrap_or(0);
+    (prompt > 0 || completion > 0).then_some(TokenUsage {
+        input_tokens: Some(prompt),
+        output_tokens: Some(completion),
+    })
+}
+
 #[async_trait]
 impl Provider for OllamaProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
@@ -452,6 +467,7 @@ impl Provider for OllamaProvider {
             )
             .await?;
 
+        let usage = ollama_usage_from_response(&response);
         let raw_content = response.message.content;
         let (text, tool_calls) = prompt_guided::parse_tool_calls_from_text(&raw_content);
 
@@ -459,6 +475,7 @@ impl Provider for OllamaProvider {
             return Ok(ProviderChatResponse {
                 text: if text.is_empty() { None } else { Some(text) },
                 tool_calls,
+                usage,
             });
         }
 
@@ -474,6 +491,7 @@ impl Provider for OllamaProvider {
                         if thinking.len() > 200 { &thinking[..200] } else { thinking }
                     )),
                     tool_calls: vec![],
+                    usage,
                 });
             }
             tracing::warn!("Ollama returned empty content");
@@ -482,6 +500,7 @@ impl Provider for OllamaProvider {
         Ok(ProviderChatResponse {
             text: Some(if text.is_empty() { raw_content } else { text }),
             tool_calls: vec![],
+            usage,
         })
     }
 

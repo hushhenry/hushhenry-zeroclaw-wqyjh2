@@ -286,6 +286,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(self.response.to_string()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
@@ -314,6 +315,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(self.response.to_string()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }

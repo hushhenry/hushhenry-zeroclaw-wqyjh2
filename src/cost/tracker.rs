@@ -3,9 +3,10 @@ use crate::config::schema::CostConfig;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
+use rusqlite::params;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -176,32 +177,10 @@ impl CostTracker {
 }
 
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
-    let storage_path = workspace_dir.join("state").join("costs.jsonl");
-    let legacy_path = workspace_dir.join(".zeroclaw").join("costs.db");
-
-    if !storage_path.exists() && legacy_path.exists() {
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-        }
-
-        if let Err(error) = fs::rename(&legacy_path, &storage_path) {
-            tracing::warn!(
-                "Failed to move legacy cost storage from {} to {}: {error}; falling back to copy",
-                legacy_path.display(),
-                storage_path.display()
-            );
-            fs::copy(&legacy_path, &storage_path).with_context(|| {
-                format!(
-                    "Failed to copy legacy cost storage from {} to {}",
-                    legacy_path.display(),
-                    storage_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(storage_path)
+    let state_dir = workspace_dir.join("state");
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("Failed to create directory {}", state_dir.display()))?;
+    Ok(state_dir.join("costs.db"))
 }
 
 fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, ModelStats> {
@@ -225,178 +204,148 @@ fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, Mo
     by_model
 }
 
-/// Persistent storage for cost records.
+/// SQLite schema for cost_records.
+const COST_RECORDS_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS cost_records (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        total_tokens INTEGER NOT NULL,
+        cost_usd REAL NOT NULL,
+        timestamp TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cost_records_timestamp ON cost_records(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_cost_records_date ON cost_records(date(timestamp));
+";
+
+/// Persistent storage for cost records (SQLite).
 struct CostStorage {
     path: PathBuf,
-    daily_cost_usd: f64,
-    monthly_cost_usd: f64,
-    cached_day: NaiveDate,
-    cached_year: i32,
-    cached_month: u32,
 }
 
 impl CostStorage {
-    /// Create or open cost storage.
+    fn open_conn(&self) -> Result<rusqlite::Connection> {
+        rusqlite::Connection::open(&self.path)
+            .with_context(|| format!("Failed to open cost database at {}", self.path.display()))
+    }
+
+    /// Create or open SQLite cost storage. Migrates from JSONL if present.
     fn new(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        let path = path.to_path_buf();
+        let conn = rusqlite::Connection::open(&path)
+            .with_context(|| format!("Failed to open cost database at {}", path.display()))?;
+        conn.execute_batch(COST_RECORDS_SCHEMA)
+            .with_context(|| "Failed to create cost_records schema")?;
+        drop(conn);
+
+        let storage = Self { path };
+
+        // Migrate from legacy costs.jsonl if it exists (same directory, previous default).
+        let jsonl_path = storage
+            .path
+            .parent()
+            .map(|p| p.join("costs.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("costs.jsonl"));
+        if jsonl_path.exists() {
+            storage.migrate_from_jsonl(&jsonl_path)?;
         }
-
-        let now = Utc::now();
-        let mut storage = Self {
-            path: path.to_path_buf(),
-            daily_cost_usd: 0.0,
-            monthly_cost_usd: 0.0,
-            cached_day: now.date_naive(),
-            cached_year: now.year(),
-            cached_month: now.month(),
-        };
-
-        storage.rebuild_aggregates(
-            storage.cached_day,
-            storage.cached_year,
-            storage.cached_month,
-        )?;
 
         Ok(storage)
     }
 
-    fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
-    where
-        F: FnMut(CostRecord),
-    {
-        if !self.path.exists() {
-            return Ok(());
-        }
-
-        let file = File::open(&self.path)
-            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+    fn migrate_from_jsonl(&self, jsonl_path: &Path) -> Result<()> {
+        let file = File::open(jsonl_path)
+            .with_context(|| format!("Failed to open legacy cost file {}", jsonl_path.display()))?;
         let reader = BufReader::new(file);
-
-        for (line_number, line) in reader.lines().enumerate() {
-            let raw_line = line.with_context(|| {
-                format!(
-                    "Failed to read line {} from cost storage {}",
-                    line_number + 1,
-                    self.path.display()
-                )
-            })?;
-
-            let trimmed = raw_line.trim();
+        let mut migrated = 0u64;
+        for line in reader.lines() {
+            let raw = line.with_context(|| "Failed to read legacy cost line")?;
+            let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
-
-            match serde_json::from_str::<CostRecord>(trimmed) {
-                Ok(record) => on_record(record),
-                Err(error) => {
-                    tracing::warn!(
-                        "Skipping malformed cost record at {}:{}: {error}",
-                        self.path.display(),
-                        line_number + 1
-                    );
-                }
+            if let Ok(record) = serde_json::from_str::<CostRecord>(trimmed) {
+                self.insert_record(&record)?;
+                migrated += 1;
             }
         }
-
+        if migrated > 0 {
+            fs::remove_file(jsonl_path).unwrap_or_else(|e| {
+                tracing::warn!("Could not remove legacy costs.jsonl after migration: {e}");
+            });
+            tracing::info!("Migrated {migrated} cost records from JSONL to SQLite");
+        }
         Ok(())
     }
 
-    fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
-        let mut daily_cost = 0.0;
-        let mut monthly_cost = 0.0;
-
-        self.for_each_record(|record| {
-            let timestamp = record.usage.timestamp.naive_utc();
-
-            if timestamp.date() == day {
-                daily_cost += record.usage.cost_usd;
-            }
-
-            if timestamp.year() == year && timestamp.month() == month {
-                monthly_cost += record.usage.cost_usd;
-            }
-        })?;
-
-        self.daily_cost_usd = daily_cost;
-        self.monthly_cost_usd = monthly_cost;
-        self.cached_day = day;
-        self.cached_year = year;
-        self.cached_month = month;
-
-        Ok(())
-    }
-
-    fn ensure_period_cache_current(&mut self) -> Result<()> {
-        let now = Utc::now();
-        let day = now.date_naive();
-        let year = now.year();
-        let month = now.month();
-
-        if day != self.cached_day || year != self.cached_year || month != self.cached_month {
-            self.rebuild_aggregates(day, year, month)?;
-        }
-
+    fn insert_record(&self, record: &CostRecord) -> Result<()> {
+        let conn = self.open_conn()?;
+        let ts = record.usage.timestamp.to_rfc3339();
+        conn.execute(
+            "INSERT INTO cost_records (id, session_id, model, input_tokens, output_tokens, total_tokens, cost_usd, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.id,
+                record.session_id,
+                record.usage.model,
+                record.usage.input_tokens as i64,
+                record.usage.output_tokens as i64,
+                record.usage.total_tokens as i64,
+                record.usage.cost_usd,
+                ts,
+            ],
+        )
+        .with_context(|| "Failed to insert cost record")?;
         Ok(())
     }
 
     /// Add a new record.
     fn add_record(&mut self, record: CostRecord) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("Failed to open cost storage at {}", self.path.display()))?;
-
-        writeln!(file, "{}", serde_json::to_string(&record)?)
-            .with_context(|| format!("Failed to write cost record to {}", self.path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
-
-        self.ensure_period_cache_current()?;
-
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
-            self.daily_cost_usd += record.usage.cost_usd;
-        }
-        if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
-            self.monthly_cost_usd += record.usage.cost_usd;
-        }
-
-        Ok(())
+        self.insert_record(&record)
     }
 
-    /// Get aggregated costs for current day and month.
+    /// Get aggregated costs for current day and month (UTC).
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
-        self.ensure_period_cache_current()?;
-        Ok((self.daily_cost_usd, self.monthly_cost_usd))
+        let conn = self.open_conn()?;
+        let now = Utc::now();
+        let today = now.date_naive().format("%Y-%m-%d").to_string();
+        let year_month = (now.year(), now.month());
+
+        let daily: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records WHERE date(timestamp) = ?1",
+            params![&today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+        let monthly: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records WHERE strftime('%Y', timestamp) = ?1 AND strftime('%m', timestamp) = ?2",
+            params![year_month.0.to_string(), format!("{:02}", year_month.1)],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+        Ok((daily, monthly))
     }
 
     /// Get cost for a specific date.
     fn get_cost_for_date(&self, date: NaiveDate) -> Result<f64> {
-        let mut cost = 0.0;
-
-        self.for_each_record(|record| {
-            if record.usage.timestamp.naive_utc().date() == date {
-                cost += record.usage.cost_usd;
-            }
-        })?;
-
+        let conn = self.open_conn()?;
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let cost: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records WHERE date(timestamp) = ?1",
+            params![date_str],
+            |row| row.get(0),
+        ).with_context(|| format!("Failed to get cost for date {date_str}"))?;
         Ok(cost)
     }
 
     /// Get cost for a specific month.
     fn get_cost_for_month(&self, year: i32, month: u32) -> Result<f64> {
-        let mut cost = 0.0;
-
-        self.for_each_record(|record| {
-            let timestamp = record.usage.timestamp.naive_utc();
-            if timestamp.year() == year && timestamp.month() == month {
-                cost += record.usage.cost_usd;
-            }
-        })?;
-
+        let conn = self.open_conn()?;
+        let cost: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records WHERE strftime('%Y', timestamp) = ?1 AND strftime('%m', timestamp) = ?2",
+            params![year.to_string(), format!("{:02}", month)],
+            |row| row.get(0),
+        ).with_context(|| format!("Failed to get cost for {year}-{month:02}"))?;
         Ok(cost)
     }
 }
@@ -404,6 +353,8 @@ impl CostStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
@@ -469,10 +420,9 @@ mod tests {
     #[test]
     fn summary_by_model_is_session_scoped() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let jsonl_path = state_dir.join("costs.jsonl");
 
         let old_record = CostRecord::new(
             "old-session",
@@ -481,7 +431,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(storage_path)
+            .open(&jsonl_path)
             .unwrap();
         writeln!(file, "{}", serde_json::to_string(&old_record).unwrap()).unwrap();
         file.sync_all().unwrap();
@@ -500,10 +450,9 @@ mod tests {
     #[test]
     fn malformed_lines_are_ignored_while_loading() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let jsonl_path = state_dir.join("costs.jsonl");
 
         let valid_usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
         let valid_record = CostRecord::new("session-a", valid_usage.clone());
@@ -511,7 +460,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(storage_path)
+            .open(&jsonl_path)
             .unwrap();
         writeln!(file, "{}", serde_json::to_string(&valid_record).unwrap()).unwrap();
         writeln!(file, "not-a-json-line").unwrap();

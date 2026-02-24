@@ -724,6 +724,31 @@ impl Agent {
                 }
             };
 
+            if let Some(ref tracker) = self.ctx.cost_tracker {
+                if let Some(ref usage) = resp.usage {
+                    let input_tokens = usage.input_tokens.unwrap_or(0);
+                    let output_tokens = usage.output_tokens.unwrap_or(0);
+                    let (input_price, output_price) = self
+                        .ctx
+                        .config
+                        .cost
+                        .prices
+                        .get(provider_ctx.model.as_str())
+                        .map(|p| (p.input, p.output))
+                        .unwrap_or((0.0, 0.0));
+                    let cost_usage = crate::cost::TokenUsage::new(
+                        provider_ctx.model.clone(),
+                        input_tokens,
+                        output_tokens,
+                        input_price,
+                        output_price,
+                    );
+                    if let Err(e) = tracker.record_usage(cost_usage) {
+                        tracing::warn!(session_id = %session_id.as_str(), "Cost record_usage failed: {e}");
+                    }
+                }
+            }
+
             let text = resp.text_or_empty().to_string();
             let tool_calls = resp.tool_calls;
 

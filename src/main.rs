@@ -40,6 +40,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod agent;
 mod channels;
 mod config;
+mod cost;
 mod cron;
 mod daemon;
 mod doctor;

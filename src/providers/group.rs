@@ -138,6 +138,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some(text.to_string()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }

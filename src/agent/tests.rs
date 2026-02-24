@@ -84,6 +84,7 @@ impl Provider for ScriptedProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                usage: None,
             });
         }
         Ok(guard.remove(0))
@@ -283,6 +284,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
+        usage: None,
     }
 }
 
@@ -291,6 +293,7 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
+        usage: None,
     }
 }
 
@@ -486,6 +489,7 @@ async fn turn_handles_empty_text_response() {
     let provider = Arc::new(ScriptedProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
+        usage: None,
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
     let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools)
@@ -499,6 +503,7 @@ async fn turn_handles_none_text_response() {
     let provider = Arc::new(ScriptedProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
+        usage: None,
     }]));
     let tools: Vec<Box<dyn Tool>> = vec![];
     let (response, _) = run_turn(&provider_ctx(provider), "hi", &tools)
@@ -521,6 +526,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
                 name: "echo".into(),
                 arguments: r#"{"message": "hi"}"#.into(),
             }],
+            usage: None,
         },
         text_response("Here are the results"),
     ]));

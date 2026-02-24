@@ -9,6 +9,7 @@
 
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::{Config, ProviderCredentialsStore};
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -186,6 +187,10 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Cost tracker when config.cost.enabled (webhook path).
+    pub cost_tracker: Option<Arc<CostTracker>>,
+    /// Cost config for resolving model pricing when recording webhook usage.
+    pub cost_config: crate::config::CostConfig,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -274,6 +279,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    let cost_tracker = if config.cost.enabled {
+        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -324,6 +341,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        cost_tracker,
+        cost_config: config.cost.clone(),
     };
 
     // Build router with middleware
@@ -512,8 +531,30 @@ async fn handle_webhook(
         .await
     {
         Ok(response) => {
-            let response = response.text_or_empty().to_string();
-            let body = serde_json::json!({"response": response, "model": state.model});
+            if let Some(ref tracker) = state.cost_tracker {
+                if let Some(ref usage) = response.usage {
+                    let input_tokens = usage.input_tokens.unwrap_or(0);
+                    let output_tokens = usage.output_tokens.unwrap_or(0);
+                    let (input_price, output_price) = state
+                        .cost_config
+                        .prices
+                        .get(state.model.as_str())
+                        .map(|p| (p.input, p.output))
+                        .unwrap_or((0.0, 0.0));
+                    let cost_usage = crate::cost::TokenUsage::new(
+                        state.model.clone(),
+                        input_tokens,
+                        output_tokens,
+                        input_price,
+                        output_price,
+                    );
+                    if let Err(e) = tracker.record_usage(cost_usage) {
+                        tracing::warn!("Webhook cost record_usage failed: {e}");
+                    }
+                }
+            }
+            let response_text = response.text_or_empty().to_string();
+            let body = serde_json::json!({"response": response_text, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -903,6 +944,7 @@ mod tests {
             Ok(crate::providers::ChatResponse {
                 text: Some("ok".into()),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
@@ -982,6 +1024,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            cost_tracker: None,
+            cost_config: crate::config::CostConfig::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -1030,6 +1074,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            cost_tracker: None,
+            cost_config: crate::config::CostConfig::default(),
         };
 
         let headers = HeaderMap::new();
@@ -1087,6 +1133,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            cost_tracker: None,
+            cost_config: crate::config::CostConfig::default(),
         };
 
         let response = handle_webhook(
@@ -1121,6 +1169,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            cost_tracker: None,
+            cost_config: crate::config::CostConfig::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -1158,6 +1208,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            cost_tracker: None,
+            cost_config: crate::config::CostConfig::default(),
         };
 
         let mut headers = HeaderMap::new();

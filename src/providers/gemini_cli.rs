@@ -4,7 +4,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -108,9 +108,20 @@ struct GenerationConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UsageMetadata {
+    prompt_token_count: Option<u64>,
+    candidates_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
+    total_token_count: Option<u64>,
+    cached_content_token_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
+    usage_metadata: Option<UsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +149,19 @@ struct FunctionCallResponse {
 #[derive(Debug, Deserialize)]
 struct ApiError {
     message: String,
+}
+
+/// Map Gemini CLI (Cloud Code Assist) usage_metadata to provider TokenUsage.
+fn gemini_cli_usage_from_metadata(um: &UsageMetadata) -> Option<TokenUsage> {
+    let prompt = um.prompt_token_count.unwrap_or(0);
+    let cached = um.cached_content_token_count.unwrap_or(0);
+    let input_tokens = prompt.saturating_sub(cached);
+    let output_tokens = um.candidates_token_count.unwrap_or(0)
+        .saturating_add(um.thoughts_token_count.unwrap_or(0));
+    (input_tokens > 0 || output_tokens > 0).then_some(TokenUsage {
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+    })
 }
 
 impl GeminiCliProvider {
@@ -405,6 +429,12 @@ impl Provider for GeminiCliProvider {
             }
         }
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        let usage = result.usage_metadata.as_ref().and_then(gemini_cli_usage_from_metadata);
+
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            usage,
+        })
     }
 }

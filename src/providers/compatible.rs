@@ -4,7 +4,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamResult, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -216,6 +216,16 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +665,11 @@ impl OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse {
+            text,
+            tool_calls,
+            usage: None,
+        }
     }
 }
 
@@ -718,6 +732,7 @@ impl Provider for OpenAiCompatibleProvider {
                     return Ok(ProviderChatResponse {
                         text: Some(text),
                         tool_calls: vec![],
+                        usage: None,
                     });
                 }
             }
@@ -732,7 +747,12 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = chat_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {

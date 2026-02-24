@@ -159,6 +159,7 @@ impl Provider for CodexProvider {
         Ok(ProviderChatResponse {
             text: Some(text),
             tool_calls: vec![],
+            usage: None,
         })
     }
 }
