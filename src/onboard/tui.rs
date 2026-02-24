@@ -1425,7 +1425,20 @@ fn draw(
                         .ok()
                         .and_then(|g| g.as_ref().and_then(|i| i.instructions.clone()))
                         .unwrap_or_else(|| "Connecting...".into());
-                    let mut lines = vec![
+                    // Match zeroai: instructions + URL outside the box (no border), URL on one line so it stays clickable.
+                    let mut oauth_constraints = vec![
+                        Constraint::Length(4),
+                        Constraint::Min(4),
+                    ];
+                    if auth_url.is_some() {
+                        oauth_constraints.insert(1, Constraint::Length(1));
+                    }
+                    let oauth_chunks = Layout::default()
+                        .direction(ratatui::layout::Direction::Vertical)
+                        .constraints(oauth_constraints)
+                        .split(chunks[1]);
+                    let mut idx = 0;
+                    let mut instructions_content = vec![
                         Line::from(Span::styled(
                             "OAuth — complete in browser, then paste code or URL below.",
                             Style::default().fg(COLOR_CYAN),
@@ -1433,34 +1446,48 @@ fn draw(
                         Line::from(""),
                         Line::from(hint.as_str()),
                     ];
-                    if let Some(ref url) = auth_url {
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(Span::styled(
-                            "URL (copy if needed):",
-                            Style::default().fg(COLOR_YELLOW),
+                    if auth_url.is_some() {
+                        instructions_content.push(Line::from(""));
+                        instructions_content.push(Line::from(Span::styled(
+                            "OAuth URL:",
+                            Style::default().fg(COLOR_CYAN),
                         )));
-                        lines.push(Line::from(url.as_str()));
                     }
-                    lines.push(Line::from(""));
-                    lines.push(Line::from("Paste authorization code or redirect URL, then Enter:"));
-                    lines.push(Line::from(user_input.as_str()));
+                    let instructions_para = Paragraph::new(instructions_content)
+                        .wrap(Wrap { trim: true })
+                        .block(Block::default().borders(Borders::NONE).title(""));
+                    f.render_widget(instructions_para, oauth_chunks[idx]);
+                    idx += 1;
+                    if auth_url.is_some() {
+                        let url_line = auth_url.as_ref().unwrap().as_str();
+                        let url_para = Paragraph::new(Line::from(url_line))
+                            .block(Block::default().borders(Borders::NONE).title(""));
+                        f.render_widget(url_para, oauth_chunks[idx]);
+                        idx += 1;
+                    }
+                    let mut box_lines = vec![
+                        Line::from(Span::styled(
+                            "Paste authorization code or redirect URL, then Enter:",
+                            Style::default().fg(COLOR_YELLOW),
+                        )),
+                        Line::from(user_input.as_str()),
+                    ];
                     if let Some(ref e) = error {
-                        lines.push(Line::from(Span::styled(
+                        box_lines.push(Line::from(Span::styled(
                             format!("Error: {}", e),
                             Style::default().fg(Color::Red),
                         )));
                     }
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
+                    box_lines.push(Line::from(Span::styled(
                         "Enter = submit   Esc = back",
                         Style::default().fg(COLOR_GRAY),
                     )));
-                    let body = Paragraph::new(lines).wrap(Wrap { trim: true });
+                    let box_para = Paragraph::new(box_lines).wrap(Wrap { trim: true });
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(COLOR_GRAY))
                         .title(step.title());
-                    f.render_widget(body.block(block), chunks[1]);
+                    f.render_widget(box_para.block(block), oauth_chunks[idx]);
                     let hint_para = Paragraph::new(Line::from(Span::styled(
                         " Type code/URL  Enter submit  Esc back  q quit",
                         Style::default().fg(COLOR_GRAY),
