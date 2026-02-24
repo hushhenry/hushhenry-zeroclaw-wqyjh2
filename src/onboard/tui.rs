@@ -1416,78 +1416,88 @@ fn draw(
                     error,
                     ..
                 } => {
-                    let auth_url = auth_info
+                    // Match zeroai config_tui.rs: label (bordered), input (bordered), then info with instructions + URL (no border).
+                    let auth_data = auth_info
                         .lock()
                         .ok()
-                        .and_then(|g| g.as_ref().map(|i| i.url.clone()));
-                    let hint = auth_info
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.as_ref().and_then(|i| i.instructions.clone()))
+                        .and_then(|g| g.as_ref().cloned());
+                    let hint = auth_data
+                        .as_ref()
+                        .and_then(|i| i.instructions.clone())
                         .unwrap_or_else(|| "Connecting...".into());
-                    // Match zeroai: instructions + URL outside the box (no border), URL on one line so it stays clickable.
-                    let mut oauth_constraints = vec![
-                        Constraint::Length(4),
-                        Constraint::Min(4),
-                    ];
-                    if auth_url.is_some() {
-                        oauth_constraints.insert(1, Constraint::Length(1));
-                    }
+                    let oauth_url = auth_data.as_ref().map(|i| i.url.as_str());
+
+                    let has_info = !hint.is_empty() || oauth_url.is_some();
+                    let constraints = if has_info {
+                        vec![
+                            Constraint::Length(3),
+                            Constraint::Length(3),
+                            Constraint::Min(3),
+                        ]
+                    } else {
+                        vec![Constraint::Length(3), Constraint::Length(3)]
+                    };
                     let oauth_chunks = Layout::default()
                         .direction(ratatui::layout::Direction::Vertical)
-                        .constraints(oauth_constraints)
+                        .constraints(constraints)
                         .split(chunks[1]);
+
                     let mut idx = 0;
-                    let mut instructions_content = vec![
-                        Line::from(Span::styled(
-                            "OAuth — complete in browser, then paste code or URL below.",
-                            Style::default().fg(COLOR_CYAN),
-                        )),
-                        Line::from(""),
-                        Line::from(hint.as_str()),
-                    ];
-                    if auth_url.is_some() {
-                        instructions_content.push(Line::from(""));
-                        instructions_content.push(Line::from(Span::styled(
-                            "OAuth URL:",
-                            Style::default().fg(COLOR_CYAN),
-                        )));
-                    }
-                    let instructions_para = Paragraph::new(instructions_content)
-                        .wrap(Wrap { trim: true })
-                        .block(Block::default().borders(Borders::NONE).title(""));
-                    f.render_widget(instructions_para, oauth_chunks[idx]);
+                    let label_para = Paragraph::new(Line::from(Span::styled(
+                        "OAuth — complete in browser, then paste code or URL below.",
+                        Style::default().fg(COLOR_CYAN),
+                    )))
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLOR_GRAY)));
+                    f.render_widget(label_para, oauth_chunks[idx]);
                     idx += 1;
-                    if auth_url.is_some() {
-                        let url_line = auth_url.as_ref().unwrap().as_str();
-                        let url_para = Paragraph::new(Line::from(url_line))
-                            .block(Block::default().borders(Borders::NONE).title(""));
-                        f.render_widget(url_para, oauth_chunks[idx]);
-                        idx += 1;
-                    }
-                    let mut box_lines = vec![
-                        Line::from(Span::styled(
-                            "Paste authorization code or redirect URL, then Enter:",
-                            Style::default().fg(COLOR_YELLOW),
-                        )),
-                        Line::from(user_input.as_str()),
-                    ];
+
+                    let input_title = Line::from(vec![
+                        Span::raw(" Input ("),
+                        Span::styled("Enter", Style::default().fg(COLOR_YELLOW)),
+                        Span::raw(" submit, "),
+                        Span::styled("Esc", Style::default().fg(COLOR_YELLOW)),
+                        Span::raw(" back) "),
+                    ]);
+                    let mut input_lines = vec![Line::from(user_input.as_str())];
                     if let Some(ref e) = error {
-                        box_lines.push(Line::from(Span::styled(
+                        input_lines.push(Line::from(Span::styled(
                             format!("Error: {}", e),
                             Style::default().fg(Color::Red),
                         )));
                     }
-                    box_lines.push(Line::from(Span::styled(
-                        "Enter = submit   Esc = back",
-                        Style::default().fg(COLOR_GRAY),
-                    )));
-                    let box_para = Paragraph::new(box_lines).wrap(Wrap { trim: true });
-                    let block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(COLOR_GRAY))
-                        .title(step.title());
-                    f.render_widget(box_para.block(block), oauth_chunks[idx]);
+                    let input_para = Paragraph::new(input_lines)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(input_title)
+                                .border_style(Style::default().fg(COLOR_GRAY)),
+                        )
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(input_para, oauth_chunks[idx]);
+                    idx += 1;
+
+                    if has_info {
+                        let mut info_content = vec![
+                            Line::from(Span::styled(
+                                "Instructions: ",
+                                Style::default().fg(COLOR_YELLOW),
+                            )),
+                            Line::from(hint.as_str()),
+                        ];
+                        if let Some(url) = oauth_url {
+                            info_content.push(Line::from(""));
+                            info_content.push(Line::from(Span::styled(
+                                "Clean URL (copy below):",
+                                Style::default().fg(COLOR_CYAN),
+                            )));
+                            info_content.push(Line::from(url));
+                        }
+                        let info_para = Paragraph::new(info_content)
+                            .wrap(Wrap { trim: false })
+                            .block(Block::default().borders(Borders::NONE).title(""));
+                        f.render_widget(info_para, oauth_chunks[idx]);
+                    }
+
                     let hint_para = Paragraph::new(Line::from(Span::styled(
                         " Type code/URL  Enter submit  Esc back  q quit",
                         Style::default().fg(COLOR_GRAY),
