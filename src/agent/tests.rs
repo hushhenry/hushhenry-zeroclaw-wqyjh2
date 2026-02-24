@@ -375,7 +375,7 @@ async fn turn_bails_out_at_max_iterations() {
     // loop_::run_tool_call_loop uses MAX_TOOL_ITERATIONS (10). Create 11 tool responses.
     const MAX_ITERS: usize = 10;
     let mut responses = Vec::new();
-    for i in 0..MAX_ITERS + 1 {
+    for i in 0..=MAX_ITERS {
         responses.push(tool_response(vec![ToolCall {
             id: format!("tc{i}"),
             name: "echo".into(),

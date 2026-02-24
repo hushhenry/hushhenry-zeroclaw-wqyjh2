@@ -14,7 +14,7 @@ pub struct PkceChallenge {
 pub fn generate_pkce() -> PkceChallenge {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(&bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
 
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());

@@ -213,7 +213,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let credentials_path = config
         .config_path
         .parent()
-        .map(|p| ProviderCredentialsStore::default_path(p))
+        .map(ProviderCredentialsStore::default_path)
         .unwrap_or_else(|| std::path::PathBuf::from("providers.json"));
     let credential_store = ProviderCredentialsStore::load(&credentials_path).unwrap_or_default();
     let credential_source = providers::CredentialSource {

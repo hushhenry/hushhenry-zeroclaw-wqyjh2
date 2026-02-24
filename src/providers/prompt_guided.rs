@@ -126,7 +126,6 @@ pub fn convert_messages_to_prompt_guided(
                 role: "user".to_string(),
                 content: tool_result_content,
             });
-            continue;
         } else if m.role == "user" {
             let is_first_user = !out.iter().any(|x| x.role == "user");
             let content = if is_first_user && !instructions.is_empty() {

@@ -143,6 +143,7 @@ impl ShellTool {
         }
     }
 
+    #[allow(clippy::unused_async)]
     async fn execute_spawn(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = args
             .get("command")
@@ -198,16 +199,14 @@ impl ShellTool {
             .unwrap_or(MAX_OUTPUT_BYTES as u64) as i64;
 
         let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
-        let run = exec_runtime
-            .enqueue_run(SpawnExecRunRequest {
-                session_id: session_id.clone(),
-                command: command.to_string(),
-                pty,
-                timeout_secs,
-                max_output_bytes,
-                watch_json,
-            })
-            .await?;
+        let run = exec_runtime.enqueue_run(SpawnExecRunRequest {
+            session_id: session_id.clone(),
+            command: command.to_string(),
+            pty,
+            timeout_secs,
+            max_output_bytes,
+            watch_json,
+        })?;
 
         Ok(ToolResult {
             success: true,
@@ -228,6 +227,7 @@ impl ShellTool {
         })
     }
 
+    #[allow(clippy::unused_async)]
     async fn execute_poll(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let run_id = args
             .get("run_id")
@@ -243,7 +243,7 @@ impl ShellTool {
             items,
             next_seq,
             snippet,
-        }) = exec_runtime.poll_run(run_id, since_seq).await?
+        }) = exec_runtime.poll_run(run_id, since_seq)?
         else {
             return Ok(ToolResult {
                 success: false,
@@ -282,6 +282,7 @@ impl ShellTool {
         })
     }
 
+    #[allow(clippy::unused_async)]
     async fn execute_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let run_id = args
             .get("run_id")
@@ -293,7 +294,7 @@ impl ShellTool {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(256);
         let stream = args
             .get("stream")
@@ -311,9 +312,8 @@ impl ShellTool {
         }
 
         let exec_runtime = ShellExecRuntime::shared(self.security.clone(), self.runtime.clone())?;
-        let Some(LogExecRunResult { items, next_seq }) = exec_runtime
-            .log_run(run_id, since_seq, limit, stream)
-            .await?
+        let Some(LogExecRunResult { items, next_seq }) =
+            exec_runtime.log_run(run_id, since_seq, limit, stream)?
         else {
             return Ok(ToolResult {
                 success: false,

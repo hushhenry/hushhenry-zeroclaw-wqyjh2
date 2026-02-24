@@ -329,7 +329,7 @@ fn resolve_provider_credential(
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "astrai" => vec!["ASTRAI_API_KEY"],
-        "gemini-cli" => vec![], // credential from providers.json only (token + project_id)
+        // credential from providers.json only (token + project_id)
         _ => vec![],
     };
 
@@ -417,7 +417,7 @@ pub fn create_provider_with_url(
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
         "gemini-cli" => {
-            let cred = key.and_then(|s| gemini_cli::parse_gemini_cli_credential(s));
+            let cred = key.and_then(gemini_cli::parse_gemini_cli_credential);
             Ok(Box::new(gemini_cli::GeminiCliProvider::new(cred)))
         }
 

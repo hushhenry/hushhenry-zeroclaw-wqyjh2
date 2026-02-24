@@ -129,7 +129,7 @@ impl ProviderManager {
         let credentials_path = config
             .config_path
             .parent()
-            .map(|p| crate::config::ProviderCredentialsStore::default_path(p))
+            .map(crate::config::ProviderCredentialsStore::default_path)
             .unwrap_or_else(|| std::path::PathBuf::from("providers.json"));
         let credential_store =
             match crate::config::ProviderCredentialsStore::load(&credentials_path) {
@@ -201,6 +201,7 @@ impl ProviderManager {
     }
 
     /// Get or create a provider; uses cache and detects cycles when resolving groups.
+    #[allow(clippy::only_used_in_recursion)]
     fn get_inner(
         &self,
         full: &str,

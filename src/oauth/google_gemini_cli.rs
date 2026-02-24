@@ -64,7 +64,7 @@ impl OAuthProvider for GeminiCliOAuthProvider {
             ("prompt", "consent"),
         ];
 
-        let auth_url = format!("{}?{}", AUTH_URL, serde_urlencoded::to_string(&params)?);
+        let auth_url = format!("{}?{}", AUTH_URL, serde_urlencoded::to_string(params)?);
 
         callbacks.on_auth(OAuthAuthInfo {
             url: auth_url.clone(),

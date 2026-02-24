@@ -326,7 +326,6 @@ impl Provider for GeminiCliProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
-            ..Default::default()
         }
     }
 

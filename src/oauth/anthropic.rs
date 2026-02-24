@@ -48,7 +48,7 @@ impl OAuthProvider for AnthropicOAuthProvider {
         let auth_url = format!(
             "{}?{}",
             AUTHORIZE_URL,
-            serde_urlencoded::to_string(&params)?
+            serde_urlencoded::to_string(params)?
         );
 
         callbacks.on_auth(OAuthAuthInfo {

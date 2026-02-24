@@ -421,7 +421,6 @@ impl Provider for OllamaProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: false,
-            ..Default::default()
         }
     }
 

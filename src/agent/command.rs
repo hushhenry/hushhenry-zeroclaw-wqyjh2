@@ -195,7 +195,7 @@ fn format_usage_reply(
             Ok(format!("Daily cost (UTC) {}: ${:.4}", day, cost))
         }
         "monthly" => {
-            let (y, m) = match (args.get(0), args.get(1)) {
+            let (y, m) = match (args.first(), args.get(1)) {
                 (None, None) => {
                     let now = Utc::now();
                     (now.year(), now.month())
@@ -234,7 +234,7 @@ pub(crate) async fn handle_slash_command(
     command: SlashCommand,
 ) -> bool {
     let Some(session_store) = ctx.session_store.as_ref() else {
-        dispatch_reply(&msg, "Session store is unavailable.".to_string()).await;
+        dispatch_reply(msg, "Session store is unavailable.".to_string()).await;
         return true;
     };
 
@@ -252,7 +252,7 @@ pub(crate) async fn handle_slash_command(
             match session_store.create_new(inbound_key, agent_id.as_deref()) {
                 Ok(session_id) => {
                     dispatch_reply(
-                        &msg,
+                        msg,
                         format!(
                             "New session started ({}). Use /agent <agent_id> to switch.",
                             short_session_id(&session_id)
@@ -262,7 +262,7 @@ pub(crate) async fn handle_slash_command(
                 }
                 Err(e) => {
                     tracing::error!("Failed to create new session: {e}");
-                    dispatch_reply(&msg, "⚠️ Failed to start new session.".to_string()).await;
+                    dispatch_reply(msg, "⚠️ Failed to start new session.".to_string()).await;
                 }
             }
             return true;
@@ -273,7 +273,7 @@ pub(crate) async fn handle_slash_command(
                     Ok(ids) => ids,
                     Err(e) => {
                         tracing::error!("Failed to list workspace agents: {e}");
-                        dispatch_reply(&msg, "⚠️ Failed to list agents.".to_string()).await;
+                        dispatch_reply(msg, "⚠️ Failed to list agents.".to_string()).await;
                         return true;
                     }
                 };
@@ -289,14 +289,14 @@ pub(crate) async fn handle_slash_command(
                     let _ = writeln!(text, "{marker}{agent_id}");
                 }
                 let _ = writeln!(text, "Use /agent <agent_id> [default] to switch. Use /setup_agent <agent_id> to create.");
-                dispatch_reply(&msg, text.trim().to_string()).await;
+                dispatch_reply(msg, text.trim().to_string()).await;
             }
             Err(error) => {
                 tracing::error!(
                     "Failed to resolve session for /agents ({}): {error}",
                     inbound_key
                 );
-                dispatch_reply(&msg, "⚠️ Failed to list agents.".to_string()).await;
+                dispatch_reply(msg, "⚠️ Failed to list agents.".to_string()).await;
             }
         },
         SlashCommand::SetupAgent {
@@ -309,18 +309,16 @@ pub(crate) async fn handle_slash_command(
                 .and_then(|s| s.parse::<f64>().ok());
             match crate::channels::handle_setup_agent_command(
                 ctx,
-                &msg,
+                msg,
                 inbound_key,
                 &agent_id,
                 provider_model.as_deref(),
                 temperature,
-            )
-            .await
-            {
-                Ok(content) => dispatch_reply(&msg, content).await,
+            ) {
+                Ok(content) => dispatch_reply(msg, content).await,
                 Err(e) => {
                     tracing::error!("Failed to create agent: {e}");
-                    dispatch_reply(&msg, format!("⚠️ Failed to create agent: {e}")).await;
+                    dispatch_reply(msg, format!("⚠️ Failed to create agent: {e}")).await;
                 }
             }
         }
@@ -335,7 +333,7 @@ pub(crate) async fn handle_slash_command(
                     }
                 },
             };
-            dispatch_reply(&msg, reply).await;
+            dispatch_reply(msg, reply).await;
         }
     }
 

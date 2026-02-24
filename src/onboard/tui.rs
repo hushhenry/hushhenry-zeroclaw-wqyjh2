@@ -76,10 +76,10 @@ enum ProviderScreen {
 impl PartialEq for ProviderScreen {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ProviderScreen::List, ProviderScreen::List) => true,
-            (ProviderScreen::ApiKey, ProviderScreen::ApiKey) => true,
             (ProviderScreen::OAuth { provider_id: a, .. }, ProviderScreen::OAuth { provider_id: b, .. }) => a == b,
-            (ProviderScreen::ModelSelect, ProviderScreen::ModelSelect) => true,
+            (ProviderScreen::List, ProviderScreen::List)
+            | (ProviderScreen::ApiKey, ProviderScreen::ApiKey)
+            | (ProviderScreen::ModelSelect, ProviderScreen::ModelSelect) => true,
             _ => false,
         }
     }
@@ -150,7 +150,7 @@ impl Step {
         Step::Summary,
     ];
 
-    fn title(&self) -> &'static str {
+    fn title(self) -> &'static str {
         match self {
             Step::Welcome => "Welcome",
             Step::Workspace => "Workspace",
@@ -180,6 +180,7 @@ impl Step {
 
 /// Tracks what was modified so we only save when dirty.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DirtyFlags {
     pub workspace: bool,
     pub provider: bool,
@@ -599,8 +600,7 @@ fn draw_channels_repair(
             let list_items = channel_list(&config.channels_config);
             let items: Vec<ratatui::text::Line> = list_items
                 .iter()
-                .enumerate()
-                .map(|(_i, (label, configured))| {
+                .map(|(label, configured)| {
                     let status = if *configured { "✅" } else { "—" };
                     Line::from(format!(
                         "{}  {} {}",
@@ -741,7 +741,7 @@ fn run_tui_loop(
                 &mut channel_list_state,
                 &mut tool_mode_list_state,
                 project_focused,
-            )
+            );
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -947,7 +947,7 @@ fn handle_provider_step(
 
     match provider_screen {
         ProviderScreen::List => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => *step = Step::Workspace,
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => *step = Step::Workspace,
             KeyCode::Up | KeyCode::Char('k') => {
                 let i = provider_list_state.selected().unwrap_or(0);
                 let next = if i == 0 {
@@ -1007,7 +1007,6 @@ fn handle_provider_step(
                     }
                 }
             }
-            KeyCode::Backspace => *step = Step::Workspace,
             _ => {}
         },
         ProviderScreen::ApiKey => match key.code {
@@ -1065,7 +1064,7 @@ fn handle_provider_step(
         ProviderScreen::ModelSelect => {
             let models = curated_models_for_provider(&state.provider);
             match key.code {
-                KeyCode::Esc => *provider_screen = ProviderScreen::ApiKey,
+                KeyCode::Esc | KeyCode::Backspace => *provider_screen = ProviderScreen::ApiKey,
                 KeyCode::Up | KeyCode::Char('k') => {
                     let i = model_list_state.selected().unwrap_or(0);
                     let next = if i == 0 {
@@ -1090,7 +1089,6 @@ fn handle_provider_step(
                     *step = step.next().unwrap_or(*step);
                     *provider_screen = ProviderScreen::List;
                 }
-                KeyCode::Backspace => *provider_screen = ProviderScreen::ApiKey,
                 _ => {}
             }
         }
@@ -1109,7 +1107,7 @@ fn handle_channels_step(
 
     match channels_screen {
         ChannelsScreen::List => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => *step = step.prev().unwrap_or(Step::Welcome),
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => *step = step.prev().unwrap_or(Step::Welcome),
             KeyCode::Up | KeyCode::Char('k') => {
                 let i = channel_list_state.selected().unwrap_or(0);
                 channel_list_state.select(Some(if i == 0 { list_len - 1 } else { i - 1 }));
@@ -1166,7 +1164,6 @@ fn handle_channels_step(
                     };
                 }
             }
-            KeyCode::Backspace => *step = step.prev().unwrap_or(Step::Welcome),
             _ => {}
         },
         ChannelsScreen::Input {
@@ -1319,6 +1316,7 @@ fn run_zeroai_proxy_config() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     f: &mut Frame,
     state: &WizardState,

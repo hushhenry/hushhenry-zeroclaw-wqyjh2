@@ -79,9 +79,7 @@ impl CodexProvider {
                 continue;
             }
             let role = match m.role.as_str() {
-                "user" => "user",
                 "assistant" => "assistant",
-                "tool" => "user",
                 _ => "user",
             };
             input.push(CodexInput {

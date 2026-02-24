@@ -109,8 +109,7 @@ impl AgentQueueItem {
     /// Delivery envelope (outbound_key) for sending the response.
     pub(crate) fn envelope(&self) -> &AgentWorkItem {
         match self {
-            AgentQueueItem::Message(w) => w,
-            AgentQueueItem::Command(_, w) => w,
+            AgentQueueItem::Message(w) | AgentQueueItem::Command(_, w) => w,
         }
     }
 }
@@ -304,9 +303,7 @@ impl Agent {
         let (_, reply_target) = parse_outbound_key_to_delivery_parts(key)
             .map_err(|e| anyhow::anyhow!("invalid outbound_key: {e}"))?;
         let msg = SendMessage::new(content, reply_target);
-        dispatch_outbound_message(key.as_str(), msg)
-            .await
-            .map_err(Into::into)
+        dispatch_outbound_message(key.as_str(), msg).await
     }
 
     /// /stop: abort current turn. Delivers "Agent was aborted.", returns AbortBatch.
@@ -590,7 +587,7 @@ impl Agent {
                 tokio::select! {
                     biased;
                     msg = self.message_rx.recv() => msg,
-                    _ = tokio::time::sleep(Duration::from_secs(idle_ttl_secs)) => {
+                    () = tokio::time::sleep(Duration::from_secs(idle_ttl_secs)) => {
                         tracing::debug!(session_id = %session_id, idle_ttl_secs, "Agent loop idle TTL reached");
                         break;
                     }
@@ -720,7 +717,7 @@ impl Agent {
                         }
                         continue;
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
             };
 
@@ -812,7 +809,7 @@ impl Agent {
                 let args = serde_json::from_str(&call.arguments)
                     .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
                 let tool_args = bind_custom_tool_args(&call.name, args, Some(session_id.as_str()));
-                let (output, _success) = self.execute_single_tool(&call, tool_args).await;
+                let (output, _success) = self.execute_single_tool(call, tool_args).await;
                 let output = maybe_truncate_tool_output(&output);
                 self.history.push(ChatMessage::tool(
                     serde_json::json!({

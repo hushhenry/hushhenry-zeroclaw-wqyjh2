@@ -54,9 +54,8 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
 
 pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
-        MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
-        MemoryBackendKind::Unknown => SQLITE_PROFILE,
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Unknown => SQLITE_PROFILE,
     }
 }
 

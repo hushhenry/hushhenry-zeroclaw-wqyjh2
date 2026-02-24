@@ -450,11 +450,14 @@ mod tests {
     }
 
     const _: () = {
-        assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
+        const {
+            assert!(MAX_TOOL_ITERATIONS > 0);
+            assert!(MAX_TOOL_ITERATIONS <= 100);
+        }
     };
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn constants_bounds_are_compile_time_checked() {
         assert!(MAX_TOOL_ITERATIONS > 0);
         assert!(MAX_TOOL_ITERATIONS <= 100);

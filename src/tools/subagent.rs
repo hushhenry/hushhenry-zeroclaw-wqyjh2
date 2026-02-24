@@ -85,7 +85,7 @@ impl Tool for SubagentTool {
         };
 
         match action {
-            ACTION_SPAWN => execute_spawn(Arc::clone(&self.config), args).await,
+            ACTION_SPAWN => execute_spawn(Arc::clone(&self.config), args),
             ACTION_SEND => execute_send(Arc::clone(&self.config), args).await,
             ACTION_STOP => execute_stop(Arc::clone(&self.config), args).await,
             _ => Ok(ToolResult {
@@ -99,7 +99,7 @@ impl Tool for SubagentTool {
     }
 }
 
-async fn execute_spawn(config: Arc<Config>, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+fn execute_spawn(config: Arc<Config>, args: serde_json::Value) -> anyhow::Result<ToolResult> {
     let agent_id = args
         .get("agent_id")
         .and_then(serde_json::Value::as_str)

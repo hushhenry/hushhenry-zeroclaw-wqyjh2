@@ -47,6 +47,9 @@ use crate::session::{
 };
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
+
+/// Per-agent tool cache type (agent_id -> tools).
+type ToolsCache = Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>;
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
@@ -124,8 +127,7 @@ pub(crate) struct ChannelRuntimeContext {
     /// Runtime adapter for building per-agent tools.
     pub(crate) runtime: Arc<dyn runtime::RuntimeAdapter>,
     /// Per-agent tool cache: agent_id -> tools (with that agent's workspace SecurityPolicy).
-    pub(crate) tools_cache:
-        Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Vec<Box<dyn Tool>>>>>>,
+    pub(crate) tools_cache: ToolsCache,
     /// Cost tracker when config.cost.enabled; used to record token usage per LLM call.
     pub(crate) cost_tracker: Option<Arc<crate::cost::CostTracker>>,
 }
@@ -320,9 +322,9 @@ pub async fn dispatch_outbound_message(
 
 /// Loop that consumes OutboundRequest from the global channel and performs the actual send (internal or channel).
 /// Start this when the channel server starts; pass the same channels_by_name used for the message dispatch.
-pub async fn run_outbound_message_loop(
+pub async fn run_outbound_message_loop<S: std::hash::BuildHasher>(
     mut rx: mpsc::Receiver<OutboundRequest>,
-    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>, S>>,
 ) {
     while let Some(req) = rx.recv().await {
         let key = req.outbound_key.trim();
@@ -687,7 +689,7 @@ pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'stat
 
 /// Setup workspace agent: DB-first. If agent exists in DB, only update default params; else create dir, scaffold, insert.
 /// Returns a message to send to the user.
-pub(crate) async fn handle_setup_agent_command(
+pub(crate) fn handle_setup_agent_command(
     ctx: &ChannelRuntimeContext,
     _msg: &traits::ChannelMessage,
     _inbound_key: &str,
@@ -731,7 +733,7 @@ pub(crate) async fn handle_setup_agent_command(
         .ok_or_else(|| anyhow::anyhow!("Session store is unavailable"))?;
     let existing = store.get_workspace_agent(agent_id)?;
 
-    if let Some(_) = existing {
+    if existing.is_some() {
         store.upsert_workspace_agent(agent_id, &config_json)?;
         return Ok(format!(
             "Agent `{}` already exists; default params updated.",
@@ -834,7 +836,7 @@ pub(crate) fn normalize_tail_messages(
     let mut i = 0;
     while i < tail_messages.len() {
         let msg = &tail_messages[i];
-        let Some(role) = SessionMessageRole::from_str(msg.role.as_str()) else {
+        let Some(role) = msg.role.as_str().parse::<SessionMessageRole>().ok() else {
             tracing::warn!(
                 role = msg.role.as_str(),
                 "Skipping unsupported role when normalizing session tail"
@@ -847,7 +849,7 @@ pub(crate) fn normalize_tail_messages(
         i += 1;
         while i < tail_messages.len() {
             let next = &tail_messages[i];
-            let Some(next_role) = SessionMessageRole::from_str(next.role.as_str()) else {
+            let Some(next_role) = next.role.as_str().parse::<SessionMessageRole>().ok() else {
                 break;
             };
             if next_role != role {

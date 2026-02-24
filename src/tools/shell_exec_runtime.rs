@@ -187,7 +187,9 @@ impl InMemoryExecRunStore {
             meta_json: meta_json.map(ToOwned::to_owned),
             created_at: now,
         };
-        self.items.lock().get_mut(run_id).map(|vec| vec.push(item));
+        if let Some(vec) = self.items.lock().get_mut(run_id) {
+            vec.push(item);
+        }
         seq
     }
 
@@ -404,7 +406,7 @@ impl ShellExecRuntime {
         Ok(runtime_instance)
     }
 
-    pub async fn enqueue_run(&self, request: SpawnExecRunRequest) -> Result<ExecRun> {
+    pub fn enqueue_run(&self, request: SpawnExecRunRequest) -> Result<ExecRun> {
         let run = self.exec_store.enqueue(
             request.session_id.as_str(),
             request.command.as_str(),
@@ -417,7 +419,7 @@ impl ShellExecRuntime {
         Ok(run)
     }
 
-    pub async fn poll_run(
+    pub fn poll_run(
         &self,
         run_id: &str,
         since_seq: Option<i64>,
@@ -441,7 +443,7 @@ impl ShellExecRuntime {
 
     /// Returns incremental exec_run_items for action=log. Optional stream filter: "stdout" or "stderr".
     /// Returns None if run_id is not found.
-    pub async fn log_run(
+    pub fn log_run(
         &self,
         run_id: &str,
         since_seq: Option<i64>,
@@ -517,8 +519,8 @@ impl ShellExecRuntime {
         loop {
             self.claim_and_spawn_available_runs().await?;
             tokio::select! {
-                _ = self.worker_notify.notified() => {}
-                _ = time::sleep(self.poll_interval) => {}
+                () = self.worker_notify.notified() => {}
+                () = time::sleep(self.poll_interval) => {}
             }
         }
     }
@@ -570,7 +572,7 @@ impl ShellExecRuntime {
             .await;
 
         if let Err(err) = result {
-            if !self.run_is_canceled(run_id.as_str()).await {
+            if !self.run_is_canceled(run_id.as_str()) {
                 self.exec_store.mark_failed(
                     run_id.as_str(),
                     None,
@@ -641,22 +643,23 @@ impl ShellExecRuntime {
         let mut timed_out = false;
         let mut recent_snippet = String::new();
         let sink = Arc::clone(&self.event_sink);
-        let timeout = Duration::from_secs(run.timeout_secs.max(1) as u64);
+        let timeout_secs: u64 = run.timeout_secs.max(1).try_into().unwrap_or(1);
+        let timeout = Duration::from_secs(timeout_secs);
         let timeout_sleep = time::sleep(timeout);
         tokio::pin!(timeout_sleep);
         let mut exit_code: Option<i64> = None;
 
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    if !self.run_is_canceled(run.run_id.as_str()).await {
+                    if !self.run_is_canceled(run.run_id.as_str()) {
                         self.exec_store.mark_canceled(run.run_id.as_str());
                     }
                     break;
                 }
-                _ = &mut timeout_sleep => {
+                () = &mut timeout_sleep => {
                     timed_out = true;
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -695,7 +698,7 @@ impl ShellExecRuntime {
                         }
                     }
                 }
-                _ = time::sleep(Duration::from_millis(20)) => {
+                () = time::sleep(Duration::from_millis(20)) => {
                     if let Some(status) = child.try_wait()? {
                         exit_code = status.code().map(i64::from);
                         while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(30), rx.recv()).await {
@@ -726,7 +729,7 @@ impl ShellExecRuntime {
             return Ok(());
         }
 
-        if self.run_is_canceled(run.run_id.as_str()).await {
+        if self.run_is_canceled(run.run_id.as_str()) {
             return Ok(());
         }
 
@@ -799,29 +802,30 @@ impl ShellExecRuntime {
         let mut timed_out = false;
         let mut recent_snippet = String::new();
         let sink = Arc::clone(&self.event_sink);
-        let timeout = Duration::from_secs(run.timeout_secs.max(1) as u64);
+        let timeout_secs: u64 = run.timeout_secs.max(1).try_into().unwrap_or(1);
+        let timeout = Duration::from_secs(timeout_secs);
         let timeout_sleep = time::sleep(timeout);
         tokio::pin!(timeout_sleep);
         let mut exit_code: Option<i64> = None;
 
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    if !self.run_is_canceled(run.run_id.as_str()).await {
+                    if !self.run_is_canceled(run.run_id.as_str()) {
                         self.exec_store.mark_canceled(run.run_id.as_str());
                     }
                     break;
                 }
-                _ = &mut timeout_sleep => {
+                () = &mut timeout_sleep => {
                     timed_out = true;
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     break;
                 }
                 maybe_input = input_rx.recv() => {
-                    if let Some(ref bytes) = maybe_input.as_ref() {
+                    if let Some(bytes) = maybe_input.as_ref() {
                         if let Some(ref mut w) = pty_write_handle {
                             let _ = w.write_all(bytes).await;
                             let _ = w.flush().await;
@@ -853,7 +857,7 @@ impl ShellExecRuntime {
                         }
                     }
                 }
-                _ = time::sleep(Duration::from_millis(20)) => {
+                () = time::sleep(Duration::from_millis(20)) => {
                     if let Some(status) = child.try_wait()? {
                         exit_code = status.code().map(i64::from);
                         while let Ok(Some(chunk)) =
@@ -884,7 +888,7 @@ impl ShellExecRuntime {
             return Ok(());
         }
 
-        if self.run_is_canceled(run.run_id.as_str()).await {
+        if self.run_is_canceled(run.run_id.as_str()) {
             return Ok(());
         }
 
@@ -904,6 +908,7 @@ impl ShellExecRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_output_chunk(
         &self,
         run: &ExecRun,
@@ -963,7 +968,10 @@ impl ShellExecRuntime {
             return Ok(());
         }
 
-        let remaining = (run.max_output_bytes - *output_bytes).max(0) as usize;
+        let remaining: usize = (run.max_output_bytes - *output_bytes)
+            .max(0)
+            .try_into()
+            .unwrap_or(0);
         if text.len() > remaining {
             text.truncate(text.floor_char_boundary(remaining));
             *truncated = true;
@@ -1021,7 +1029,7 @@ impl ShellExecRuntime {
         Ok(())
     }
 
-    async fn run_is_canceled(&self, run_id: &str) -> bool {
+    fn run_is_canceled(&self, run_id: &str) -> bool {
         self.exec_store
             .get_run(run_id)
             .is_some_and(|run| run.status == ExecRunStatus::Canceled.as_str())

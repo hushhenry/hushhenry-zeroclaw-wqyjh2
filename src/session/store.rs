@@ -44,13 +44,17 @@ impl SessionMessageRole {
             Self::Tool => "tool",
         }
     }
+}
 
-    pub fn from_str(role: &str) -> Option<Self> {
-        match role {
-            "user" => Some(Self::User),
-            "assistant" => Some(Self::Assistant),
-            "tool" => Some(Self::Tool),
-            _ => None,
+impl std::str::FromStr for SessionMessageRole {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "tool" => Ok(Self::Tool),
+            _ => Err(()),
         }
     }
 }
@@ -327,7 +331,7 @@ impl SessionStore {
         content: &str,
         meta_json: Option<&str>,
     ) -> Result<i64> {
-        let Some(role) = SessionMessageRole::from_str(role) else {
+        let Some(role_enum) = role.parse::<SessionMessageRole>().ok() else {
             tracing::warn!(
                 session_id = %session_id.as_str(),
                 role,
@@ -342,7 +346,7 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO session_messages (session_id, role, content, created_at, meta_json)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id.as_str(), role.as_str(), content, now, meta_json],
+            params![session_id.as_str(), role_enum.as_str(), content, now, meta_json],
         )
         .context("Failed to append session message")?;
 
@@ -951,8 +955,8 @@ mod tests {
     fn session_store_init_schema_creates_all_tables() {
         let workspace = TempDir::new().unwrap();
         let db_path = workspace.path().join("memory").join("sessions.db");
-        let _store = SessionStore::new(workspace.path()).unwrap();
-        drop(_store);
+        let store = SessionStore::new(workspace.path()).unwrap();
+        drop(store);
 
         let conn = Connection::open(db_path).unwrap();
         let version: i64 = conn
